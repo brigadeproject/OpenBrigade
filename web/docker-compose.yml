@@ -1,0 +1,161 @@
+name: brigade
+
+services:
+  brigade_ollama_proxy:
+    image: python:3.10-slim
+    container_name: brigade_ollama_proxy
+    restart: unless-stopped
+    profiles:
+      - app
+    network_mode: host
+    command:
+      - python
+      - /app/ops/ollama_bridge_proxy.py
+      - --listen-host
+      - ${BRIGADE_OLLAMA_PROXY_LISTEN_HOST:-172.17.0.1}
+      - --listen-port
+      - ${BRIGADE_OLLAMA_PROXY_PORT:-11434}
+      - --target-host
+      - ${BRIGADE_OLLAMA_PROXY_TARGET_HOST:-127.0.0.1}
+      - --target-port
+      - ${BRIGADE_OLLAMA_PROXY_TARGET_PORT:-11434}
+    volumes:
+      - ./ops/ollama_bridge_proxy.py:/app/ops/ollama_bridge_proxy.py:ro
+
+  brigade_orchestrator:
+    build: .
+    container_name: brigade_orchestrator
+    restart: unless-stopped
+    profiles:
+      - app
+    command: ["orchestrator", "daemon"]
+    environment:
+      BRIGADE_DATA_DIR: /data
+      BRIGADE_POSTGRES_DSN: postgresql://${BRIGADE_POSTGRES_USER:-brigade}:${BRIGADE_POSTGRES_PASSWORD:?set BRIGADE_POSTGRES_PASSWORD in .env}@brigade_postgres:5432/${BRIGADE_POSTGRES_DB:-brigade}
+      BRIGADE_REDIS_URL: redis://brigade_redis:6379/0
+      BRIGADE_QDRANT_URL: http://brigade_qdrant:6333
+      BRIGADE_NEO4J_URI: bolt://brigade_neo4j:7687
+      BRIGADE_NEO4J_HTTP_URL: http://brigade_neo4j:7474
+      BRIGADE_NEO4J_AUTH: ${BRIGADE_NEO4J_AUTH:?set BRIGADE_NEO4J_AUTH in .env}
+      BRIGADE_OLLAMA_BASE_URL: ${BRIGADE_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    volumes:
+      - brigade_app_data:/data
+    networks:
+      - brigade_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - brigade_ollama_proxy
+      - brigade_postgres
+      - brigade_redis
+      - brigade_qdrant
+      - brigade_neo4j
+
+  brigade_web:
+    build: .
+    container_name: brigade_web
+    restart: unless-stopped
+    profiles:
+      - app
+    command: ["web", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      BRIGADE_DATA_DIR: /data
+      BRIGADE_POSTGRES_DSN: postgresql://${BRIGADE_POSTGRES_USER:-brigade}:${BRIGADE_POSTGRES_PASSWORD:?set BRIGADE_POSTGRES_PASSWORD in .env}@brigade_postgres:5432/${BRIGADE_POSTGRES_DB:-brigade}
+      BRIGADE_REDIS_URL: redis://brigade_redis:6379/0
+      BRIGADE_QDRANT_URL: http://brigade_qdrant:6333
+      BRIGADE_NEO4J_URI: bolt://brigade_neo4j:7687
+      BRIGADE_NEO4J_HTTP_URL: http://brigade_neo4j:7474
+      BRIGADE_NEO4J_AUTH: ${BRIGADE_NEO4J_AUTH:?set BRIGADE_NEO4J_AUTH in .env}
+      BRIGADE_OLLAMA_BASE_URL: ${BRIGADE_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      BRIGADE_REQUIRE_AUTH: ${BRIGADE_REQUIRE_AUTH:-false}
+      BRIGADE_JWT_SECRET: ${BRIGADE_JWT_SECRET:?set BRIGADE_JWT_SECRET in .env}
+      BRIGADE_JWT_ISSUER: ${BRIGADE_JWT_ISSUER:-openbrigade-local}
+      BRIGADE_JWT_AUDIENCE: ${BRIGADE_JWT_AUDIENCE:-openbrigade}
+    ports:
+      - "${BRIGADE_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_WEB_PORT:-58080}:8080"
+    volumes:
+      - brigade_app_data:/data
+    networks:
+      - brigade_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - brigade_orchestrator
+      - brigade_postgres
+      - brigade_redis
+      - brigade_qdrant
+      - brigade_neo4j
+
+  brigade_postgres:
+    image: postgres:16-alpine
+    container_name: brigade_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${BRIGADE_POSTGRES_DB:-brigade}
+      POSTGRES_USER: ${BRIGADE_POSTGRES_USER:-brigade}
+      POSTGRES_PASSWORD: ${BRIGADE_POSTGRES_PASSWORD:?set BRIGADE_POSTGRES_PASSWORD in .env}
+    ports:
+      - "${BRIGADE_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - brigade_postgres_data:/var/lib/postgresql/data
+    networks:
+      - brigade_net
+
+  brigade_redis:
+    image: redis:7-alpine
+    container_name: brigade_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${BRIGADE_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_REDIS_PORT:-56379}:6379"
+    volumes:
+      - brigade_redis_data:/data
+    networks:
+      - brigade_net
+
+  brigade_qdrant:
+    image: qdrant/qdrant:v1.14.1
+    container_name: brigade_qdrant
+    restart: unless-stopped
+    ports:
+      - "${BRIGADE_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_QDRANT_HTTP_PORT:-56333}:6333"
+      - "${BRIGADE_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_QDRANT_GRPC_PORT:-56334}:6334"
+    volumes:
+      - brigade_qdrant_data:/qdrant/storage
+    networks:
+      - brigade_net
+
+  brigade_neo4j:
+    image: neo4j:5-community
+    container_name: brigade_neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${BRIGADE_NEO4J_AUTH:?set BRIGADE_NEO4J_AUTH in .env}
+      NEO4J_server_memory_heap_initial__size: ${BRIGADE_NEO4J_HEAP_INITIAL:-512m}
+      NEO4J_server_memory_heap_max__size: ${BRIGADE_NEO4J_HEAP_MAX:-1G}
+    ports:
+      - "${BRIGADE_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_NEO4J_HTTP_PORT:-57474}:7474"
+      - "${BRIGADE_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_NEO4J_BOLT_PORT:-57687}:7687"
+    volumes:
+      - brigade_neo4j_data:/data
+      - brigade_neo4j_logs:/logs
+    networks:
+      - brigade_net
+
+networks:
+  brigade_net:
+    name: brigade_net
+
+volumes:
+  brigade_postgres_data:
+    name: brigade_postgres_data
+  brigade_redis_data:
+    name: brigade_redis_data
+  brigade_qdrant_data:
+    name: brigade_qdrant_data
+  brigade_neo4j_data:
+    name: brigade_neo4j_data
+  brigade_neo4j_logs:
+    name: brigade_neo4j_logs
+  brigade_app_data:
+    name: brigade_app_data

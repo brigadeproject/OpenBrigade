@@ -1,0 +1,15 @@
+.env
+.brigade/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.venv/
+artifacts/
+dist/
+build/
+*.egg-info/
+backups/
+web/node_modules/
+web/dist/
+reference/

@@ -1,0 +1,50 @@
+[project]
+name = "openbrigade"
+version = "0.1.0"
+description = "A proactive agent harness coordinated by an orchestrator."
+readme = "OpenBrigade_V0.1_Design_Summary.md"
+requires-python = ">=3.10"
+dependencies = [
+  "psycopg[binary]>=3.1",
+  "redis>=5.0",
+]
+
+[project.scripts]
+brigade = "brigade.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "ruff>=0.4.0",
+]
+stores = []
+models = [
+  "litellm>=1.0",
+]
+web = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["brigade*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-m \"not integration\""
+markers = [
+  "integration: exercises local services or live model endpoints",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["reference"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -1,0 +1,17 @@
+.brigade
+.agents
+.codex
+.env
+.env.dev
+.git
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.egg-info
+artifacts
+backups
+reference
+tests
+web/node_modules
+web/dist
