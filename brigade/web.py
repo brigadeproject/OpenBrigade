@@ -39,14 +39,12 @@ from brigade.schemas import (
     WorkMode,
 )
 from brigade.services import (
-    OPS_ROOM_LAYOUT_KEY,
     OPS_ROOM_ROOMS,
     build_chat_payload,
     build_cockpit_payload,
     build_hierarchy_payload,
     build_ops_room_payload,
     build_settings_payload,
-    normalize_ops_room_layout,
     send_orchestrator_chat,
     send_user_chat,
     set_config_value,
@@ -133,14 +131,6 @@ def create_app(
         if not can(current.user, permission):
             raise HTTPException(status_code=403, detail=f"missing permission: {permission}")
         return current.user
-
-    def current_user_key(current: AuthResult) -> str:
-        if current.user is not None:
-            return current.user.username
-        return "bootstrap"
-
-    def ops_room_layout(current: AuthResult) -> dict[str, Any] | None:
-        return store.ui_layout(current_user_key(current), OPS_ROOM_LAYOUT_KEY)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
@@ -340,7 +330,7 @@ def create_app(
     @app.get("/api/ops-room")
     async def ops_room(current: AuthResult = auth_dependency) -> dict[str, object]:
         require("status:read", current)
-        return build_ops_room_payload(store, layout=ops_room_layout(current))
+        return build_ops_room_payload(store)
 
     @app.get("/api/ops-room/events")
     async def ops_room_events(current: AuthResult = auth_dependency):
@@ -348,7 +338,7 @@ def create_app(
 
         async def events():
             while True:
-                payload = build_ops_room_payload(store, layout=ops_room_layout(current))
+                payload = build_ops_room_payload(store)
                 yield f"event: snapshot\ndata: {json.dumps(payload, sort_keys=True)}\n\n"
                 await asyncio.sleep(2.0)
 
@@ -357,22 +347,6 @@ def create_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-
-    @app.get("/api/ops-room/layout")
-    async def get_ops_room_layout(current: AuthResult = auth_dependency) -> dict[str, object]:
-        require("status:read", current)
-        return normalize_ops_room_layout(ops_room_layout(current))
-
-    @app.put("/api/ops-room/layout")
-    async def put_ops_room_layout(
-        payload: dict[str, Any],
-        current: AuthResult = auth_dependency,
-    ) -> dict[str, object]:
-        require("status:read", current)
-        layout = normalize_ops_room_layout(payload)
-        store.set_ui_layout(current_user_key(current), OPS_ROOM_LAYOUT_KEY, layout)
-        stored = store.ui_layout(current_user_key(current), OPS_ROOM_LAYOUT_KEY)
-        return normalize_ops_room_layout(stored)
 
     @app.put("/api/mission")
     async def set_mission(

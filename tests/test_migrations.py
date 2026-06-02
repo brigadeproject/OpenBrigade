@@ -23,12 +23,11 @@ def test_assignment_execution_claims_migration_exists():
     assert "run_owner text not null" in sql
 
 
-def test_ui_layouts_migration_exists():
+def test_removed_ui_layouts_migration_is_tombstoned():
     sql = Path("migrations/0005_ui_layouts.sql").read_text(encoding="utf-8")
 
-    assert "create table if not exists brigade_ui_layouts" in sql
-    assert "primary key (user_key, layout_key)" in sql
-    assert "record jsonb not null" in sql
+    assert "select 1;" in sql
+    assert "brigade_ui_layouts" not in sql
 
 
 def test_external_connections_migration_exists():

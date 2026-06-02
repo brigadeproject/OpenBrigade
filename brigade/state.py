@@ -24,7 +24,6 @@ from brigade.schemas import (
     team_from_dict,
     user_from_dict,
 )
-from brigade.time import utc_now_iso
 
 EMPTY_STATE: dict[str, Any] = {
     "mission": None,
@@ -46,7 +45,6 @@ EMPTY_STATE: dict[str, Any] = {
     "transcripts": [],
     "episodes": [],
     "provenance_records": [],
-    "ui_layouts": {},
     "connector_audit_events": [],
     "external_identities": [],
     "local_inference": {
@@ -381,21 +379,6 @@ class JsonStateStore:
             "neo4j": {"backend": "neo4j", "ok": False, "detail": "not configured"},
         }
 
-    def ui_layout(self, user_key: str, layout_key: str) -> dict[str, Any] | None:
-        layout = self.load().get("ui_layouts", {}).get(_ui_layout_key(user_key, layout_key))
-        return dict(layout) if isinstance(layout, dict) else None
-
-    def set_ui_layout(self, user_key: str, layout_key: str, layout: dict[str, Any]) -> None:
-        state = self.load()
-        layouts = state.setdefault("ui_layouts", {})
-        record = dict(layout)
-        record.setdefault("version", 1)
-        record["user_key"] = user_key
-        record["layout_key"] = layout_key
-        record["updated_at"] = utc_now_iso()
-        layouts[_ui_layout_key(user_key, layout_key)] = record
-        self.save(state)
-
     def add_connector_audit_event(self, record: dict[str, Any]) -> None:
         state = self.load()
         state.setdefault("connector_audit_events", []).append(dict(record))
@@ -477,7 +460,3 @@ def _goal_identity(goal: dict[str, Any]) -> tuple[object, ...]:
         goal.get("set_by"),
         bool(goal.get("human_confirmed")),
     )
-
-
-def _ui_layout_key(user_key: str, layout_key: str) -> str:
-    return f"{user_key}:{layout_key}"

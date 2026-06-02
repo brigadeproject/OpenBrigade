@@ -15,8 +15,6 @@ from brigade.schemas import Assignment, AssignmentStatus, ChatMessage, User
 from brigade.store import StateStore
 from brigade.time import utc_now_iso
 
-OPS_ROOM_LAYOUT_KEY = "ops-room"
-
 OPS_ROOM_ROOMS: list[dict[str, Any]] = [
     {
         "id": "orchestrator",
@@ -468,8 +466,6 @@ def build_hierarchy_payload(store: StateStore) -> dict[str, Any]:
 
 def build_ops_room_payload(
     store: StateStore,
-    *,
-    layout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     mission = store.mission()
     agents = store.agents()
@@ -523,7 +519,6 @@ def build_ops_room_payload(
         "financial_report": store.latest_financial_report(),
         "local_inference": store.local_inference(),
         "cloud_jobs": store.cloud_jobs(),
-        "layout": normalize_ops_room_layout(layout),
         "messages": [message.to_dict() for message in store.messages()[-30:]],
     }
 
@@ -621,33 +616,6 @@ def build_dashboard_payload_data(store: StateStore) -> dict[str, Any]:
     from brigade.tui import build_dashboard_payload
 
     return build_dashboard_payload(store)
-
-
-def normalize_ops_room_layout(layout: dict[str, Any] | None = None) -> dict[str, Any]:
-    record = dict(layout or {})
-    seats = record.get("seats")
-    if not isinstance(seats, list):
-        seats = []
-    normalized_seats: list[dict[str, Any]] = []
-    for seat in seats:
-        if not isinstance(seat, dict):
-            continue
-        agent_id = str(seat.get("agent_id") or "").strip()
-        if not agent_id:
-            continue
-        normalized_seats.append(
-            {
-                "agent_id": agent_id,
-                "x": int(seat.get("x") or 0),
-                "y": int(seat.get("y") or 0),
-            }
-        )
-    return {
-        **record,
-        "version": int(record.get("version") or 1),
-        "layout_key": str(record.get("layout_key") or OPS_ROOM_LAYOUT_KEY),
-        "seats": normalized_seats,
-    }
 
 
 def build_settings_payload(settings: Settings) -> dict[str, Any]:

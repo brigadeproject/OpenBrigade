@@ -136,12 +136,6 @@ type Message = {
   created_at: string;
 };
 
-type OpsRoomLayout = {
-  version: number;
-  layout_key: string;
-  seats?: unknown[];
-};
-
 type OpsRoomSnapshot = {
   version: number;
   generated_at: string;
@@ -156,7 +150,6 @@ type OpsRoomSnapshot = {
   financial_report?: Record<string, unknown> | null;
   local_inference?: Record<string, unknown>;
   cloud_jobs?: Record<string, unknown>[];
-  layout: OpsRoomLayout;
   messages: Message[];
 };
 

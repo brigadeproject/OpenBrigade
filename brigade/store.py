@@ -164,10 +164,6 @@ class StateStore(Protocol):
 
     def external_datastore_status(self) -> dict[str, dict[str, object]]: ...
 
-    def ui_layout(self, user_key: str, layout_key: str) -> dict[str, Any] | None: ...
-
-    def set_ui_layout(self, user_key: str, layout_key: str, layout: dict[str, Any]) -> None: ...
-
     def add_connector_audit_event(self, record: dict[str, Any]) -> None: ...
 
     def connector_audit_events(
@@ -1373,39 +1369,6 @@ class PostgresStateStore:
             "qdrant": self._qdrant.health().to_dict(),
             "neo4j": self._neo4j.health().to_dict(),
         }
-
-    def ui_layout(self, user_key: str, layout_key: str) -> dict[str, Any] | None:
-        record = self._record_or_none(
-            """
-            select record
-            from brigade_ui_layouts
-            where user_key = %s and layout_key = %s
-            """,
-            (user_key, layout_key),
-        )
-        return dict(record) if isinstance(record, dict) else None
-
-    def set_ui_layout(self, user_key: str, layout_key: str, layout: dict[str, Any]) -> None:
-        record = dict(layout)
-        record.setdefault("version", 1)
-        record["user_key"] = user_key
-        record["layout_key"] = layout_key
-        record["updated_at"] = utc_now_iso()
-        self._execute(
-            """
-            insert into brigade_ui_layouts (user_key, layout_key, updated_at, record)
-            values (%s, %s, %s, %s::jsonb)
-            on conflict (user_key, layout_key) do update set
-              updated_at = excluded.updated_at,
-              record = excluded.record
-            """,
-            (
-                user_key,
-                layout_key,
-                record["updated_at"],
-                json.dumps(record, sort_keys=True),
-            ),
-        )
 
     def add_connector_audit_event(self, record: dict[str, Any]) -> None:
         self._execute(
