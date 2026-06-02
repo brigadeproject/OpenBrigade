@@ -22,7 +22,7 @@ def test_ops_room_snapshot_maps_agent_state_and_layout(tmp_path):
     store.upsert_agent_state(
         AgentState(
             agent="sage",
-            status="working",
+            status="idle",
             current_assignment_id=assignment.assignment_id,
             current_assignment_summary=assignment.assignment,
         )
@@ -41,8 +41,30 @@ def test_ops_room_snapshot_maps_agent_state_and_layout(tmp_path):
     assert payload["version"] == 1
     assert payload["agents"][0]["status"] == "working"
     assert payload["agents"][0]["activity"] == "typing"
+    assert payload["agents"][0]["room"]["id"] == "studio"
+    assert payload["agents"][0]["room"]["source"] == "assignment"
     assert payload["agents"][0]["current_assignment"]["assignment"] == "Draft launch plan"
+    assert payload["rooms"][0]["id"] == "orchestrator"
     assert payload["layout"]["seats"] == [{"agent_id": "sage", "x": 4, "y": 14}]
+
+
+def test_ops_room_snapshot_prefers_explicit_task_room(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    store.add_agent(Agent("garde", "GARDE", "workspace-garde", "engineer"))
+    assignment = Assignment(
+        assignment="Write a launch update after the deploy",
+        assigned_to="garde",
+        created_by="human",
+        source="test",
+        room_id="server",
+    )
+    assignment.transition_to(AssignmentStatus.ASSIGNED)
+    store.add_assignment(assignment)
+
+    payload = build_ops_room_payload(store)
+
+    assert payload["agents"][0]["room"]["id"] == "server"
+    assert payload["agents"][0]["current_assignment"]["room_id"] == "server"
 
 
 def test_json_state_store_keeps_per_user_ops_room_layouts(tmp_path):

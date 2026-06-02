@@ -161,10 +161,10 @@ Prototype v0.9.1 adds the Live Ops Room as the final RC-facing web surface befor
 brigade web --host 127.0.0.1 --port 8080
 ```
 
-The Live Ops Room renders a Pixel Agents-inspired room backed by OpenBrigade state. It streams
-agent/task snapshots over `/api/ops-room/events`, uses REST for actions, supports per-user seat
-placement, and exposes common mission, goal, task, and user-to-agent chat workflows. Pixel Agents
-assets are included under `web/public/assets/pixel-agents/` with MIT attribution.
+The Live Ops Room renders a room-floor view backed by OpenBrigade state. It streams
+agent/task snapshots over `/api/ops-room/events`, uses REST for actions, routes agents into rooms
+from their active assignments, and exposes common mission, goal, task, and user-to-agent chat
+workflows.
 
 The orchestrator writes active assignments to `HEARTBEAT.md` in explicit agent workspaces under
 `.brigade/`. The runner reads the last parseable assignment block, preserves surrounding notes,

@@ -2,45 +2,22 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
-const TILE_SIZE = 16;
-const ASSET_ROOT = "/assets/pixel-agents";
-const DEFAULT_SEATS: Seat[] = [
-  { agent_id: "", x: 3, y: 14 },
-  { agent_id: "", x: 7, y: 14 },
-  { agent_id: "", x: 4, y: 17 },
-  { agent_id: "", x: 6, y: 17 },
-  { agent_id: "", x: 4, y: 19 },
-  { agent_id: "", x: 6, y: 19 },
-  { agent_id: "", x: 12, y: 13 },
-  { agent_id: "", x: 16, y: 13 },
-  { agent_id: "", x: 12, y: 16 },
-  { agent_id: "", x: 16, y: 16 },
+const OPS_ROOM_FALLBACK_ROOMS: OpsRoomRoom[] = [
+  { id: "orchestrator", label: "Orchestrator", domains: [], kind: "orchestrator", fixed_agent_id: "orchestrator" },
+  { id: "studio", label: "Studio", domains: ["content", "writing", "marketing"], kind: "work" },
+  { id: "craft", label: "Craft Room", domains: ["build", "design", "implementation", "prototype"], kind: "work" },
+  { id: "cubicles", label: "Cubicles", domains: ["research", "ops", "coordination", "support"], kind: "work" },
+  { id: "server", label: "Server Room", domains: ["infra", "security", "code", "test"], kind: "work" },
+  { id: "finance", label: "Finance", domains: ["finance", "budget", "usage", "reporting"], kind: "work" },
+  { id: "breakroom", label: "Break Room", domains: [], statuses: ["idle", "queued"], kind: "rest" },
+  {
+    id: "barracks",
+    label: "Barracks",
+    domains: [],
+    statuses: ["blocked", "awaiting_human", "reflecting", "ruminating", "dreaming"],
+    kind: "rest",
+  },
 ];
-
-const FURNITURE_PATHS: Record<string, string> = {
-  BIN: "BIN/BIN.png",
-  CLOCK: "CLOCK/CLOCK.png",
-  COFFEE: "COFFEE/COFFEE.png",
-  COFFEE_TABLE: "COFFEE_TABLE/COFFEE_TABLE.png",
-  CUSHIONED_BENCH: "CUSHIONED_BENCH/CUSHIONED_BENCH.png",
-  DESK_FRONT: "DESK/DESK_FRONT.png",
-  DOUBLE_BOOKSHELF: "DOUBLE_BOOKSHELF/DOUBLE_BOOKSHELF.png",
-  HANGING_PLANT: "HANGING_PLANT/HANGING_PLANT.png",
-  LARGE_PAINTING: "LARGE_PAINTING/LARGE_PAINTING.png",
-  PC_FRONT_OFF: "PC/PC_FRONT_OFF.png",
-  PC_SIDE: "PC/PC_SIDE.png",
-  PLANT: "PLANT/PLANT.png",
-  PLANT_2: "PLANT_2/PLANT_2.png",
-  SMALL_PAINTING: "SMALL_PAINTING/SMALL_PAINTING.png",
-  SMALL_PAINTING_2: "SMALL_PAINTING_2/SMALL_PAINTING_2.png",
-  SMALL_TABLE_FRONT: "SMALL_TABLE/SMALL_TABLE_FRONT.png",
-  SMALL_TABLE_SIDE: "SMALL_TABLE/SMALL_TABLE_SIDE.png",
-  SOFA_BACK: "SOFA/SOFA_BACK.png",
-  SOFA_FRONT: "SOFA/SOFA_FRONT.png",
-  SOFA_SIDE: "SOFA/SOFA_SIDE.png",
-  TABLE_FRONT: "TABLE_FRONT/TABLE_FRONT.png",
-  WOODEN_CHAIR_SIDE: "WOODEN_CHAIR/WOODEN_CHAIR_SIDE.png",
-};
 
 type User = {
   username: string;
@@ -85,7 +62,10 @@ type Assignment = {
   progress_summary?: string | null;
   blockers: string[];
   awaiting_human: boolean;
+  last_run_provider?: string | null;
+  last_run_model?: string | null;
   goal_statement?: string | null;
+  room_id?: string | null;
   created_at?: string;
   updated_at?: string;
 };
@@ -101,18 +81,38 @@ type AgentState = {
   next_available: string;
 };
 
+type AgentRoom = {
+  id: string;
+  label: string;
+  source: string;
+  reason: string;
+  domain?: string | null;
+};
+
 type VisualAgent = {
   agent_id: string;
   display_name: string;
   role: string;
+  model_provider: string;
+  model_name: string;
   team_id?: string | null;
   team_role: string;
   status: string;
   activity: string;
+  room?: AgentRoom | null;
   current_assignment?: Assignment | null;
   state?: AgentState | null;
   goals: Goal[];
   usage: Usage;
+};
+
+type OpsRoomRoom = {
+  id: string;
+  label: string;
+  domains: string[];
+  statuses?: string[];
+  fixed_agent_id?: string | null;
+  kind?: string;
 };
 
 type Team = {
@@ -132,19 +132,14 @@ type Message = {
   sender: string;
   recipient: string;
   content: string;
+  metadata?: Record<string, unknown>;
   created_at: string;
-};
-
-type Seat = {
-  agent_id: string;
-  x: number;
-  y: number;
 };
 
 type OpsRoomLayout = {
   version: number;
   layout_key: string;
-  seats: Seat[];
+  seats?: unknown[];
 };
 
 type OpsRoomSnapshot = {
@@ -152,6 +147,7 @@ type OpsRoomSnapshot = {
   generated_at: string;
   mission: Mission | null;
   latest_reasoning?: { decision_summary?: string; cycle_id?: string } | null;
+  rooms?: OpsRoomRoom[];
   agents: VisualAgent[];
   teams: Team[];
   assignments: Assignment[];
@@ -271,20 +267,6 @@ type ModelRoute = {
   base_url?: string | null;
 };
 
-type DefaultLayout = {
-  cols: number;
-  rows: number;
-  tiles: number[];
-  furniture: { uid: string; type: string; col: number; row: number }[];
-};
-
-type Assets = {
-  layout: DefaultLayout;
-  floors: HTMLImageElement[];
-  characters: HTMLImageElement[];
-  furniture: Record<string, HTMLImageElement>;
-};
-
 type ApiOptions = RequestInit & { json?: unknown };
 
 class ApiError extends Error {
@@ -319,9 +301,6 @@ function App() {
   const [status, setStatus] = useState("Loading");
   const [streamStatus, setStreamStatus] = useState("connecting");
   const [authClock, setAuthClock] = useState(Date.now());
-  const [seatDraft, setSeatDraft] = useState<Seat[]>([]);
-  const [layoutDirty, setLayoutDirty] = useState(false);
-  const [editingSeats, setEditingSeats] = useState(false);
   const [activePanel, setActivePanel] = useState<"tasks" | "chat" | "goals">("tasks");
   const [view, setView] = useState<"cockpit" | "ops">(() => initialView());
   const [taskDialogOpen, setTaskDialogOpen] = useState(false);
@@ -403,10 +382,7 @@ function App() {
     if (!selectedAgentId && next.agents[0]) {
       setSelectedAgentId(next.agents[0].agent_id);
     }
-    if (!layoutDirty) {
-      setSeatDraft(next.layout?.seats || []);
-    }
-  }, [api, layoutDirty, selectedAgentId]);
+  }, [api, selectedAgentId]);
 
   const refreshAll = useCallback(async () => {
     if (tokenExpired) {
@@ -498,9 +474,6 @@ function App() {
             }
             const next = JSON.parse(data) as OpsRoomSnapshot;
             setSnapshot(next);
-            if (!layoutDirty) {
-              setSeatDraft(next.layout?.seats || []);
-            }
             if (!selectedAgentId && next.agents[0]) {
               setSelectedAgentId(next.agents[0].agent_id);
             }
@@ -529,7 +502,7 @@ function App() {
         window.clearTimeout(reconnectTimer);
       }
     };
-  }, [layoutDirty, selectedAgentId, token, tokenExpired]);
+  }, [selectedAgentId, token, tokenExpired]);
 
   const selectedAgent = useMemo(
     () => allAgents(cockpit, snapshot).find((agent) => agent.agent_id === selectedAgentId) || null,
@@ -577,21 +550,6 @@ function App() {
     }
     setAgentModelSelections((current) => ({ ...current, [selectedAgentId]: route }));
   }, [selectedAgentId]);
-
-  async function saveSeatLayout() {
-    if (!snapshot) {
-      return;
-    }
-    const resolved = resolveSeats(snapshot.agents, seatDraft);
-    await api<OpsRoomLayout>("/api/ops-room/layout", {
-      method: "PUT",
-      json: { version: 1, layout_key: "ops-room", seats: resolved },
-    });
-    setSeatDraft(resolved);
-    setLayoutDirty(false);
-    setStatus("Seat layout saved");
-    await loadSnapshot();
-  }
 
   const statusTone = tokenExpired || authMessage ? "bad" : streamStatus === "live" ? "good" : "warn";
 
@@ -699,6 +657,8 @@ function App() {
           onSelectAgent={selectAgent}
           onSelectedAgentModelChange={setSelectedAgentModel}
           onOrchestratorModelChange={setOrchestratorModel}
+          onModelsChange={setModels}
+          onSettingsChange={setSettings}
           onRefresh={refreshAll}
           setStatus={setStatus}
           onOpenTaskDialog={() => setTaskDialogOpen(true)}
@@ -712,18 +672,9 @@ function App() {
           teams={snapshot?.teams || cockpit?.teams || []}
           activePanel={activePanel}
           setActivePanel={setActivePanel}
-          seatDraft={seatDraft}
-          editingSeats={editingSeats}
-          layoutDirty={layoutDirty}
           can={can}
           api={api}
-          onSaveSeats={() => saveSeatLayout().catch((error) => setStatus(errorMessage(error)))}
-          onToggleSeats={() => setEditingSeats((value) => !value)}
           onSelectAgent={setSelectedAgentId}
-          onChangeSeats={(nextSeats) => {
-            setSeatDraft(nextSeats);
-            setLayoutDirty(true);
-          }}
           onRefresh={refreshAll}
           setStatus={setStatus}
           onOpenTaskDialog={() => setTaskDialogOpen(true)}
@@ -796,6 +747,8 @@ function CockpitView({
   onSelectAgent,
   onSelectedAgentModelChange,
   onOrchestratorModelChange,
+  onModelsChange,
+  onSettingsChange,
   onRefresh,
   setStatus,
   onOpenTaskDialog,
@@ -814,6 +767,8 @@ function CockpitView({
   onSelectAgent: (agentId: string, panel?: "tasks" | "chat" | "goals") => void;
   onSelectedAgentModelChange: (route: ModelRoute) => void;
   onOrchestratorModelChange: (route: ModelRoute) => void;
+  onModelsChange: (models: ModelInventory) => void;
+  onSettingsChange: (settings: SettingsPayload) => void;
   onRefresh: () => Promise<void>;
   setStatus: (status: string) => void;
   onOpenTaskDialog: () => void;
@@ -822,18 +777,35 @@ function CockpitView({
   return (
     <section className="cockpit">
       <div className="widget-grid">
-        <Widget title="Uptime">
-          <div className="stat-large">{formatDuration(cockpit?.uptime_seconds || 0)}</div>
-          <p className="muted">Started {formatTime(cockpit?.started_at)}</p>
+        <Widget title="Current Alerts">
+          <AlertList
+            alerts={cockpit?.alerts || []}
+            canClear={can("orchestrator:write")}
+            api={api}
+            onDone={onRefresh}
+            setStatus={setStatus}
+          />
         </Widget>
-        <Widget title="Service Health">
-          <HealthList checks={cockpit?.datastores || []} />
+        <Widget title="Uptime / Service Health" className="health-combo">
+          <div className="two-column-widget">
+            <div>
+              <div className="stat-large">{formatDuration(cockpit?.uptime_seconds || 0)}</div>
+              <p className="muted">Started {formatTime(cockpit?.started_at)}</p>
+            </div>
+            <HealthList checks={cockpit?.datastores || []} />
+          </div>
         </Widget>
         <Widget title="Models Available">
-          <ModelSummary cockpit={cockpit} models={models} />
-        </Widget>
-        <Widget title="Token Usage / Spend">
-          <UsageSummary usage={cockpit?.usage || null} />
+          <ModelSummary
+            cockpit={cockpit}
+            models={models}
+            canEdit={can("admin")}
+            api={api}
+            onModelsChange={onModelsChange}
+            onSettingsChange={onSettingsChange}
+            onDone={onRefresh}
+            setStatus={setStatus}
+          />
         </Widget>
         <Widget title="Current Mission" wide>
           <MissionWidget
@@ -845,9 +817,6 @@ function CockpitView({
             setStatus={setStatus}
           />
         </Widget>
-        <Widget title="Current Alerts">
-          <AlertList alerts={cockpit?.alerts || []} />
-        </Widget>
         <Widget title="Tasks" wide>
           <TaskBoard
             tasks={cockpit?.tasks || null}
@@ -856,6 +825,19 @@ function CockpitView({
             onOpenTaskDialog={onOpenTaskDialog}
             onSelectAgent={(agentId) => onSelectAgent(agentId, "tasks")}
           />
+        </Widget>
+        <Widget title="Orchestrator Chat" wide>
+          <OrchestratorChat
+            canChat={can("chat:write")}
+            api={api}
+            inventory={models}
+            route={orchestratorModel}
+            onRouteChange={onOrchestratorModelChange}
+            setStatus={setStatus}
+          />
+        </Widget>
+        <Widget title="Token Usage / Spend">
+          <UsageSummary usage={cockpit?.usage || null} />
         </Widget>
         <Widget title="Teams">
           <TeamBoard
@@ -884,16 +866,6 @@ function CockpitView({
             </>
           )}
         </Widget>
-        <Widget title="Orchestrator Chat" wide>
-          <OrchestratorChat
-            canChat={can("chat:write")}
-            api={api}
-            inventory={models}
-            route={orchestratorModel}
-            onRouteChange={onOrchestratorModelChange}
-            setStatus={setStatus}
-          />
-        </Widget>
         <Widget title="Settings / Status" wide>
           <SettingsStatus
             settings={settings}
@@ -911,14 +883,16 @@ function CockpitView({
 function Widget({
   title,
   wide = false,
+  className = "",
   children,
 }: {
   title: string;
   wide?: boolean;
+  className?: string;
   children: React.ReactNode;
 }) {
   return (
-    <article className={`widget ${wide ? "wide" : ""}`}>
+    <article className={`widget ${wide ? "wide" : ""} ${className}`}>
       <h2>{title}</h2>
       {children}
     </article>
@@ -945,14 +919,49 @@ function HealthList({ checks }: { checks: { name: string; ok: boolean; detail: s
 function ModelSummary({
   cockpit,
   models,
+  canEdit,
+  api,
+  onModelsChange,
+  onSettingsChange,
+  onDone,
+  setStatus,
 }: {
   cockpit: CockpitPayload | null;
   models: ModelInventory | null;
+  canEdit: boolean;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  onModelsChange: (models: ModelInventory) => void;
+  onSettingsChange: (settings: SettingsPayload) => void;
+  onDone: () => Promise<void>;
+  setStatus: (status: string) => void;
 }) {
   if (!cockpit) {
     return <p className="muted">Loading model status.</p>;
   }
-  const available = models?.options.filter((option) => option.available) || [];
+  const options = visibleModelOptions(models);
+  const available = options.filter((option) => option.available);
+  const defaultOption = options.find((option) => option.is_default) || options[0] || null;
+  const defaultKey = defaultOption ? modelOptionKey(defaultOption) : "";
+
+  async function setDefault(value: string) {
+    const option = options.find((item) => modelOptionKey(item) === value);
+    if (!option) {
+      return;
+    }
+    setStatus("Saving default model");
+    const result = await api<{ settings: SettingsPayload; models: ModelInventory }>("/api/models/default", {
+      method: "PUT",
+      json: {
+        provider: option.provider,
+        model: option.model,
+      },
+    });
+    onSettingsChange(result.settings);
+    onModelsChange(result.models);
+    setStatus("Default model saved");
+    await onDone();
+  }
+
   return (
     <div className="model-summary">
       <dl className="compact-dl">
@@ -967,8 +976,33 @@ function ModelSummary({
         <dt>Available</dt>
         <dd>{available.length}</dd>
       </dl>
+      <label className="model-select">
+        <span>Global default</span>
+        <select
+          value={defaultKey}
+          disabled={!canEdit || !models}
+          onChange={(event) => setDefault(event.target.value).catch((error) => setStatus(errorMessage(error)))}
+        >
+          {!models && <option value="">Loading models</option>}
+          {options.map((option) => (
+            <option
+              key={modelOptionKey(option)}
+              value={modelOptionKey(option)}
+              disabled={!option.available}
+            >
+              {option.label}
+              {!option.available ? " (unavailable)" : ""}
+            </option>
+          ))}
+        </select>
+      </label>
+      <PermissionNotice
+        allowed={canEdit}
+        permission="admin"
+        action="global model changes are disabled"
+      />
       <div className="mini-list">
-        {(models?.options || []).slice(0, 5).map((option) => (
+        {options.slice(0, 5).map((option) => (
           <span key={modelOptionKey(option)} className={option.available ? "" : "muted-bad"}>
             {option.label} / {option.available ? "ready" : option.detail || "unavailable"}
           </span>
@@ -989,16 +1023,21 @@ function ModelSelect({
   route: ModelRoute | null;
   onChange: (route: ModelRoute) => void;
 }) {
-  const options = inventory?.options || [];
-  const value = route ? modelRouteKey(route) : inventory ? modelOptionKey(inventory.recommended) : "";
+  const visibleOptions = visibleModelOptions(inventory);
+  const fallback = visibleOptions.find((option) => option.is_default) || visibleOptions[0] || null;
+  const value = route && route.provider !== "fake"
+    ? modelRouteKey(route)
+    : fallback
+      ? modelOptionKey(fallback)
+      : "";
   return (
     <label className="model-select">
       <span>{label}</span>
       <select
         value={value}
-        disabled={!inventory || options.length === 0}
+        disabled={!inventory || visibleOptions.length === 0}
         onChange={(event) => {
-          const option = options.find((item) => modelOptionKey(item) === event.target.value);
+          const option = visibleOptions.find((item) => modelOptionKey(item) === event.target.value);
           const nextRoute = modelRouteFromOption(option || null);
           if (nextRoute) {
             onChange(nextRoute);
@@ -1006,7 +1045,7 @@ function ModelSelect({
         }}
       >
         {!inventory && <option value="">Loading models</option>}
-        {options.map((option) => (
+        {visibleOptions.map((option) => (
           <option
             key={modelOptionKey(option)}
             value={modelOptionKey(option)}
@@ -1148,17 +1187,52 @@ function ListBlock({ title, items }: { title: string; items: string[] }) {
   );
 }
 
-function AlertList({ alerts }: { alerts: string[] }) {
+function AlertList({
+  alerts,
+  canClear,
+  api,
+  onDone,
+  setStatus,
+}: {
+  alerts: string[];
+  canClear: boolean;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  onDone: () => Promise<void>;
+  setStatus: (status: string) => void;
+}) {
+  async function clear() {
+    setStatus("Clearing alerts");
+    const result = await api<{ count: number }>("/api/alerts", { method: "DELETE" });
+    setStatus(`Cleared ${result.count} alerts`);
+    await onDone();
+  }
+
   if (!alerts.length) {
     return <p className="muted">No current alerts.</p>;
   }
   return (
-    <div className="stack-list compact">
-      {alerts.slice(-8).map((alert, index) => (
-        <article key={`${index}:${alert}`} className="alert-row">
-          <p>{alert}</p>
-        </article>
-      ))}
+    <div className="alert-list">
+      <div className="toolbar-row">
+        <span className="muted">{alerts.length} active</span>
+        <button
+          disabled={!canClear}
+          onClick={() => clear().catch((error) => setStatus(errorMessage(error)))}
+        >
+          Clear
+        </button>
+      </div>
+      <div className="stack-list compact">
+        {alerts.slice(-8).map((alert, index) => (
+          <article key={`${index}:${alert}`} className="alert-row">
+            <p>{alert}</p>
+          </article>
+        ))}
+      </div>
+      <PermissionNotice
+        allowed={canClear}
+        permission="orchestrator:write"
+        action="alert clearing is disabled"
+      />
     </div>
   );
 }
@@ -1350,6 +1424,7 @@ function OrchestratorChat({
   const [messages, setMessages] = useState<Message[]>([]);
   const [responseHtmlById, setResponseHtmlById] = useState<Record<string, string>>({});
   const [pending, setPending] = useState(false);
+  const feedRef = useAutoScroll<HTMLDivElement>([messages.length, pending]);
 
   const loadMessages = useCallback(async () => {
     const payload = await api<ChatPayload>("/api/chat/messages?channel=orchestrator");
@@ -1398,16 +1473,18 @@ function OrchestratorChat({
         route={route}
         onChange={onRouteChange}
       />
-      <div className="chat-feed">
+      <div className="chat-feed" ref={feedRef}>
         {messages.slice(-8).map((item) => (
           <article key={item.message_id} className="message-row">
             <span>
               {item.sender} -&gt; {item.recipient} / {formatTime(item.created_at)}
             </span>
-            {item.sender === "orchestrator" && responseHtmlById[item.message_id] ? (
+            {item.sender === "orchestrator" ? (
               <div
                 className="message-markdown"
-                dangerouslySetInnerHTML={{ __html: responseHtmlById[item.message_id] }}
+                dangerouslySetInnerHTML={{
+                  __html: responseHtmlById[item.message_id] || renderMarkdownHtml(item.content),
+                }}
               />
             ) : (
               <p>{item.content}</p>
@@ -1564,15 +1641,9 @@ function OpsRoomView({
   teams,
   activePanel,
   setActivePanel,
-  seatDraft,
-  editingSeats,
-  layoutDirty,
   can,
   api,
-  onSaveSeats,
-  onToggleSeats,
   onSelectAgent,
-  onChangeSeats,
   onRefresh,
   setStatus,
   onOpenTaskDialog,
@@ -1584,15 +1655,9 @@ function OpsRoomView({
   teams: Team[];
   activePanel: "tasks" | "chat" | "goals";
   setActivePanel: (panel: "tasks" | "chat" | "goals") => void;
-  seatDraft: Seat[];
-  editingSeats: boolean;
-  layoutDirty: boolean;
   can: (permission: string) => boolean;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
-  onSaveSeats: () => void;
-  onToggleSeats: () => void;
   onSelectAgent: (agentId: string) => void;
-  onChangeSeats: (seats: Seat[]) => void;
   onRefresh: () => Promise<void>;
   setStatus: (status: string) => void;
   onOpenTaskDialog: () => void;
@@ -1606,21 +1671,15 @@ function OpsRoomView({
             <span>{snapshot?.generated_at || "Waiting for snapshot"}</span>
           </div>
           <div className="room-tools">
-            <button className={editingSeats ? "active" : ""} onClick={onToggleSeats}>
-              Seats
-            </button>
-            <button disabled={!layoutDirty} onClick={onSaveSeats}>
-              Save Seats
+            <button onClick={() => onRefresh().catch((error) => setStatus(errorMessage(error)))}>
+              Refresh
             </button>
           </div>
         </div>
-        <OpsRoomCanvas
+        <OpsRoomFloor
           snapshot={snapshot}
-          seats={seatDraft}
-          editingSeats={editingSeats}
           selectedAgentId={selectedAgentId}
           onSelectAgent={onSelectAgent}
-          onChangeSeats={onChangeSeats}
         />
       </div>
 
@@ -1782,9 +1841,20 @@ function AgentChatPanel({
 }) {
   const [message, setMessage] = useState("");
   const [pending, setPending] = useState(false);
+  const selectedAgent = snapshot?.agents.find((agent) => agent.agent_id === selectedAgentId) || null;
   const messages = (snapshot?.messages || []).filter(
     (item) => item.sender === selectedAgentId || item.recipient === selectedAgentId,
   );
+  const feedRef = useAutoScroll<HTMLDivElement>([selectedAgentId, messages.length, pending]);
+  const lastRunProvider = selectedAgent?.current_assignment?.last_run_provider;
+  const lastRunModel = selectedAgent?.current_assignment?.last_run_model;
+  const configuredProvider = selectedAgent?.model_provider;
+  const configuredModel = selectedAgent?.model_name;
+  const routeProvider = lastRunProvider || configuredProvider || modelRoute?.provider;
+  const routeModel = lastRunModel || configuredModel || modelRoute?.model;
+  const routeLabel = routeProvider && routeModel
+    ? `${routeProvider} / ${routeModel}${lastRunProvider ? " (last run)" : " (configured)"}`
+    : "model not loaded";
 
   async function send() {
     if (!message.trim() || !selectedAgentId) {
@@ -1812,7 +1882,8 @@ function AgentChatPanel({
 
   return (
     <section className="panel-body chat-panel">
-      <div className="chat-feed">
+      <p className="model-route-note">Agent model: {routeLabel}</p>
+      <div className="chat-feed" ref={feedRef}>
         {messages.slice(-12).map((item) => (
           <article key={item.message_id} className="message-row">
             <span>
@@ -1961,7 +2032,9 @@ function TaskDialog({
   const [assignment, setAssignment] = useState("");
   const [priority, setPriority] = useState("normal");
   const [workMode, setWorkMode] = useState("heartbeat");
+  const [roomId, setRoomId] = useState("");
   const [goalStatement, setGoalStatement] = useState("");
+  const taskRooms = OPS_ROOM_FALLBACK_ROOMS.filter((room) => room.kind === "work");
 
   async function createTask() {
     if (!assignment.trim() || !agentId || !canCreate) {
@@ -1975,6 +2048,7 @@ function TaskDialog({
         assignment,
         priority,
         work_mode: workMode,
+        room_id: roomId || undefined,
         goal_statement: goalStatement || undefined,
         idempotency_key: randomId("web-task"),
       },
@@ -2021,6 +2095,17 @@ function TaskDialog({
               </select>
             </label>
             <label>
+              <span>Room</span>
+              <select value={roomId} disabled={!canCreate} onChange={(event) => setRoomId(event.target.value)}>
+                <option value="">auto</option>
+                {taskRooms.map((room) => (
+                  <option key={room.id} value={room.id}>
+                    {room.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
               <span>Work mode</span>
               <select value={workMode} disabled={!canCreate} onChange={(event) => setWorkMode(event.target.value)}>
                 <option value="heartbeat">heartbeat</option>
@@ -2057,443 +2142,284 @@ function TaskDialog({
   );
 }
 
-function OpsRoomCanvas({
+function OpsRoomFloor({
   snapshot,
-  seats,
-  editingSeats,
   selectedAgentId,
   onSelectAgent,
-  onChangeSeats,
 }: {
   snapshot: OpsRoomSnapshot | null;
-  seats: Seat[];
-  editingSeats: boolean;
   selectedAgentId: string;
   onSelectAgent: (agentId: string) => void;
-  onChangeSeats: (seats: Seat[]) => void;
 }) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const wrapRef = useRef<HTMLDivElement | null>(null);
-  const { assets, error } = useAssets();
-  const [zoom, setZoom] = useState(1);
-  const [dragAgentId, setDragAgentId] = useState<string | null>(null);
-  const resolvedSeats = useMemo(
-    () => resolveSeats(snapshot?.agents || [], seats),
-    [seats, snapshot?.agents],
-  );
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const wrap = wrapRef.current;
-    if (!canvas || !wrap) {
-      return;
-    }
-    const resize = () => {
-      const dpr = window.devicePixelRatio || 1;
-      const rect = wrap.getBoundingClientRect();
-      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
-      canvas.style.width = `${rect.width}px`;
-      canvas.style.height = `${rect.height}px`;
-    };
-    resize();
-    const observer = new ResizeObserver(resize);
-    observer.observe(wrap);
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) {
-      return;
-    }
-    const context = canvas.getContext("2d");
-    if (!context) {
-      return;
-    }
-    let frame = 0;
-    let stopped = false;
-    const draw = (time: number) => {
-      if (stopped) {
-        return;
-      }
-      if (assets && snapshot) {
-        renderRoom(context, canvas, assets, snapshot, resolvedSeats, {
-          editingSeats,
-          selectedAgentId,
-          time,
-          zoom,
-        });
-      } else {
-        renderFallbackRoom(context, canvas, snapshot, error);
-      }
-      frame = window.requestAnimationFrame(draw);
-    };
-    frame = window.requestAnimationFrame(draw);
-    return () => {
-      stopped = true;
-      window.cancelAnimationFrame(frame);
-    };
-  }, [assets, editingSeats, error, resolvedSeats, selectedAgentId, snapshot, zoom]);
-
-  const pointerToTile = useCallback(
-    (event: React.PointerEvent<HTMLCanvasElement>) => {
-      const canvas = canvasRef.current;
-      if (!canvas || !assets) {
-        return null;
-      }
-      const rect = canvas.getBoundingClientRect();
-      const metrics = roomMetrics(rect.width, rect.height, assets.layout, zoom);
-      const x = (event.clientX - rect.left - metrics.originX) / metrics.scale;
-      const y = (event.clientY - rect.top - metrics.originY) / metrics.scale;
-      return {
-        x: Math.max(0, Math.min(assets.layout.cols - 1, Math.round(x / TILE_SIZE))),
-        y: Math.max(0, Math.min(assets.layout.rows - 1, Math.round(y / TILE_SIZE))),
-      };
-    },
-    [assets, zoom],
-  );
-
-  const agentAtPointer = useCallback(
-    (event: React.PointerEvent<HTMLCanvasElement>) => {
-      const tile = pointerToTile(event);
-      if (!tile) {
-        return null;
-      }
-      let nearest: { agentId: string; distance: number } | null = null;
-      for (const seat of resolvedSeats) {
-        const distance = Math.abs(tile.x - seat.x) + Math.abs(tile.y - seat.y);
-        if (distance <= 1 && (!nearest || distance < nearest.distance)) {
-          nearest = { agentId: seat.agent_id, distance };
-        }
-      }
-      return nearest?.agentId || null;
-    },
-    [pointerToTile, resolvedSeats],
-  );
-
-  function moveSeat(agentId: string, x: number, y: number) {
-    const next = resolvedSeats.map((seat) =>
-      seat.agent_id === agentId ? { ...seat, x, y } : seat,
-    );
-    onChangeSeats(next);
-  }
+  const rooms = snapshot?.rooms?.length ? snapshot.rooms : OPS_ROOM_FALLBACK_ROOMS;
+  const agents = snapshot?.agents || [];
+  const agentsByRoom = useMemo(() => {
+    const next = new Map<string, VisualAgent[]>();
+    rooms.forEach((room) => next.set(room.id, []));
+    agents.forEach((agent) => {
+      const roomId = agentRoomId(agent);
+      const bucket = next.get(roomId) || [];
+      bucket.push(agent);
+      next.set(roomId, bucket);
+    });
+    return next;
+  }, [agents, rooms]);
 
   return (
-    <div className="canvas-wrap" ref={wrapRef}>
-      <canvas
-        ref={canvasRef}
-        onPointerDown={(event) => {
-          const agentId = agentAtPointer(event);
-          if (agentId) {
-            onSelectAgent(agentId);
-          }
-          if (editingSeats && agentId) {
-            setDragAgentId(agentId);
-            event.currentTarget.setPointerCapture(event.pointerId);
-          }
-        }}
-        onPointerMove={(event) => {
-          if (!editingSeats || !dragAgentId) {
-            return;
-          }
-          const tile = pointerToTile(event);
-          if (tile) {
-            moveSeat(dragAgentId, tile.x, tile.y);
-          }
-        }}
-        onPointerUp={(event) => {
-          if (dragAgentId) {
-            event.currentTarget.releasePointerCapture(event.pointerId);
-          }
-          setDragAgentId(null);
-        }}
-      />
-      <div className="zoom-controls">
-        <button onClick={() => setZoom((value) => Math.max(0.7, value - 0.15))}>-</button>
-        <span>{Math.round(zoom * 100)}%</span>
-        <button onClick={() => setZoom((value) => Math.min(1.8, value + 0.15))}>+</button>
+    <div className="floor-shell">
+      <div className="floor-legend" aria-label="Agent status legend">
+        {["working", "queued", "blocked", "idle"].map((status) => (
+          <span key={status}>
+            <i className={`agent-token-dot ${statusClass(status)}`} />
+            {status}
+          </span>
+        ))}
       </div>
-      {!assets && !error && <div className="canvas-loading">Loading room assets</div>}
+      <div className="floor-grid">
+        {rooms.map((room) => {
+          const occupants = agentsByRoom.get(room.id) || [];
+          const isRest = room.kind === "rest";
+          const isOrchestrator = room.id === "orchestrator";
+          const isActiveOrchestrator = isOrchestrator && Boolean(snapshot?.latest_reasoning);
+          const tokenUse = occupants.reduce(
+            (sum, agent) => sum + (agent.usage?.total_tokens || 0),
+            0,
+          );
+          return (
+            <article
+              key={room.id}
+              className={[
+                "floor-room",
+                `room-${room.id}`,
+                room.kind || "work",
+                occupants.length ? "occupied" : "",
+                isActiveOrchestrator ? "active" : "",
+              ].join(" ")}
+            >
+              <header className="floor-room-head">
+                <h3>{room.label}</h3>
+                <span>{roomSubtitle(room)}</span>
+              </header>
+              <div className="floor-occupants">
+                {occupants.length ? (
+                  occupants.map((agent) => (
+                    <button
+                      key={agent.agent_id}
+                      className={`agent-token ${statusClass(agent.status)} ${
+                        selectedAgentId === agent.agent_id ? "selected" : ""
+                      }`}
+                      title={agent.room?.reason || agent.status}
+                      onClick={() => onSelectAgent(agent.agent_id)}
+                    >
+                      <span className="agent-token-name">
+                        <i className={`agent-token-dot ${statusClass(agent.status)}`} />
+                        {agent.display_name}
+                      </span>
+                      <span className="agent-token-task">
+                        {shortText(agent.current_assignment?.assignment || agent.status, 58)}
+                      </span>
+                      {!isRest && (
+                        <span className="agent-token-bar" aria-hidden="true">
+                          <i style={{ width: `${tokenPercent(agent)}%` }} />
+                        </span>
+                      )}
+                    </button>
+                  ))
+                ) : (
+                  <p className="floor-empty">
+                    {isOrchestrator && snapshot?.latest_reasoning?.decision_summary
+                      ? shortText(snapshot.latest_reasoning.decision_summary, 72)
+                      : isRest
+                        ? "-"
+                        : "empty"}
+                  </p>
+                )}
+              </div>
+              <footer className="floor-room-foot">
+                {isRest ? (
+                  <>
+                    <span>occupants</span>
+                    <strong>{occupants.length || "-"}</strong>
+                  </>
+                ) : (
+                  <>
+                    <span>recorded tokens</span>
+                    <strong>{tokenUse ? tokenUse.toLocaleString() : "-"}</strong>
+                  </>
+                )}
+              </footer>
+            </article>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
-function useAssets() {
-  const [assets, setAssets] = useState<Assets | null>(null);
-  const [error, setError] = useState("");
+function agentRoomId(agent: VisualAgent) {
+  if (agent.room?.id) {
+    return agent.room.id;
+  }
+  if (agent.current_assignment?.room_id) {
+    return agent.current_assignment.room_id;
+  }
+  if (["blocked", "awaiting_human", "reflecting", "ruminating", "dreaming"].includes(agent.status)) {
+    return "barracks";
+  }
+  return agent.current_assignment ? "cubicles" : "breakroom";
+}
 
+function roomSubtitle(room: OpsRoomRoom) {
+  if (room.statuses?.length) {
+    return room.statuses.join(" / ");
+  }
+  return room.domains.length ? room.domains.join(" / ") : "-";
+}
+
+function tokenPercent(agent: VisualAgent) {
+  return Math.min(100, Math.max(8, Math.round(((agent.usage?.total_tokens || 0) / 60000) * 100)));
+}
+
+function statusClass(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+}
+
+function useAutoScroll<T extends HTMLElement>(dependencies: React.DependencyList) {
+  const ref = useRef<T | null>(null);
   useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      try {
-        const [layout, floors, characters, furniture] = await Promise.all([
-          fetch(`${ASSET_ROOT}/default-layout-1.json`).then((response) => response.json()),
-          Promise.all(
-            Array.from({ length: 9 }, (_, index) =>
-              loadImage(`${ASSET_ROOT}/floors/floor_${index}.png`),
-            ),
-          ),
-          Promise.all(
-            Array.from({ length: 6 }, (_, index) =>
-              loadImage(`${ASSET_ROOT}/characters/char_${index}.png`),
-            ),
-          ),
-          loadFurnitureImages(),
-        ]);
-        if (!cancelled) {
-          setAssets({ layout, floors, characters, furniture });
-        }
-      } catch (loadError) {
-        if (!cancelled) {
-          setError(errorMessage(loadError));
-        }
-      }
+    const element = ref.current;
+    if (element) {
+      element.scrollTop = element.scrollHeight;
     }
-    load();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  return { assets, error };
+  }, dependencies);
+  return ref;
 }
 
-async function loadFurnitureImages() {
-  const entries = await Promise.all(
-    Object.entries(FURNITURE_PATHS).map(async ([type, path]) => [
-      type,
-      await loadImage(`${ASSET_ROOT}/furniture/${path}`),
-    ]),
-  );
-  return Object.fromEntries(entries) as Record<string, HTMLImageElement>;
-}
+function renderMarkdownHtml(text: string) {
+  const lines = text.split(/\r?\n/);
+  const parts: string[] = [];
+  let inCode = false;
+  let codeLines: string[] = [];
+  let inList = false;
+  let tableRows: string[][] = [];
 
-function loadImage(src: string) {
-  return new Promise<HTMLImageElement>((resolve, reject) => {
-    const image = new Image();
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error(`failed to load ${src}`));
-    image.src = src;
-  });
-}
-
-function renderRoom(
-  context: CanvasRenderingContext2D,
-  canvas: HTMLCanvasElement,
-  assets: Assets,
-  snapshot: OpsRoomSnapshot,
-  seats: Seat[],
-  options: {
-    editingSeats: boolean;
-    selectedAgentId: string;
-    time: number;
-    zoom: number;
-  },
-) {
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
-  const dpr = window.devicePixelRatio || 1;
-  context.setTransform(dpr, 0, 0, dpr, 0, 0);
-  context.clearRect(0, 0, width, height);
-  context.fillStyle = "#26332b";
-  context.fillRect(0, 0, width, height);
-
-  const metrics = roomMetrics(width, height, assets.layout, options.zoom);
-  context.save();
-  context.translate(metrics.originX, metrics.originY);
-  context.scale(metrics.scale, metrics.scale);
-  drawTiles(context, assets);
-  drawFurniture(context, assets);
-  drawSeats(context, seats, options.editingSeats);
-  drawAgents(context, assets, snapshot, seats, options);
-  context.restore();
-}
-
-function renderFallbackRoom(
-  context: CanvasRenderingContext2D,
-  canvas: HTMLCanvasElement,
-  snapshot: OpsRoomSnapshot | null,
-  error: string,
-) {
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
-  const dpr = window.devicePixelRatio || 1;
-  context.setTransform(dpr, 0, 0, dpr, 0, 0);
-  context.clearRect(0, 0, width, height);
-  context.fillStyle = "#223129";
-  context.fillRect(0, 0, width, height);
-  context.fillStyle = "#e8eee9";
-  context.font = "14px sans-serif";
-  context.fillText(error || "Waiting for room state", 24, 32);
-  (snapshot?.agents || []).slice(0, 12).forEach((agent, index) => {
-    const x = 28 + (index % 4) * 128;
-    const y = 72 + Math.floor(index / 4) * 72;
-    context.fillStyle = statusColor(agent.status);
-    context.fillRect(x, y, 44, 44);
-    context.fillStyle = "#ffffff";
-    context.fillText(agent.display_name, x + 54, y + 24);
-  });
-}
-
-function drawTiles(context: CanvasRenderingContext2D, assets: Assets) {
-  const { layout } = assets;
-  for (let row = 0; row < layout.rows; row += 1) {
-    for (let col = 0; col < layout.cols; col += 1) {
-      const tile = layout.tiles[row * layout.cols + col];
-      const x = col * TILE_SIZE;
-      const y = row * TILE_SIZE;
-      if (tile === 255 || tile === undefined) {
-        context.fillStyle = "#1c2823";
-        context.fillRect(x, y, TILE_SIZE, TILE_SIZE);
-        continue;
-      }
-      const floor = assets.floors[Math.max(0, Math.min(assets.floors.length - 1, tile))];
-      context.drawImage(floor, x, y, TILE_SIZE, TILE_SIZE);
-      context.strokeStyle = "rgba(29, 38, 34, 0.16)";
-      context.strokeRect(x + 0.5, y + 0.5, TILE_SIZE - 1, TILE_SIZE - 1);
-    }
-  }
-}
-
-function drawFurniture(context: CanvasRenderingContext2D, assets: Assets) {
-  const sorted = [...assets.layout.furniture].sort((a, b) => a.row - b.row || a.col - b.col);
-  for (const item of sorted) {
-    const type = item.type.replace(":left", "");
-    const image = assets.furniture[type];
-    if (!image) {
-      continue;
-    }
-    const x = item.col * TILE_SIZE;
-    const y = item.row * TILE_SIZE;
-    if (item.type.endsWith(":left")) {
-      context.save();
-      context.translate(x + image.width, y);
-      context.scale(-1, 1);
-      context.drawImage(image, 0, 0);
-      context.restore();
-    } else {
-      context.drawImage(image, x, y);
-    }
-  }
-}
-
-function drawSeats(context: CanvasRenderingContext2D, seats: Seat[], editing: boolean) {
-  if (!editing) {
-    return;
-  }
-  for (const seat of seats) {
-    const x = seat.x * TILE_SIZE;
-    const y = seat.y * TILE_SIZE;
-    context.fillStyle = "rgba(255, 202, 87, 0.26)";
-    context.strokeStyle = "#f0b84c";
-    context.lineWidth = 1;
-    context.fillRect(x, y, TILE_SIZE, TILE_SIZE);
-    context.strokeRect(x + 0.5, y + 0.5, TILE_SIZE - 1, TILE_SIZE - 1);
-  }
-}
-
-function drawAgents(
-  context: CanvasRenderingContext2D,
-  assets: Assets,
-  snapshot: OpsRoomSnapshot,
-  seats: Seat[],
-  options: { selectedAgentId: string; time: number },
-) {
-  const seatMap = new Map(seats.map((seat) => [seat.agent_id, seat]));
-  snapshot.agents.forEach((agent, index) => {
-    const seat = seatMap.get(agent.agent_id);
-    if (!seat) {
+  const flushTable = () => {
+    if (!tableRows.length) {
       return;
     }
-    const sprite = assets.characters[index % assets.characters.length];
-    const typing = agent.activity === "typing";
-    const attention = agent.activity === "attention" || agent.activity === "blocked";
-    const frame = typing ? 3 + (Math.floor(options.time / 280) % 2) : attention ? 5 : 1;
-    const bob = typing ? Math.sin(options.time / 120) * 1 : 0;
-    const x = seat.x * TILE_SIZE;
-    const y = seat.y * TILE_SIZE - 18 + bob;
-
-    if (agent.agent_id === options.selectedAgentId) {
-      context.fillStyle = "rgba(238, 181, 67, 0.32)";
-      context.beginPath();
-      context.ellipse(x + 8, y + 30, 12, 5, 0, 0, Math.PI * 2);
-      context.fill();
+    const [header, ...body] = tableRows;
+    parts.push("<table><thead><tr>");
+    header.forEach((cell) => parts.push(`<th>${renderInlineMarkdown(cell)}</th>`));
+    parts.push("</tr></thead>");
+    if (body.length) {
+      parts.push("<tbody>");
+      body.forEach((row) => {
+        parts.push("<tr>");
+        header.forEach((_, index) => {
+          parts.push(`<td>${renderInlineMarkdown(row[index] || "")}</td>`);
+        });
+        parts.push("</tr>");
+      });
+      parts.push("</tbody>");
     }
-
-    context.drawImage(sprite, frame * 16, 0, 16, 32, x, y, 16, 32);
-    drawAgentLabel(context, agent, x + 8, y - 5);
-  });
-}
-
-function drawAgentLabel(
-  context: CanvasRenderingContext2D,
-  agent: VisualAgent,
-  centerX: number,
-  y: number,
-) {
-  const text = `${agent.display_name} ${statusMark(agent.status)}`;
-  context.font = "8px sans-serif";
-  const width = Math.min(96, context.measureText(text).width + 8);
-  context.fillStyle = "rgba(255, 255, 255, 0.92)";
-  context.strokeStyle = statusColor(agent.status);
-  context.lineWidth = 1;
-  roundRect(context, centerX - width / 2, y - 10, width, 12, 3);
-  context.fill();
-  context.stroke();
-  context.fillStyle = "#1e2a24";
-  context.fillText(text, centerX - width / 2 + 4, y - 1);
-}
-
-function roundRect(
-  context: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-  radius: number,
-) {
-  context.beginPath();
-  context.moveTo(x + radius, y);
-  context.lineTo(x + width - radius, y);
-  context.quadraticCurveTo(x + width, y, x + width, y + radius);
-  context.lineTo(x + width, y + height - radius);
-  context.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
-  context.lineTo(x + radius, y + height);
-  context.quadraticCurveTo(x, y + height, x, y + height - radius);
-  context.lineTo(x, y + radius);
-  context.quadraticCurveTo(x, y, x + radius, y);
-}
-
-function roomMetrics(width: number, height: number, layout: DefaultLayout, zoom: number) {
-  const roomWidth = layout.cols * TILE_SIZE;
-  const roomHeight = layout.rows * TILE_SIZE;
-  const scale = Math.max(
-    1,
-    Math.min((width - 24) / roomWidth, (height - 24) / roomHeight) * zoom,
-  );
-  return {
-    scale,
-    originX: (width - roomWidth * scale) / 2,
-    originY: (height - roomHeight * scale) / 2,
+    parts.push("</table>");
+    tableRows = [];
   };
+
+  const flushList = () => {
+    if (inList) {
+      parts.push("</ul>");
+      inList = false;
+    }
+  };
+
+  lines.forEach((raw) => {
+    const line = raw.trim();
+    if (line.startsWith("```")) {
+      flushTable();
+      if (!inCode) {
+        inCode = true;
+        codeLines = [];
+      } else {
+        parts.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        inCode = false;
+      }
+      return;
+    }
+    if (inCode) {
+      codeLines.push(raw);
+      return;
+    }
+    if (!line) {
+      flushTable();
+      flushList();
+      return;
+    }
+    if (isMarkdownTableRow(line)) {
+      const cells = splitMarkdownTableRow(line);
+      if (!isMarkdownTableSeparator(cells)) {
+        tableRows.push(cells);
+      }
+      return;
+    }
+    flushTable();
+    if (line.startsWith("- ") || line.startsWith("* ")) {
+      if (!inList) {
+        parts.push("<ul>");
+        inList = true;
+      }
+      parts.push(`<li>${renderInlineMarkdown(line.slice(2).trim())}</li>`);
+      return;
+    }
+    flushList();
+    if (line.startsWith("### ")) {
+      parts.push(`<h3>${renderInlineMarkdown(line.slice(4))}</h3>`);
+    } else if (line.startsWith("## ")) {
+      parts.push(`<h2>${renderInlineMarkdown(line.slice(3))}</h2>`);
+    } else if (line.startsWith("# ")) {
+      parts.push(`<h1>${renderInlineMarkdown(line.slice(2))}</h1>`);
+    } else if (line.startsWith("> ")) {
+      parts.push(`<blockquote>${renderInlineMarkdown(line.slice(2))}</blockquote>`);
+    } else {
+      parts.push(`<p>${renderInlineMarkdown(line)}</p>`);
+    }
+  });
+
+  flushTable();
+  flushList();
+  if (inCode) {
+    parts.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+  }
+  return parts.join("\n");
 }
 
-function resolveSeats(agents: VisualAgent[], seats: Seat[]) {
-  const saved = new Map(seats.map((seat) => [seat.agent_id, seat]));
-  return agents.map((agent, index) => {
-    const existing = saved.get(agent.agent_id);
-    if (existing) {
-      return existing;
-    }
-    const fallback = DEFAULT_SEATS[index % DEFAULT_SEATS.length];
-    const cycle = Math.floor(index / DEFAULT_SEATS.length);
-    return {
-      agent_id: agent.agent_id,
-      x: Math.min(19, fallback.x + cycle),
-      y: Math.min(20, fallback.y + cycle),
-    };
-  });
+function renderInlineMarkdown(text: string) {
+  return escapeHtml(text)
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+}
+
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function isMarkdownTableRow(text: string) {
+  return text.startsWith("|") && text.endsWith("|") && text.split("|").length >= 3;
+}
+
+function splitMarkdownTableRow(text: string) {
+  return text.slice(1, -1).split("|").map((cell) => cell.trim());
+}
+
+function isMarkdownTableSeparator(cells: string[]) {
+  return cells.length > 0 && cells.every((cell) => cell.length > 0 && /^:?-+:?$/.test(cell));
 }
 
 function modelOptionKey(option: ModelOption) {
@@ -2516,7 +2442,7 @@ function modelRouteFromOption(option: ModelOption | null | undefined): ModelRout
 }
 
 function modelRoutePayload(route: ModelRoute | null): Record<string, string> {
-  if (!route) {
+  if (!route || route.provider === "fake") {
     return {};
   }
   return {
@@ -2524,6 +2450,10 @@ function modelRoutePayload(route: ModelRoute | null): Record<string, string> {
     model: route.model,
     ...(route.base_url ? { base_url: route.base_url } : {}),
   };
+}
+
+function visibleModelOptions(inventory: ModelInventory | null) {
+  return (inventory?.options || []).filter((option) => option.provider !== "fake");
 }
 
 function allAgents(cockpit: CockpitPayload | null, snapshot: OpsRoomSnapshot | null) {
@@ -2549,32 +2479,6 @@ function blockerSummary(agent: VisualAgent) {
     return "Needs user input";
   }
   return blockers[0] || "Blocked";
-}
-
-function statusMark(status: string) {
-  if (status === "working") {
-    return "work";
-  }
-  if (status === "blocked") {
-    return "block";
-  }
-  if (status === "awaiting_human") {
-    return "help";
-  }
-  return "idle";
-}
-
-function statusColor(status: string) {
-  if (status === "working") {
-    return "#21745e";
-  }
-  if (status === "blocked") {
-    return "#b64634";
-  }
-  if (status === "awaiting_human") {
-    return "#c98d26";
-  }
-  return "#68766d";
 }
 
 function lines(value: string) {

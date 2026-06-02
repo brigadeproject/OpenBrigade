@@ -3,6 +3,18 @@
 OpenBrigade is a proactive agent harness built around an orchestrator, explicit missions,
 per-agent goals, heartbeat assignments, durable task history, and curated memory/knowledge state.
 
+## RC capability boundary
+
+The RC ships the proactive orchestrator, fixed-roster delegation, Telegram inbound/outbound,
+Google Chat inbound webhooks, web GUI, TUI, API-key model access for Claude/OpenAI/Gemini, manual
+OAuth credential import for OpenAI/Codex and Gemini, Ollama/local routing, and per-agent model
+configuration during managed runs.
+
+The RC does not claim Claude OAuth, native Google Workspace tools, dynamic sub-agent spawning, or
+MCP client/server support as shipped features. Google Workspace tools are expected to arrive through
+the post-RC MCP client milestone described in `docs/MCP_CLIENT_POST_RC.md`. Dynamic sub-agent
+spawning is scoped to v1.1; the RC delegates tracked tasks across an existing, fixed agent roster.
+
 The PR-candidate path uses the `brigade_` Docker stack with Postgres, Redis, Qdrant, and Neo4j.
 Operator workflows require the containerized stores. Live commands should run through
 `./ops/brigade-live.sh ...` so state lands in Postgres and the runtime services.
@@ -193,7 +205,9 @@ curl "https://api.telegram.org/bot${BRIGADE_TELEGRAM_BOT_TOKEN}/setWebhook" \
   -d "secret_token=${BRIGADE_TELEGRAM_WEBHOOK_SECRET}"
 ```
 
-Google Chat webhooks use a shared query token:
+Google Chat webhooks use a shared query token. For RC, this connector is inbound-only: it records
+incoming Chat events and routes them through the approval/audit path, but it does not POST outbound
+replies to the Google Chat API.
 
 ```bash
 BRIGADE_GOOGLE_CHAT_WEBHOOK_ENABLED=true
@@ -216,9 +230,12 @@ brigade connector approvals approve --provider telegram --external-user 123 --us
 brigade connector approvals reject --provider google_chat --external-user users/alice --reason "not recognized"
 ```
 
-OpenAI, OpenAI/Codex, and Gemini routes continue to use LiteLLM. API keys remain supported through
-`OPENAI_API_KEY` and `GEMINI_API_KEY`. OAuth credentials can be stored locally under
-`.brigade/secrets/model-auth/` or `BRIGADE_SECRET_STORE_PATH`; status output redacts tokens:
+OpenAI, OpenAI/Codex, Anthropic/Claude, and Gemini routes continue to use LiteLLM. API keys remain
+supported through `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`. Claude is API-key
+only for RC. OpenAI/Codex and Gemini OAuth credentials can be imported or manually exchanged and
+stored locally under `.brigade/secrets/model-auth/` or `BRIGADE_SECRET_STORE_PATH`; status output
+redacts tokens. The RC flow is not a hosted browser/device-code login and does not refresh expired
+tokens automatically:
 
 ```bash
 brigade model auth login --provider openai --method oauth --access-token <token> --refresh-token <token>
@@ -239,10 +256,10 @@ The Live Ops Room remains available through the local web gateway:
 brigade web --host 127.0.0.1 --port 8080
 ```
 
-The Live Ops Room renders a Pixel Agents-inspired room backed by OpenBrigade state. It streams
-agent/task snapshots over `/api/ops-room/events`, uses REST for actions, supports per-user seat
-placement, and exposes common mission, goal, task, and user-to-agent chat workflows. Pixel Agents
-assets are included under `web/public/assets/pixel-agents/` with MIT attribution.
+The Live Ops Room renders a room-floor view backed by OpenBrigade state. It streams
+agent/task snapshots over `/api/ops-room/events`, uses REST for actions, routes agents into rooms
+from their active assignments, and exposes common mission, goal, task, and user-to-agent chat
+workflows.
 
 The orchestrator writes active assignments to `HEARTBEAT.md` in explicit agent workspaces under
 `.brigade/`. The runner reads the last parseable assignment block, preserves surrounding notes,

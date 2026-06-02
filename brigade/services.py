@@ -17,6 +17,156 @@ from brigade.time import utc_now_iso
 
 OPS_ROOM_LAYOUT_KEY = "ops-room"
 
+OPS_ROOM_ROOMS: list[dict[str, Any]] = [
+    {
+        "id": "orchestrator",
+        "label": "Orchestrator",
+        "domains": [],
+        "fixed_agent_id": "orchestrator",
+        "kind": "orchestrator",
+    },
+    {
+        "id": "studio",
+        "label": "Studio",
+        "domains": ["content", "writing", "marketing"],
+        "kind": "work",
+    },
+    {
+        "id": "craft",
+        "label": "Craft Room",
+        "domains": ["build", "design", "implementation", "prototype"],
+        "kind": "work",
+    },
+    {
+        "id": "cubicles",
+        "label": "Cubicles",
+        "domains": ["research", "ops", "coordination", "support"],
+        "kind": "work",
+    },
+    {
+        "id": "server",
+        "label": "Server Room",
+        "domains": ["infra", "security", "code", "test"],
+        "kind": "work",
+    },
+    {
+        "id": "finance",
+        "label": "Finance",
+        "domains": ["finance", "budget", "usage", "reporting"],
+        "kind": "work",
+    },
+    {
+        "id": "breakroom",
+        "label": "Break Room",
+        "domains": [],
+        "statuses": ["idle", "queued"],
+        "kind": "rest",
+    },
+    {
+        "id": "barracks",
+        "label": "Barracks",
+        "domains": [],
+        "statuses": ["blocked", "awaiting_human", "reflecting", "ruminating", "dreaming"],
+        "kind": "rest",
+    },
+]
+
+_ROOM_IDS = {room["id"] for room in OPS_ROOM_ROOMS}
+
+_ROOM_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "server",
+        (
+            "api",
+            "auth",
+            "bug",
+            "build",
+            "ci",
+            "code",
+            "docker",
+            "endpoint",
+            "error",
+            "infra",
+            "migration",
+            "network",
+            "postgres",
+            "redis",
+            "security",
+            "server",
+            "stack",
+            "test",
+            "webhook",
+        ),
+    ),
+    (
+        "finance",
+        (
+            "abacus",
+            "budget",
+            "burn",
+            "cost",
+            "expense",
+            "finance",
+            "forecast",
+            "invoice",
+            "pricing",
+            "report",
+            "spend",
+            "token",
+            "usage",
+        ),
+    ),
+    (
+        "studio",
+        (
+            "blog",
+            "brief",
+            "content",
+            "copy",
+            "deck",
+            "doc",
+            "editorial",
+            "launch plan",
+            "marketing",
+            "post",
+            "release notes",
+            "summary",
+            "write",
+        ),
+    ),
+    (
+        "craft",
+        (
+            "design",
+            "frontend",
+            "implement",
+            "mvp",
+            "pixel",
+            "polish",
+            "prototype",
+            "ship",
+            "ui",
+            "ux",
+        ),
+    ),
+    (
+        "cubicles",
+        (
+            "audit",
+            "coordinate",
+            "customer",
+            "handoff",
+            "ops",
+            "organize",
+            "plan",
+            "research",
+            "review",
+            "support",
+            "triage",
+        ),
+    ),
+)
+
 SAFE_CONFIG_KEYS = {
     "log_level": str,
     "orchestrator_cadence_seconds": int,
@@ -348,6 +498,7 @@ def build_ops_room_payload(
                 "crew_chief_for_team_id": chief_team_ids.get(agent.agent_id),
                 "status": status,
                 "activity": _agent_activity(status, assignment),
+                "room": _agent_room(agent.to_dict(), status, assignment),
                 "current_assignment": assignment.to_dict() if assignment else None,
                 "state": state.to_dict() if state else None,
                 "goals": [goal.to_dict() for goal in goals.get(agent.agent_id, [])],
@@ -360,6 +511,7 @@ def build_ops_room_payload(
         "generated_at": utc_now_iso(),
         "mission": mission.to_dict() if mission else None,
         "latest_reasoning": reasoning[-1] if reasoning else None,
+        "rooms": OPS_ROOM_ROOMS,
         "agents": visual_agents,
         "teams": [team.to_dict() for team in teams],
         "assignments": [assignment.to_dict() for assignment in assignments],
@@ -655,18 +807,96 @@ def _active_assignment_by_agent(assignments: list[Assignment]) -> dict[str, Assi
     return active
 
 
+def _agent_room(
+    agent: dict[str, Any],
+    status: str,
+    assignment: Assignment | None,
+) -> dict[str, Any]:
+    agent_id = str(agent.get("agent_id") or "")
+    if agent_id == "orchestrator":
+        return _room_projection("orchestrator", source="fixed", reason="fixed orchestrator room")
+    if assignment is not None:
+        explicit_room = (assignment.room_id or "").strip().lower()
+        if explicit_room in _ROOM_IDS:
+            return _room_projection(
+                explicit_room,
+                source="assignment",
+                reason="task room",
+                domain=explicit_room,
+            )
+        room_id, domain = _task_room_id(assignment, agent)
+        return _room_projection(
+            room_id,
+            source="assignment",
+            reason=f"task domain: {domain}",
+            domain=domain,
+        )
+    if status in {"blocked", "awaiting_human", "reflecting", "ruminating", "dreaming"}:
+        return _room_projection("barracks", source="status", reason=status, domain=status)
+    return _room_projection(
+        "breakroom",
+        source="availability",
+        reason="no active task",
+        domain="idle",
+    )
+
+
+def _task_room_id(assignment: Assignment, agent: dict[str, Any]) -> tuple[str, str]:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            assignment.assignment,
+            assignment.goal_statement,
+            assignment.assignment_rationale,
+            agent.get("role"),
+            agent.get("team_id"),
+        )
+    ).lower()
+    for room_id, keywords in _ROOM_KEYWORDS:
+        if any(keyword in text for keyword in keywords):
+            return room_id, _room_domain(room_id, text)
+    if assignment.status == AssignmentStatus.QUEUED:
+        return "breakroom", "queued"
+    return "cubicles", "operations"
+
+
+def _room_domain(room_id: str, text: str) -> str:
+    room = next((item for item in OPS_ROOM_ROOMS if item["id"] == room_id), None)
+    domains = list(room.get("domains", []) if room else [])
+    for domain in domains:
+        if domain in text:
+            return str(domain)
+    return str(domains[0] if domains else room_id)
+
+
+def _room_projection(
+    room_id: str,
+    *,
+    source: str,
+    reason: str,
+    domain: str | None = None,
+) -> dict[str, Any]:
+    room = next((item for item in OPS_ROOM_ROOMS if item["id"] == room_id), OPS_ROOM_ROOMS[3])
+    return {
+        "id": room["id"],
+        "label": room["label"],
+        "source": source,
+        "reason": reason,
+        "domain": domain,
+    }
+
+
 def _agent_status(status: str | None, assignment: Assignment | None) -> str:
-    if status:
-        return status
-    if assignment is None:
-        return "idle"
-    if assignment.awaiting_human:
-        return "awaiting_human"
-    if assignment.status == AssignmentStatus.BLOCKED:
-        return "blocked"
-    if assignment.status in {AssignmentStatus.ASSIGNED, AssignmentStatus.WORKING}:
-        return "working"
-    return "idle"
+    if assignment is not None:
+        if assignment.awaiting_human:
+            return "awaiting_human"
+        if assignment.status == AssignmentStatus.BLOCKED:
+            return "blocked"
+        if assignment.status == AssignmentStatus.QUEUED:
+            return "queued"
+        if assignment.status in {AssignmentStatus.ASSIGNED, AssignmentStatus.WORKING}:
+            return "working"
+    return status or "idle"
 
 
 def _agent_activity(status: str, assignment: Assignment | None) -> str:

@@ -140,6 +140,7 @@ class Assignment:
     created_by_user_id: str | None = None
     created_by_role: str | None = None
     idempotency_key: str | None = None
+    room_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.assignment, "assignment")
@@ -355,6 +356,7 @@ def assignment_from_dict(item: dict[str, Any]) -> Assignment:
         created_by_user_id=item.get("created_by_user_id"),
         created_by_role=item.get("created_by_role"),
         idempotency_key=item.get("idempotency_key"),
+        room_id=item.get("room_id"),
     )
 
 

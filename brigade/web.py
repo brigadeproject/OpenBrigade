@@ -40,6 +40,7 @@ from brigade.schemas import (
 )
 from brigade.services import (
     OPS_ROOM_LAYOUT_KEY,
+    OPS_ROOM_ROOMS,
     build_chat_payload,
     build_cockpit_payload,
     build_hierarchy_payload,
@@ -48,6 +49,7 @@ from brigade.services import (
     normalize_ops_room_layout,
     send_orchestrator_chat,
     send_user_chat,
+    set_config_value,
 )
 from brigade.store import RedisRuntimeClient, StateStore, open_state_store
 from brigade.time import utc_now_iso
@@ -316,6 +318,25 @@ def create_app(
         require("status:read", current)
         return available_model_options(settings)
 
+    @app.put("/api/models/default")
+    async def set_default_model(
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        nonlocal settings
+        require("admin", current)
+        provider = str(payload.get("provider") or "").strip()
+        model = str(payload.get("model") or "").strip()
+        if not provider or not model:
+            raise HTTPException(status_code=400, detail="provider and model are required")
+        set_config_value(settings.config_path, "default_provider", provider)
+        set_config_value(settings.config_path, "default_model", model)
+        settings = load_settings(settings.config_path)
+        return {
+            "settings": {**build_settings_payload(settings), "api_version": __version__},
+            "models": available_model_options(settings),
+        }
+
     @app.get("/api/ops-room")
     async def ops_room(current: AuthResult = auth_dependency) -> dict[str, object]:
         require("status:read", current)
@@ -450,12 +471,21 @@ def create_app(
         require("task:read", current)
         return [assignment.to_dict() for assignment in store.assignments()]
 
+    @app.delete("/api/alerts")
+    async def clear_alerts(current: AuthResult = auth_dependency) -> dict[str, object]:
+        require("orchestrator:write", current)
+        return {"status": "cleared", "count": store.clear_alerts()}
+
     @app.post("/api/tasks")
     async def create_task(
         payload: dict[str, Any],
         current: AuthResult = auth_dependency,
     ) -> dict[str, object]:
         user = require("task:write", current)
+        room_id = str(payload.get("room_id") or "").strip().lower() or None
+        work_room_ids = {room["id"] for room in OPS_ROOM_ROOMS if room.get("kind") == "work"}
+        if room_id and room_id not in work_room_ids:
+            raise HTTPException(status_code=400, detail="unknown task room")
         assignment = Assignment(
             assignment=str(payload["assignment"]),
             assigned_to=str(payload["agent_id"]),
@@ -468,6 +498,7 @@ def create_app(
             created_by_user_id=user.username if user else None,
             created_by_role=user.role.value if user else None,
             idempotency_key=payload.get("idempotency_key"),
+            room_id=room_id,
         )
         store.add_assignment(assignment)
         return assignment.to_dict()
