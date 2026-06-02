@@ -51,6 +51,20 @@ class ActionProvider:
         )
 
 
+class MalformedActionProvider:
+    route_type = "simulated"
+    model = "test-malformed-orchestrator"
+
+    def complete(self, prompt: str) -> ModelResponse:
+        assert "OpenBrigade orchestrator escalation protocol" in prompt
+        return ModelResponse(
+            text="not json",
+            provider="fake",
+            model=self.model,
+            route_type=self.route_type,
+        )
+
+
 def test_human_tasks_are_assigned_before_orchestrator_tasks():
     orchestrator_task = Assignment(
         assignment="Generated task",
@@ -401,6 +415,23 @@ def test_orchestrator_escalation_applies_safe_create_assignment(tmp_path):
     assert result["status"] == "actions"
     assert store.assignments()[0].assignment == "Restart stale goal work"
     assert store.assignments()[0].source == "orchestrator_escalation"
+
+
+def test_orchestrator_escalation_degrades_on_malformed_model_output(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    store.add_agent(Agent("sage", "SAGE", "workspace-sage"))
+
+    result = run_orchestrator_escalation(
+        store,
+        MalformedActionProvider(),
+        triggers=[{"kind": "stale_task", "summary": "task stalled"}],
+    )
+
+    assert result["status"] == "no_action"
+    assert result["actions_applied"] == []
+    assert result["actions_rejected"] == []
+    assert "malformed model response" in result["summary"]
+    assert store.alerts()
 
 
 def test_orchestrator_rejects_active_task_rebalance(tmp_path):

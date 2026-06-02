@@ -386,7 +386,6 @@ def available_model_options(settings: Any) -> dict[str, Any]:
         )
 
     options = _dedupe_model_options(options)
-    recommended = _recommended_option(options, default_provider, default_model)
     default = next((item for item in options if item.is_default), None)
     if default is None:
         default = ModelOption(
@@ -400,6 +399,7 @@ def available_model_options(settings: Any) -> dict[str, Any]:
             is_default=True,
         )
         options.append(default)
+    recommended = _recommended_option(options, default_provider, default_model)
 
     return {
         "default": default.to_dict(),
@@ -532,7 +532,10 @@ def _recommended_option(
     ]
     if provider_options:
         return min(provider_options, key=_model_preference_score)
-    return next(option for option in options if option.available)
+    available = [option for option in options if option.available]
+    if available:
+        return min(available, key=_model_preference_score)
+    return next((option for option in options if option.is_default), options[0])
 
 
 def _model_preference_score(option: ModelOption) -> tuple[int, str]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,8 @@ def run_managed_agents(
     provider: ModelProvider,
     agent_id: str | None = None,
     tool_registry: ToolRegistry | None = None,
+    provider_factory: Callable[[str], ModelProvider] | None = None,
+    fallback_provider: ModelProvider | None = None,
 ) -> list[RunResult]:
     target_ids = [agent_id] if agent_id else [item.agent_id for item in store.agents()]
     results: list[RunResult] = []
@@ -83,16 +86,48 @@ def run_managed_agents(
         assignment = store.active_assignment_for_agent(current_agent_id)
         if assignment is None:
             continue
+        run_provider = provider_factory(current_agent_id) if provider_factory else provider
+        result_provider = run_provider
         try:
             results.append(
                 run_agent_once(
                     current_agent_id,
                     store,
-                    provider,
+                    run_provider,
                     tool_registry=registry,
                 )
             )
         except RuntimeError as exc:
+            if fallback_provider is not None and _provider_key(fallback_provider) != _provider_key(
+                run_provider
+            ):
+                store.add_alert(
+                    f"agent {current_agent_id} provider {_provider_key(run_provider)} failed: "
+                    f"{exc}; retrying with default provider {_provider_key(fallback_provider)}"
+                )
+                LOGGER.warning(
+                    "agent_run_provider_fallback",
+                    extra={
+                        "agent_id": current_agent_id,
+                        "assignment_id": assignment.assignment_id,
+                        "provider": _provider_key(run_provider),
+                        "fallback_provider": _provider_key(fallback_provider),
+                        "reason": str(exc),
+                    },
+                )
+                try:
+                    result_provider = fallback_provider
+                    results.append(
+                        run_agent_once(
+                            current_agent_id,
+                            store,
+                            fallback_provider,
+                            tool_registry=registry,
+                        )
+                    )
+                    continue
+                except RuntimeError as fallback_exc:
+                    exc = fallback_exc
             summary = str(exc)
             store.add_alert(f"agent {current_agent_id} run deferred: {summary}")
             LOGGER.warning(
@@ -108,12 +143,20 @@ def run_managed_agents(
                     assignment_id=assignment.assignment_id,
                     status=assignment.status.value,
                     summary=summary,
-                    route_type=getattr(provider, "route_type", "unknown"),
+                    route_type=getattr(result_provider, "route_type", "unknown"),
                     transcript_path=assignment.transcript_path,
                     cycle_count=assignment.cycle_count,
                 )
             )
     return results
+
+
+def _provider_key(provider: ModelProvider) -> str:
+    return (
+        f"{getattr(provider, 'provider_name', provider.__class__.__name__)}:"
+        f"{getattr(provider, 'model', 'unknown')}:"
+        f"{getattr(provider, 'route_type', 'unknown')}"
+    )
 
 
 def run_agent_once(

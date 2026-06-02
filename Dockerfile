@@ -10,7 +10,7 @@ RUN npm run build
 FROM python:3.10-slim
 
 WORKDIR /app
-COPY pyproject.toml README.md OpenBrigade_V0.1_Design_Summary.md ./
+COPY pyproject.toml README.md ./
 COPY brigade ./brigade
 COPY migrations ./migrations
 COPY --from=web-build /app/web/dist ./web/dist

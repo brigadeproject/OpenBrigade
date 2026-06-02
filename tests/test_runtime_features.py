@@ -15,6 +15,7 @@ from brigade.runner import run_agent_once, run_managed_agents
 from brigade.schemas import Agent, Assignment, AssignmentStatus, Goal, Mission
 from brigade.state import JsonStateStore
 from brigade.time import add_seconds_iso, utc_now_iso
+from brigade.tools import ToolContext, default_tool_registry
 from brigade.workspace import (
     ASSIGNMENT_MARKER,
     read_heartbeat_assignment,
@@ -34,6 +35,31 @@ class WorkingProvider:
             model=self.model,
             route_type=self.route_type,
         )
+
+
+class CompleteProvider:
+    route_type = "simulated"
+
+    def __init__(self, model: str = "test-complete") -> None:
+        self.model = model
+
+    def complete(self, prompt: str) -> ModelResponse:
+        del prompt
+        return ModelResponse(
+            text=json.dumps({"status": "complete", "summary": f"done with {self.model}"}),
+            provider="fake",
+            model=self.model,
+            route_type=self.route_type,
+        )
+
+
+class FailingProvider:
+    route_type = "cloud"
+    model = "test-failing"
+
+    def complete(self, prompt: str) -> ModelResponse:
+        del prompt
+        raise RuntimeError("provider unavailable")
 
 
 class WaitingProvider:
@@ -412,6 +438,191 @@ def test_run_managed_agents_uses_explicit_agent_manifest(tmp_path):
 
     assert len(results) == 1
     assert results[0].assignment_id == assignment.assignment_id
+
+
+def test_run_managed_agents_uses_per_agent_provider_factory(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    sage = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    garde = Agent(agent_id="garde", display_name="GARDE", workspace_path="workspace-garde")
+    providers = {
+        "sage": CompleteProvider("sage-model"),
+        "garde": CompleteProvider("garde-model"),
+    }
+    for agent in (sage, garde):
+        assignment = Assignment(
+            assignment=f"Complete work for {agent.agent_id}",
+            assigned_to=agent.agent_id,
+            created_by="human",
+            source="direct_command",
+        )
+        assignment.transition_to(AssignmentStatus.ASSIGNED)
+        store.add_agent(agent)
+        store.add_assignment(assignment)
+        write_heartbeat_assignment(agent, assignment, tmp_path)
+
+    results = run_managed_agents(
+        store,
+        CompleteProvider("default-model"),
+        provider_factory=lambda agent_id: providers[agent_id],
+    )
+
+    assert {item.assignment_id for item in results} == {
+        item["assignment_id"] for item in store.assignment_history()
+    }
+    assert {record["model"] for record in store.usage_records()} == {
+        "sage-model",
+        "garde-model",
+    }
+
+
+def test_run_managed_agents_falls_back_to_default_provider(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    assignment = Assignment(
+        assignment="Retry with default model",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+    )
+    assignment.transition_to(AssignmentStatus.ASSIGNED)
+    store.add_agent(agent)
+    store.add_assignment(assignment)
+    write_heartbeat_assignment(agent, assignment, tmp_path)
+
+    results = run_managed_agents(
+        store,
+        CompleteProvider("default-model"),
+        provider_factory=lambda agent_id: FailingProvider(),
+        fallback_provider=CompleteProvider("default-model"),
+    )
+
+    assert len(results) == 1
+    assert results[0].status == AssignmentStatus.COMPLETE.value
+    assert store.usage_records()[0]["model"] == "default-model"
+    assert any("retrying with default provider" in alert for alert in store.alerts())
+
+
+def test_create_subtasks_tool_creates_dependency_linked_children(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    chief = Agent(agent_id="chief", display_name="CHIEF", workspace_path="workspace-chief")
+    worker = Agent(agent_id="worker", display_name="WORKER", workspace_path="workspace-worker")
+    parent = Assignment(
+        assignment="Break down mission work",
+        assigned_to="chief",
+        created_by="human",
+        source="direct_command",
+    )
+    parent.transition_to(AssignmentStatus.ASSIGNED)
+    store.add_agent(chief)
+    store.add_agent(worker)
+    store.add_assignment(parent)
+
+    result = default_tool_registry().execute(
+        "create_subtasks",
+        ToolContext(agent=chief, assignment=parent, store=store),
+        {
+            "subtasks": [
+                {"agent_id": "worker", "assignment": "First step"},
+                {
+                    "agent_id": "worker",
+                    "assignment": "Second step",
+                    "depends_on_previous": True,
+                },
+            ]
+        },
+    )
+
+    children = [
+        item for item in store.assignments() if item.parent_assignment_id == parent.assignment_id
+    ]
+    assert result.ok is True
+    assert len(children) == 2
+    assert children[1].dependency_ids == [children[0].assignment_id]
+
+
+def test_create_subtasks_tool_rejects_invalid_batch_without_partial_writes(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    chief = Agent(agent_id="chief", display_name="CHIEF", workspace_path="workspace-chief")
+    worker = Agent(agent_id="worker", display_name="WORKER", workspace_path="workspace-worker")
+    parent = Assignment(
+        assignment="Break down mission work",
+        assigned_to="chief",
+        created_by="human",
+        source="direct_command",
+    )
+    parent.transition_to(AssignmentStatus.ASSIGNED)
+    store.add_agent(chief)
+    store.add_agent(worker)
+    store.add_assignment(parent)
+
+    result = default_tool_registry().execute(
+        "create_subtasks",
+        ToolContext(agent=chief, assignment=parent, store=store),
+        {
+            "subtasks": [
+                {"agent_id": "worker", "assignment": "Valid first step"},
+                {"agent_id": "missing", "assignment": "Invalid second step"},
+            ]
+        },
+    )
+
+    assert result.ok is False
+    assert [item.assignment_id for item in store.assignments()] == [parent.assignment_id]
+
+
+def test_delegate_tool_rejects_depth_and_fan_out_overflow(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    store.add_agent(agent)
+    root = Assignment(
+        assignment="Root work",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+    )
+    child = Assignment(
+        assignment="Child work",
+        assigned_to="sage",
+        created_by="sage",
+        source="agent_delegate",
+        parent_assignment_id=root.assignment_id,
+    )
+    grandchild = Assignment(
+        assignment="Grandchild work",
+        assigned_to="sage",
+        created_by="sage",
+        source="agent_delegate",
+        parent_assignment_id=child.assignment_id,
+    )
+    for assignment in (root, child, grandchild):
+        store.add_assignment(assignment)
+
+    registry = default_tool_registry()
+    depth_result = registry.execute(
+        "delegate",
+        ToolContext(agent=agent, assignment=grandchild, store=store),
+        {"agent_id": "sage", "assignment": "Too deep"},
+    )
+    assert depth_result.ok is False
+    assert "depth limit" in depth_result.output
+
+    for index in range(5):
+        store.add_assignment(
+            Assignment(
+                assignment=f"Existing child {index}",
+                assigned_to="sage",
+                created_by="sage",
+                source="agent_delegate",
+                parent_assignment_id=root.assignment_id,
+            )
+        )
+    fanout_result = registry.execute(
+        "delegate",
+        ToolContext(agent=agent, assignment=root, store=store),
+        {"agent_id": "sage", "assignment": "Too many children"},
+    )
+    assert fanout_result.ok is False
+    assert "fan-out limit" in fanout_result.output
 
 
 def test_run_agent_once_ignores_queued_or_blocked_backlog_for_agent(tmp_path):

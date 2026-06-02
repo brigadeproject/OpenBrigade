@@ -840,6 +840,33 @@ def test_web_static_root_uses_first_candidate_with_index(tmp_path):
     assert _static_root([missing, container_like]) == container_like
 
 
+def test_web_index_serves_built_spa(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+
+    from brigade.config import Settings
+    from brigade.state import JsonStateStore
+    from brigade.web import create_app
+
+    static_root = tmp_path / "web" / "dist"
+    static_root.mkdir(parents=True)
+    (static_root / "index.html").write_text("<div id=\"root\">built spa</div>", encoding="utf-8")
+    (static_root / "assets").mkdir()
+    monkeypatch.setattr("brigade.web._static_root", lambda candidates=None: static_root)
+
+    settings = Settings(config_path=tmp_path / "brigade.config.json", data_dir=tmp_path)
+    response = asyncio.run(
+        _asgi_request(
+            create_app(settings, JsonStateStore(tmp_path / "state.json")),
+            "GET",
+            "/",
+        )
+    )
+
+    assert response.status_code == 200
+    assert "built spa" in response.text
+    assert "OpenBrigade web UI is not built" not in response.text
+
+
 def test_markdown_renderer_outputs_safe_html():
     rendered = render_markdown_html(
         "# Header\n\n- item\n\nUse **bold** and *italic* with `code` and [link](https://example.com)\n"

@@ -47,6 +47,9 @@ class ToolContext:
 
 
 ToolHandler = Callable[[ToolContext, dict[str, Any]], ToolResult]
+MAX_DELEGATION_DEPTH = 2
+MAX_CHILDREN_PER_ASSIGNMENT = 5
+MAX_CREATE_SUBTASKS = 5
 
 
 class ToolRegistry:
@@ -133,6 +136,22 @@ def default_tool_registry() -> ToolRegistry:
             },
         ),
         _delegate,
+    )
+    registry.register(
+        ToolSpec(
+            name="create_subtasks",
+            description=(
+                "Create bounded child assignments for registered agents, optionally "
+                "linking each item to the previous child as a dependency."
+            ),
+            argument_schema={
+                "subtasks": (
+                    "array of up to 5 objects with agent_id, assignment, optional "
+                    "goal_statement, priority, and depends_on_previous"
+                )
+            },
+        ),
+        _create_subtasks,
     )
     return registry
 
@@ -246,6 +265,9 @@ def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
 
 
 def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    guard = _delegation_guard(context, requested_children=1)
+    if guard is not None:
+        return guard
     target_agent_id = _required_text(arguments, "agent_id")
     target = next(
         (agent for agent in context.store.agents() if agent.agent_id == target_agent_id),
@@ -253,11 +275,10 @@ def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     )
     if target is None:
         return ToolResult(False, f"unknown target agent: {target_agent_id}")
-    priority_value = str(arguments.get("priority") or Priority.NORMAL.value).lower()
     try:
-        priority = Priority(priority_value)
-    except ValueError:
-        return ToolResult(False, f"unsupported priority: {priority_value}")
+        priority = _priority_from_arguments(arguments)
+    except ValueError as exc:
+        return ToolResult(False, str(exc))
     assignment = Assignment(
         assignment=_required_text(arguments, "assignment"),
         assigned_to=target_agent_id,
@@ -274,6 +295,130 @@ def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         f"created queued assignment {assignment.assignment_id} for {target_agent_id}",
         {"assignment_id": assignment.assignment_id, "status": assignment.status.value},
     )
+
+
+def _create_subtasks(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    raw_subtasks = arguments.get("subtasks")
+    if not isinstance(raw_subtasks, list) or not raw_subtasks:
+        return ToolResult(False, "subtasks must be a non-empty array")
+    if len(raw_subtasks) > MAX_CREATE_SUBTASKS:
+        return ToolResult(False, f"subtasks is limited to {MAX_CREATE_SUBTASKS} items")
+    guard = _delegation_guard(context, requested_children=len(raw_subtasks))
+    if guard is not None:
+        return guard
+
+    known_agent_ids = {agent.agent_id for agent in context.store.agents()}
+    normalized: list[dict[str, Any]] = []
+    for index, raw_subtask in enumerate(raw_subtasks, start=1):
+        if not isinstance(raw_subtask, dict):
+            return ToolResult(False, f"subtask {index} must be an object")
+        target_agent_id = _required_text(raw_subtask, "agent_id")
+        if target_agent_id not in known_agent_ids:
+            return ToolResult(False, f"unknown target agent in subtask {index}: {target_agent_id}")
+        try:
+            priority = _priority_from_arguments(raw_subtask)
+        except ValueError as exc:
+            return ToolResult(False, f"subtask {index}: {exc}")
+        normalized.append(
+            {
+                "agent_id": target_agent_id,
+                "assignment": _required_text(raw_subtask, "assignment"),
+                "priority": priority,
+                "goal_statement": _arg_text(raw_subtask, "goal_statement", None),
+                "depends_on_previous": bool(raw_subtask.get("depends_on_previous")),
+                "index": index,
+            }
+        )
+
+    created: list[dict[str, Any]] = []
+    previous_assignment_id: str | None = None
+    for item in normalized:
+        dependency_ids = (
+            [previous_assignment_id]
+            if item["depends_on_previous"] and previous_assignment_id
+            else []
+        )
+        assignment = Assignment(
+            assignment=str(item["assignment"]),
+            assigned_to=str(item["agent_id"]),
+            created_by=context.agent.agent_id,
+            source="agent_delegate",
+            priority=item["priority"],
+            parent_assignment_id=context.assignment.assignment_id,
+            dependency_ids=dependency_ids,
+            goal_statement=item["goal_statement"],
+            assignment_rationale=(
+                f"Structured subtask {item['index']} created by {context.agent.agent_id}."
+            ),
+        )
+        context.store.add_assignment(assignment)
+        previous_assignment_id = assignment.assignment_id
+        created.append(
+            {
+                "assignment_id": assignment.assignment_id,
+                "agent_id": item["agent_id"],
+                "dependency_ids": dependency_ids,
+                "status": assignment.status.value,
+            }
+        )
+    return ToolResult(
+        True,
+        f"created {len(created)} queued subtasks",
+        {"created": created},
+    )
+
+
+def _delegation_guard(context: ToolContext, *, requested_children: int) -> ToolResult | None:
+    depth = _delegation_depth(context.store, context.assignment)
+    if depth >= MAX_DELEGATION_DEPTH:
+        return ToolResult(
+            False,
+            f"delegation depth limit reached for assignment {context.assignment.assignment_id}",
+            {"max_depth": MAX_DELEGATION_DEPTH, "depth": depth},
+        )
+    child_count = sum(
+        1
+        for assignment in context.store.assignments()
+        if assignment.parent_assignment_id == context.assignment.assignment_id
+    )
+    if child_count + requested_children > MAX_CHILDREN_PER_ASSIGNMENT:
+        return ToolResult(
+            False,
+            (
+                f"delegation fan-out limit exceeded for assignment "
+                f"{context.assignment.assignment_id}"
+            ),
+            {
+                "max_children": MAX_CHILDREN_PER_ASSIGNMENT,
+                "existing_children": child_count,
+                "requested_children": requested_children,
+            },
+        )
+    return None
+
+
+def _delegation_depth(store: StateStore, assignment: Assignment) -> int:
+    depth = 0
+    parent_id = assignment.parent_assignment_id
+    seen = {assignment.assignment_id}
+    while parent_id:
+        if parent_id in seen:
+            break
+        seen.add(parent_id)
+        parent = store.find_assignment(parent_id)
+        if parent is None:
+            break
+        depth += 1
+        parent_id = parent.parent_assignment_id
+    return depth
+
+
+def _priority_from_arguments(arguments: dict[str, Any]) -> Priority:
+    priority_value = str(arguments.get("priority") or Priority.NORMAL.value).lower()
+    try:
+        return Priority(priority_value)
+    except ValueError as exc:
+        raise ValueError(f"unsupported priority: {priority_value}") from exc
 
 
 def _required_text(arguments: dict[str, Any], key: str) -> str:

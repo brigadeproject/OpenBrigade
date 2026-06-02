@@ -259,6 +259,13 @@ class JsonStateStore:
     def alerts(self) -> list[str]:
         return list(self.load().get("alerts", []))
 
+    def clear_alerts(self) -> int:
+        state = self.load()
+        count = len(state.get("alerts", []))
+        state["alerts"] = []
+        self.save(state)
+        return count
+
     def add_knowledge_document(self, document: dict[str, Any]) -> None:
         state = self.load()
         state.setdefault("knowledge_documents", []).append(document)

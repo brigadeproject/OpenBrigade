@@ -16,7 +16,15 @@ from brigade.prompt_floors import (
     compact_json,
 )
 from brigade.providers import ModelProvider
-from brigade.schemas import Agent, AgentState, Assignment, AssignmentStatus, Goal, Priority
+from brigade.schemas import (
+    Agent,
+    AgentState,
+    Assignment,
+    AssignmentStatus,
+    Goal,
+    Priority,
+    WorkMode,
+)
 from brigade.store import StateStore
 from brigade.time import parse_utc_iso, utc_now, utc_now_iso
 from brigade.workspace import write_heartbeat_assignment
@@ -124,6 +132,87 @@ def deterministic_cycle(
         },
     )
     return CycleResult(assigned=assigned, skipped=skipped, alerts=alerts)
+
+
+def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
+    agents = store.agents()
+    assignments = store.assignments()
+    goals_by_agent = store.goals()
+    mission = store.mission()
+    occupied_agents = {
+        item.assigned_to
+        for item in assignments
+        if item.status
+        in {
+            AssignmentStatus.QUEUED,
+            AssignmentStatus.ASSIGNED,
+            AssignmentStatus.WORKING,
+            AssignmentStatus.BLOCKED,
+        }
+    }
+    active_keys = {item.idempotency_key for item in assignments if item.idempotency_key}
+    crew_chiefs = {team.crew_chief_id for team in store.teams() if team.crew_chief_id}
+    created: list[Assignment] = []
+
+    for agent in agents:
+        if agent.agent_id in occupied_agents:
+            continue
+        goal = next(iter(goals_by_agent.get(agent.agent_id, [])), None)
+        if goal is not None:
+            key = f"orchestrator-idle-goal:{agent.agent_id}:{goal.statement}"
+            if key in active_keys:
+                continue
+            assignment_text = f"Advance goal: {goal.statement}"
+            rationale = "Agent was idle while a confirmed goal had no active task."
+            goal_statement = goal.statement
+        elif mission is not None and (agent.agent_id in crew_chiefs or agent.role == "crew_chief"):
+            key = f"orchestrator-idle-mission:{agent.agent_id}:{mission.statement}"
+            if key in active_keys:
+                continue
+            assignment_text = (
+                "Build the next concrete task plan for the current mission and identify "
+                "which agent should execute each step."
+            )
+            rationale = "Crew Chief was idle while the mission had no active planning task."
+            goal_statement = mission.statement
+        else:
+            continue
+
+        assignment = Assignment(
+            assignment=assignment_text,
+            assigned_to=agent.agent_id,
+            created_by="orchestrator",
+            source="orchestrator_idle_task_builder",
+            priority=Priority.NORMAL,
+            work_mode=WorkMode.HEARTBEAT,
+            goal_statement=goal_statement,
+            assignment_rationale=rationale,
+            created_by_role="orchestrator",
+            idempotency_key=key,
+        )
+        store.add_assignment(assignment)
+        active_keys.add(key)
+        created.append(assignment)
+
+    if created:
+        store.add_orchestrator_reasoning(
+            {
+                "reasoning_id": str(uuid4()),
+                "cycle_id": str(uuid4()),
+                "started_at": utc_now_iso(),
+                "ended_at": utc_now_iso(),
+                "source": "orchestrator_idle_task_builder",
+                "mission_statement": mission.statement if mission else None,
+                "queued_assignments": [item.assignment_id for item in created],
+                "assigned": [],
+                "skipped": [],
+                "alerts": [],
+                "agent_states": {},
+                "decision_summary": f"queued={len(created)} idle-agent assignments",
+                "payload": {"created": [item.to_dict() for item in created]},
+            }
+        )
+    return created
 
 
 def evaluate_orchestrator_floor(
@@ -248,7 +337,20 @@ def run_orchestrator_escalation(
             "source": "orchestrator_escalation",
         }
     )
-    parsed = parse_orchestrator_response(response.text)
+    try:
+        parsed = parse_orchestrator_response(response.text)
+    except ValueError as exc:
+        summary = f"orchestrator escalation ignored malformed model response: {exc}"
+        store.add_alert(summary)
+        return {
+            "status": "no_action",
+            "summary": summary,
+            "triggers": triggers,
+            "actions_applied": [],
+            "actions_rejected": [],
+            "provider": response.provider,
+            "model": response.model,
+        }
     action_result = apply_orchestrator_actions(store, parsed.actions)
     return {
         "status": parsed.status,

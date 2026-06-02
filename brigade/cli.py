@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -49,6 +49,7 @@ from brigade.memory import (
 from brigade.orchestrator import (
     CycleResult,
     build_cycle_reasoning_record,
+    build_idle_agent_assignments,
     derive_agent_states,
     deterministic_cycle,
     evaluate_orchestrator_floor,
@@ -1466,13 +1467,36 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "agent" and args.agent_command == "run":
         _require_permission(store, settings, actor, "orchestrator:write")
-        result = run_agent_once(args.id, store, _provider_from_args(args, settings))
+        default_provider = _provider_from_args(args, settings)
+        provider = (
+            default_provider
+            if _provider_args_explicit(args)
+            else _provider_for_agent(settings, store, args.id)
+        )
+        try:
+            result = run_agent_once(args.id, store, provider)
+        except RuntimeError:
+            if _provider_args_explicit(args) or _provider_identity(provider) == _provider_identity(
+                default_provider
+            ):
+                raise
+            store.add_alert(
+                f"agent {args.id} provider failed; retrying with default provider"
+            )
+            result = run_agent_once(args.id, store, default_provider)
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "agent" and args.agent_command == "run-all":
         _require_permission(store, settings, actor, "orchestrator:write")
-        results = run_managed_agents(store, _provider_from_args(args, settings))
+        provider = _provider_from_args(args, settings)
+        provider_factory = _managed_agent_provider_factory(args, settings, store)
+        results = run_managed_agents(
+            store,
+            provider,
+            provider_factory=provider_factory,
+            fallback_provider=provider if provider_factory else None,
+        )
         print(json.dumps([item.to_dict() for item in results], indent=2, sort_keys=True))
         return 0
 
@@ -1895,6 +1919,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         completed = 0
         agent_results = []
         provider = _provider_from_args(args, settings)
+        provider_factory = _managed_agent_provider_factory(args, settings, store)
         while max_cycles is None or completed < max_cycles:
             _run_cycle(
                 store,
@@ -1902,7 +1927,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stale_work_seconds=settings.stale_work_seconds,
             )
             if not args.no_run_agents:
-                agent_results.extend(run_managed_agents(store, provider))
+                agent_results.extend(
+                    run_managed_agents(
+                        store,
+                        provider,
+                        provider_factory=provider_factory,
+                        fallback_provider=provider if provider_factory else None,
+                    )
+                )
             completed += 1
             if max_cycles is not None and completed >= max_cycles:
                 break
@@ -2134,6 +2166,39 @@ def _provider_from_args(args: argparse.Namespace, settings: Settings | None = No
             provider_name="gemini",
         )
     return LiteLLMProvider(model=model, api_key=args.api_key, api_base=base_url)
+
+
+def _provider_args_explicit(args: argparse.Namespace) -> bool:
+    return bool(args.provider or args.model or args.base_url or args.api_key)
+
+
+def _provider_for_agent(settings: Settings, store: StateStore, agent_id: str) -> ModelProvider:
+    agent = next((item for item in store.agents() if item.agent_id == agent_id), None)
+    if agent is None:
+        return provider_from_settings(settings)
+    return provider_from_settings(
+        settings,
+        provider=agent.model_provider,
+        model=agent.model_name,
+    )
+
+
+def _provider_identity(provider: ModelProvider) -> tuple[str, str, str]:
+    return (
+        str(getattr(provider, "provider_name", provider.__class__.__name__)),
+        str(getattr(provider, "model", "unknown")),
+        str(getattr(provider, "route_type", "unknown")),
+    )
+
+
+def _managed_agent_provider_factory(
+    args: argparse.Namespace,
+    settings: Settings,
+    store: StateStore,
+) -> Callable[[str], ModelProvider] | None:
+    if _provider_args_explicit(args):
+        return None
+    return lambda agent_id: _provider_for_agent(settings, store, agent_id)
 
 
 def _chat_tui_provider_from_args(args: argparse.Namespace, settings: Settings):
@@ -3482,6 +3547,7 @@ def _run_cycle(
     *,
     stale_work_seconds: int = 86_400,
 ) -> CycleResult:
+    build_idle_agent_assignments(store)
     floor = build_orchestrator_floor(store, stale_seconds=stale_work_seconds)
     floor_triggers = evaluate_orchestrator_floor(
         store,

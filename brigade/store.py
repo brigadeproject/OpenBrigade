@@ -116,6 +116,8 @@ class StateStore(Protocol):
 
     def alerts(self) -> list[str]: ...
 
+    def clear_alerts(self) -> int: ...
+
     def add_knowledge_document(self, document: dict[str, Any]) -> None: ...
 
     def knowledge_documents(self) -> list[dict[str, Any]]: ...
@@ -306,6 +308,9 @@ class RedisRuntimeClient:
     def enqueue_alert(self, message: str) -> None:
         record = {"message": message, "created_at": utc_now_iso()}
         self._execute(lambda client: client.rpush(self.ALERT_QUEUE_KEY, json.dumps(record)))
+
+    def clear_alerts(self) -> None:
+        self._execute(lambda client: client.delete(self.ALERT_QUEUE_KEY))
 
     def acquire_local_inference_lock(self, holder: str, *, lock_ttl_seconds: int) -> None:
         previous = self.get_json(self.LOCAL_INFERENCE_KEY) or {}
@@ -907,6 +912,16 @@ class PostgresStateStore:
                 "select message from brigade_alerts order by created_at, id"
             )
         ]
+
+    def clear_alerts(self) -> int:
+        count = int(self._query("select count(*) from brigade_alerts")[0][0])
+        self._execute("delete from brigade_alerts")
+        if self._redis.available():
+            try:
+                self._redis.clear_alerts()
+            except RuntimeError:
+                pass
+        return count
 
     def add_knowledge_document(self, document: dict[str, Any]) -> None:
         self._execute(
