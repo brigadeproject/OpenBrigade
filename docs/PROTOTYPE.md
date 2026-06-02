@@ -232,7 +232,7 @@ Supported v0.9.1 actions are:
 - add goals
 - create assignments
 - ask an agent
-- drag and save per-user agent seats
+- route task cards into live rooms from assignment state
 
 The room intentionally does not include the full Pixel Agents furniture editor, VS Code integration,
 WebSocket protocol, or goal edit/delete. Pixel Agents assets are bundled in

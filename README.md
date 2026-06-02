@@ -184,7 +184,7 @@ brigade web --host 127.0.0.1 --port 8080
 ```
 
 Operational setup, bounded-smoke, rollback, disable-switch, limit, and audit procedures live in
-`CONNECTORS_RUNBOOK.md`.
+`docs/CONNECTORS_RUNBOOK.md`.
 
 Live webhook routes:
 
@@ -304,10 +304,10 @@ running. LiteLLM-backed cloud calls are available through `litellm`, `openai`, o
 once the `models` extra is installed and API keys are set.
 
 Backup guidance for source, runtime state, and the `brigade_` volume set lives in [BACKUP.md](BACKUP.md).
-Prototype-specific live-operation notes live in [PROTOTYPE.md](PROTOTYPE.md).
-Operator architecture notes live in [OPERATING_ARCHITECTURE.md](OPERATING_ARCHITECTURE.md).
-Network topology notes live in [NETWORK_TOPOLOGY.md](NETWORK_TOPOLOGY.md).
-Memory architecture notes live in [MEMORY_ARCHITECTURE.md](MEMORY_ARCHITECTURE.md).
-Library ingestion notes live in [LIBRARY_SYSTEMS.md](LIBRARY_SYSTEMS.md).
-Prompt architecture notes live in [PROMPT_ARCHITECTURE.md](PROMPT_ARCHITECTURE.md).
-Release and public-cleanup checks live in [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
+Prototype-specific live-operation notes live in [docs/PROTOTYPE.md](docs/PROTOTYPE.md).
+Operator architecture notes live in [docs/OPERATING_ARCHITECTURE.md](docs/OPERATING_ARCHITECTURE.md).
+Network topology notes live in [docs/NETWORK_TOPOLOGY.md](docs/NETWORK_TOPOLOGY.md).
+Memory architecture notes live in [docs/MEMORY_ARCHITECTURE.md](docs/MEMORY_ARCHITECTURE.md).
+Library ingestion notes live in [docs/LIBRARY_SYSTEMS.md](docs/LIBRARY_SYSTEMS.md).
+Prompt architecture notes live in [docs/PROMPT_ARCHITECTURE.md](docs/PROMPT_ARCHITECTURE.md).
+Release and public-cleanup checks live in [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).

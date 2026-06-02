@@ -62,8 +62,9 @@ Bounded live smoke:
 3. Verify pending approval or persisted chat/episode/audit records.
 4. Disable the route after validation unless it is intended to stay live.
 
-Outbound behavior: replies use the configured Google Chat response path. Missing or invalid
-connector credentials must fail closed with an alert/audit record.
+Outbound behavior: Google Chat is inbound-only for the RC. The webhook route parses and records
+events, approvals, and audit state, but OpenBrigade does not POST replies back to the Google Chat
+API yet. Operators should describe this connector as inbound-only until outbound API posting lands.
 
 Rollback: set `BRIGADE_GOOGLE_CHAT_WEBHOOK_ENABLED=false`, remove the Chat app/webhook route, and
 remove the shared secret from `.env`.
@@ -74,6 +75,8 @@ Supported auth modes:
 
 - API key through `OPENAI_API_KEY`.
 - Local OAuth credential records under `BRIGADE_SECRET_STORE_PATH` via `brigade model auth login`.
+  This is manual import/code exchange, not hosted browser/device-code login, and expired tokens
+  require re-login.
 
 Invalid credentials should return a blocked provider result or explicit auth error and must not
 write secrets into messages, transcripts, or agent workspaces.
@@ -88,12 +91,23 @@ brigade model complete --provider openai --model <small-model> --prompt "Return 
 Rollback: unset `OPENAI_API_KEY`, run `brigade model auth logout --provider openai`, and use
 `--provider fake` or local Ollama for deterministic validation.
 
+## Anthropic / Claude
+
+Supported auth mode:
+
+- API key through `ANTHROPIC_API_KEY`.
+
+Claude OAuth is deferred for RC. Do not advertise Claude Code credential reuse or Claude OAuth as a
+current feature.
+
 ## Gemini
 
 Supported auth modes:
 
 - API key through `GEMINI_API_KEY`.
 - Local OAuth credential records under `BRIGADE_SECRET_STORE_PATH` via `brigade model auth login`.
+  This is manual import/code exchange, not hosted browser/device-code login, and expired tokens
+  require re-login.
 
 Invalid credentials should return a blocked provider result or explicit auth error and must not
 write secrets into messages, transcripts, or agent workspaces.

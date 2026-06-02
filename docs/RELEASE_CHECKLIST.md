@@ -4,7 +4,7 @@ Use this checklist before publishing a prototype tag or sharing a public snapsho
 
 ## Validation
 
-- Execute the current RC punch list: `RC_PUNCHLIST_v1_0.md`
+- Execute the current RC punch list: `reports/TODO-PUNCHLIST.md`
 - Run unit tests: `python3 -m pytest`
 - Run lint: `python3 -m ruff check .`
 - Compile Python entry points: `python3 -m compileall brigade tests ops/ollama_bridge_proxy.py`
@@ -29,8 +29,8 @@ Use this checklist before publishing a prototype tag or sharing a public snapsho
   files from release build contexts and source artifacts.
 - Review `reference/` usage for license and attribution before copying code.
 - Check for secrets or host-specific paths in docs, examples, and committed config.
-- Keep README and PROTOTYPE commands aligned with the actual CLI.
-- Confirm external connectors follow `CONNECTORS_RUNBOOK.md` and remain disabled by default.
+- Keep README and `docs/PROTOTYPE.md` commands aligned with the actual CLI.
+- Confirm external connectors follow `docs/CONNECTORS_RUNBOOK.md` and remain disabled by default.
 
 ## v0.5 MVP Smoke
 
