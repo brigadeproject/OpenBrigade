@@ -271,7 +271,7 @@ fire; `BRIGADE_STALE_WORK_SECONDS` controls the default freshness window.
 Qdrant episode writes use Ollama embeddings when configured. The local development stack expects
 the main Ollama runtime at `BRIGADE_OLLAMA_BASE_URL` and a separate embedding runtime at
 `BRIGADE_OLLAMA_EMBEDDING_BASE_URL`; the default embedding setup is
-`http://host.docker.internal:11435` with `nomic-embed-text:latest` and 768-dimensional vectors.
+`http://host.docker.internal:11434` with `nomic-embed-text:latest` and 768-dimensional vectors.
 Use a model-specific collection such as `brigade_episodes_nomic_embed_text` when changing vector
 size or embedding model.
 

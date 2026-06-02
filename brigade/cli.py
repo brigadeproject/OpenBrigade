@@ -69,6 +69,7 @@ from brigade.rbac import can
 from brigade.runner import (
     _acquire_local_inference_lock,
     _release_local_inference_lock,
+    is_local_inference_backpressure,
     run_agent_once,
     run_managed_agents,
 )
@@ -1475,10 +1476,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         try:
             result = run_agent_once(args.id, store, provider)
-        except RuntimeError:
+        except RuntimeError as exc:
             if _provider_args_explicit(args) or _provider_identity(provider) == _provider_identity(
                 default_provider
-            ):
+            ) or is_local_inference_backpressure(exc):
                 raise
             store.add_alert(
                 f"agent {args.id} provider failed; retrying with default provider"

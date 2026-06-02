@@ -431,7 +431,7 @@ def test_orchestrator_escalation_degrades_on_malformed_model_output(tmp_path):
     assert result["actions_applied"] == []
     assert result["actions_rejected"] == []
     assert "malformed model response" in result["summary"]
-    assert store.alerts()
+    assert store.alerts() == []
 
 
 def test_orchestrator_rejects_active_task_rebalance(tmp_path):

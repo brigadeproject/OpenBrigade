@@ -341,7 +341,14 @@ def run_orchestrator_escalation(
         parsed = parse_orchestrator_response(response.text)
     except ValueError as exc:
         summary = f"orchestrator escalation ignored malformed model response: {exc}"
-        store.add_alert(summary)
+        LOGGER.warning(
+            "orchestrator_escalation_malformed_response",
+            extra={
+                "provider": response.provider,
+                "model": response.model,
+                "reason": str(exc),
+            },
+        )
         return {
             "status": "no_action",
             "summary": summary,

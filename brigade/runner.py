@@ -27,6 +27,10 @@ from brigade.workspace import (
 )
 
 LOCAL_INFERENCE_COOLDOWN_SECONDS = 600
+LOCAL_INFERENCE_BACKPRESSURE_PREFIXES = (
+    "local inference unavailable until ",
+    "local inference already held by ",
+)
 MAX_PROVIDER_RETRIES = 3
 MAX_AGENT_ITERATIONS = 6
 MAX_CONTEXT_FILE_CHARS = 4000
@@ -98,8 +102,11 @@ def run_managed_agents(
                 )
             )
         except RuntimeError as exc:
-            if fallback_provider is not None and _provider_key(fallback_provider) != _provider_key(
-                run_provider
+            backpressure = is_local_inference_backpressure(exc)
+            if (
+                fallback_provider is not None
+                and _provider_key(fallback_provider) != _provider_key(run_provider)
+                and not backpressure
             ):
                 store.add_alert(
                     f"agent {current_agent_id} provider {_provider_key(run_provider)} failed: "
@@ -128,10 +135,13 @@ def run_managed_agents(
                     continue
                 except RuntimeError as fallback_exc:
                     exc = fallback_exc
+                    backpressure = is_local_inference_backpressure(exc)
             summary = str(exc)
-            store.add_alert(f"agent {current_agent_id} run deferred: {summary}")
-            LOGGER.warning(
-                "agent_run_deferred",
+            if not backpressure:
+                store.add_alert(f"agent {current_agent_id} run deferred: {summary}")
+            log = LOGGER.info if backpressure else LOGGER.warning
+            log(
+                "agent_run_deferred_local_backpressure" if backpressure else "agent_run_deferred",
                 extra={
                     "agent_id": current_agent_id,
                     "assignment_id": assignment.assignment_id,
@@ -149,6 +159,11 @@ def run_managed_agents(
                 )
             )
     return results
+
+
+def is_local_inference_backpressure(exc: BaseException | str) -> bool:
+    summary = str(exc)
+    return summary.startswith(LOCAL_INFERENCE_BACKPRESSURE_PREFIXES)
 
 
 def _provider_key(provider: ModelProvider) -> str:

@@ -79,7 +79,7 @@ def test_load_settings_derives_host_datastore_urls_from_compose_env(tmp_path):
                 "BRIGADE_REDIS_PORT=56379",
                 "BRIGADE_QDRANT_HTTP_PORT=56333",
                 "BRIGADE_QDRANT_COLLECTION=brigade_episodes_nomic_embed_text",
-                "BRIGADE_OLLAMA_EMBEDDING_BASE_URL=http://host.docker.internal:11435",
+                "BRIGADE_OLLAMA_EMBEDDING_BASE_URL=http://host.docker.internal:11434",
                 "BRIGADE_OLLAMA_EMBEDDING_MODEL=nomic-embed-text:latest",
                 "BRIGADE_OLLAMA_EMBEDDING_VECTOR_SIZE=768",
                 "BRIGADE_NEO4J_BOLT_PORT=57687",
@@ -95,7 +95,7 @@ def test_load_settings_derives_host_datastore_urls_from_compose_env(tmp_path):
     assert settings.redis_url == "redis://127.0.0.1:56379/0"
     assert settings.qdrant_url == "http://127.0.0.1:56333"
     assert settings.qdrant_collection == "brigade_episodes_nomic_embed_text"
-    assert settings.ollama_embedding_base_url == "http://host.docker.internal:11435"
+    assert settings.ollama_embedding_base_url == "http://host.docker.internal:11434"
     assert settings.ollama_embedding_model == "nomic-embed-text:latest"
     assert settings.ollama_embedding_vector_size == 768
     assert settings.neo4j_uri == "bolt://127.0.0.1:57687"

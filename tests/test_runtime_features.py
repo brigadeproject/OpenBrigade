@@ -415,7 +415,7 @@ def test_run_managed_agents_defers_local_cooldown_without_crashing(tmp_path):
     assert results[0].status == AssignmentStatus.ASSIGNED.value
     assert "local inference unavailable" in results[0].summary
     assert store.find_assignment(assignment.assignment_id).status == AssignmentStatus.ASSIGNED
-    assert store.alerts()
+    assert store.alerts() == []
 
 
 def test_run_managed_agents_uses_explicit_agent_manifest(tmp_path):
