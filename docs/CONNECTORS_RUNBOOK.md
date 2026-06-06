@@ -89,7 +89,7 @@ brigade model complete --provider openai --model <small-model> --prompt "Return 
 ```
 
 Rollback: unset `OPENAI_API_KEY`, run `brigade model auth logout --provider openai`, and use
-`--provider fake` or local Ollama for deterministic validation.
+local Ollama for bounded validation.
 
 ## Anthropic / Claude
 
@@ -120,4 +120,4 @@ brigade model complete --provider gemini --model <small-model> --prompt "Return 
 ```
 
 Rollback: unset `GEMINI_API_KEY`, run `brigade model auth logout --provider gemini`, and use
-`--provider fake` or local Ollama for deterministic validation.
+local Ollama for bounded validation.

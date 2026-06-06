@@ -3,17 +3,25 @@ from __future__ import annotations
 import json
 
 from brigade.orchestrator import (
+    ProactiveContinuationConfig,
     apply_orchestrator_actions,
+    build_cycle_reasoning_record,
+    build_orchestration_telemetry,
     derive_agent_states,
     deterministic_cycle,
+    evaluate_mission_continuation,
     evaluate_orchestrator_floor,
     run_orchestrator_escalation,
 )
 from brigade.prompt_floors import build_crew_chief_floor, build_orchestrator_floor
 from brigade.providers import ModelResponse
+from brigade.runner import run_agent_once
 from brigade.schemas import Agent, Assignment, AssignmentStatus, Goal, Mission, Priority, Team
 from brigade.state import JsonStateStore
 from brigade.time import add_seconds_iso, utc_now_iso
+from brigade.tools import ToolContext, default_tool_registry
+from brigade.workspace import write_heartbeat_assignment
+from tests.helpers import TestProvider
 
 
 class RaisingProvider:
@@ -23,7 +31,7 @@ class RaisingProvider:
 
 
 class ActionProvider:
-    route_type = "simulated"
+    route_type = "test"
     model = "test-actions"
 
     def complete(self, prompt: str) -> ModelResponse:
@@ -45,21 +53,21 @@ class ActionProvider:
                     ],
                 }
             ),
-            provider="fake",
+            provider="test",
             model=self.model,
             route_type=self.route_type,
         )
 
 
 class MalformedActionProvider:
-    route_type = "simulated"
+    route_type = "test"
     model = "test-malformed-orchestrator"
 
     def complete(self, prompt: str) -> ModelResponse:
         assert "OpenBrigade orchestrator escalation protocol" in prompt
         return ModelResponse(
             text="not json",
-            provider="fake",
+            provider="test",
             model=self.model,
             route_type=self.route_type,
         )
@@ -461,3 +469,196 @@ def test_orchestrator_rejects_active_task_rebalance(tmp_path):
     assert result["applied"] == []
     assert result["rejected"]
     assert store.find_assignment(assignment.assignment_id).assigned_to == "sage"
+
+
+def test_orchestration_telemetry_normalizes_cycle_decisions():
+    assignment = Assignment(
+        assignment="Run the plan",
+        assigned_to="sage",
+        created_by="human",
+        source="test",
+        goal_statement="Move the mission",
+    )
+    result = deterministic_cycle([assignment])
+    states = derive_agent_states([Agent("sage", "SAGE", "workspace-sage")], [assignment])
+    record = build_cycle_reasoning_record(
+        "Test mission",
+        [assignment],
+        result,
+        states,
+    )
+
+    telemetry = build_orchestration_telemetry([record])
+
+    assert telemetry["latest_event"]["decision"] == "assigned"
+    assert telemetry["latest_event"]["assignment_id"] == assignment.assignment_id
+    assert telemetry["counts"]["cycle_decision"] == 1
+
+
+def test_orchestration_telemetry_renders_legacy_reasoning_record():
+    telemetry = build_orchestration_telemetry(
+        [
+            {
+                "reasoning_id": "legacy",
+                "cycle_id": "cycle",
+                "ended_at": "2026-01-01T00:00:00+00:00",
+                "source": "legacy",
+                "mission_statement": "Legacy mission",
+                "assigned": [],
+                "skipped": [],
+                "decision_summary": "assigned=0 skipped=0 alerts=0",
+            }
+        ]
+    )
+
+    assert telemetry["latest_event"]["type"] == "reasoning_summary"
+    assert telemetry["latest_event"]["summary"] == "assigned=0 skipped=0 alerts=0"
+
+
+def test_mission_continuation_propose_only_records_one_proposal_without_task(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    store.set_mission(Mission("Continue the mission", ["next plan"], []))
+    store.add_agent(Agent("chief", "CHIEF", "workspace-chief", "crew_chief"))
+    store.upsert_team(Team("alpha", "Alpha", crew_chief_id="chief"))
+
+    result = evaluate_mission_continuation(store)
+    telemetry = build_orchestration_telemetry(store.orchestrator_reasoning())
+
+    assert result["status"] == "proposed"
+    assert store.assignments() == []
+    assert len(telemetry["proposals"]) == 1
+    assert telemetry["proposals"][0]["idempotency_key"].startswith(
+        "orchestrator-proactive:v1:"
+    )
+
+
+def test_mission_continuation_creation_mode_respects_caps(tmp_path):
+    capped = JsonStateStore(tmp_path / "capped.json")
+    capped.set_mission(Mission("Continue the mission", ["next plan"], []))
+    capped.add_agent(Agent("chief", "CHIEF", "workspace-chief", "crew_chief"))
+    capped.upsert_team(Team("alpha", "Alpha", crew_chief_id="chief"))
+
+    capped_result = evaluate_mission_continuation(
+        capped,
+        ProactiveContinuationConfig(
+            mode="create",
+            creation_enabled=True,
+            max_creations_per_cycle=0,
+        ),
+    )
+
+    assert capped_result["status"] == "proposed"
+    assert capped.assignments() == []
+
+    created = JsonStateStore(tmp_path / "created.json")
+    created.set_mission(Mission("Continue the mission", ["next plan"], []))
+    created.add_agent(Agent("chief", "CHIEF", "workspace-chief", "crew_chief"))
+    created.upsert_team(Team("alpha", "Alpha", crew_chief_id="chief"))
+
+    created_result = evaluate_mission_continuation(
+        created,
+        ProactiveContinuationConfig(mode="create", creation_enabled=True),
+    )
+
+    assert created_result["status"] == "created"
+    assert len(created.assignments()) == 1
+    assert created.assignments()[0].source == "orchestrator_mission_continuation"
+
+
+def test_mission_continuation_prevents_duplicate_proposals_by_idempotency(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    store.set_mission(Mission("Continue the mission", ["next plan"], []))
+    store.add_agent(Agent("chief", "CHIEF", "workspace-chief", "crew_chief"))
+    store.upsert_team(Team("alpha", "Alpha", crew_chief_id="chief"))
+
+    first = evaluate_mission_continuation(store)
+    second = evaluate_mission_continuation(store)
+
+    assert first["status"] == "proposed"
+    assert second["status"] == "skipped"
+    assert second["skipped"][0]["reason"] == "duplicate_idempotency_key"
+
+
+def test_mission_continuation_skip_reasons_are_visible(tmp_path):
+    no_mission = JsonStateStore(tmp_path / "no-mission.json")
+    assert evaluate_mission_continuation(no_mission)["skipped"][0]["reason"] == "no_mission"
+
+    no_chief = JsonStateStore(tmp_path / "no-chief.json")
+    no_chief.set_mission(Mission("Continue the mission", ["next plan"], []))
+    assert evaluate_mission_continuation(no_chief)["skipped"][0]["reason"] == "no_crew_chief"
+
+    active = JsonStateStore(tmp_path / "active.json")
+    active.set_mission(Mission("Continue the mission", ["next plan"], []))
+    active.add_agent(Agent("chief", "CHIEF", "workspace-chief", "crew_chief"))
+    active.upsert_team(Team("alpha", "Alpha", crew_chief_id="chief"))
+    active.add_assignment(
+        Assignment(
+            assignment="Existing work",
+            assigned_to="chief",
+            created_by="human",
+            source="test",
+        )
+    )
+
+    assert (
+        evaluate_mission_continuation(active)["skipped"][0]["reason"]
+        == "active_or_queued_work_exists"
+    )
+
+
+def test_delegate_tool_records_orchestration_event(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    chief = Agent("chief", "CHIEF", "workspace-chief", "crew_chief")
+    worker = Agent("worker", "WORKER", "workspace-worker")
+    parent = Assignment(
+        assignment="Break down mission work",
+        assigned_to="chief",
+        created_by="human",
+        source="test",
+    )
+    parent.transition_to(AssignmentStatus.ASSIGNED)
+    store.add_agent(chief)
+    store.add_agent(worker)
+    store.add_assignment(parent)
+
+    result = default_tool_registry().execute(
+        "delegate",
+        ToolContext(agent=chief, assignment=parent, store=store),
+        {"agent_id": "worker", "assignment": "Execute the delegated work"},
+    )
+    telemetry = build_orchestration_telemetry(store.orchestrator_reasoning())
+
+    assert result.ok is True
+    assert telemetry["latest_event"]["type"] == "delegated_task"
+    assert telemetry["latest_event"]["parent_assignment_id"] == parent.assignment_id
+    assert telemetry["latest_event"]["child_assignment_ids"]
+
+
+def test_parent_completion_records_synthesis_event(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    chief = Agent("chief", "CHIEF", "workspace-chief", "crew_chief")
+    parent = Assignment(
+        assignment="Synthesize child results",
+        assigned_to="chief",
+        created_by="human",
+        source="test",
+    )
+    parent.transition_to(AssignmentStatus.ASSIGNED)
+    child = Assignment(
+        assignment="Child result",
+        assigned_to="chief",
+        created_by="chief",
+        source="agent_delegate",
+        parent_assignment_id=parent.assignment_id,
+    )
+    store.add_agent(chief)
+    store.add_assignment(parent)
+    store.add_assignment(child)
+    write_heartbeat_assignment(chief, parent, tmp_path)
+
+    run_agent_once("chief", store, TestProvider())
+    telemetry = build_orchestration_telemetry(store.orchestrator_reasoning())
+
+    assert telemetry["latest_event"]["type"] == "parent_synthesis"
+    assert telemetry["latest_event"]["parent_assignment_id"] == parent.assignment_id
+    assert child.assignment_id in telemetry["latest_event"]["child_assignment_ids"]

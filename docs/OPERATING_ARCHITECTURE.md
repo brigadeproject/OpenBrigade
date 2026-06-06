@@ -63,7 +63,6 @@ effects.
 
 Provider routes include:
 
-- `fake` for deterministic tests only.
 - `ollama` for the local/default runtime model path.
 - LiteLLM-backed `openai`, `gemini`, and other external providers for v0.9.1 connection work.
 

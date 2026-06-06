@@ -10,7 +10,7 @@ from brigade.memory import (
     archive_stale_daily_memories,
     curate_workspace_memory,
 )
-from brigade.providers import FakeProvider, ModelResponse
+from brigade.providers import ModelResponse, ModelUnavailableError
 from brigade.runner import run_agent_once, run_managed_agents
 from brigade.schemas import Agent, Assignment, AssignmentStatus, Goal, Mission
 from brigade.state import JsonStateStore
@@ -24,21 +24,21 @@ from brigade.workspace import (
 
 
 class WorkingProvider:
-    route_type = "simulated"
+    route_type = "test"
     model = "test-working"
 
     def complete(self, prompt: str) -> ModelResponse:
         del prompt
         return ModelResponse(
             text=json.dumps({"status": "working", "summary": "continue: Draft a longer plan"}),
-            provider="fake",
+            provider="test",
             model=self.model,
             route_type=self.route_type,
         )
 
 
 class CompleteProvider:
-    route_type = "simulated"
+    route_type = "test"
 
     def __init__(self, model: str = "test-complete") -> None:
         self.model = model
@@ -47,7 +47,7 @@ class CompleteProvider:
         del prompt
         return ModelResponse(
             text=json.dumps({"status": "complete", "summary": f"done with {self.model}"}),
-            provider="fake",
+            provider="test",
             model=self.model,
             route_type=self.route_type,
         )
@@ -63,7 +63,7 @@ class FailingProvider:
 
 
 class WaitingProvider:
-    route_type = "simulated"
+    route_type = "test"
     model = "test-waiting"
 
     def __init__(self, expected_next_activity_at: str) -> None:
@@ -79,7 +79,7 @@ class WaitingProvider:
                     "expected_next_activity_at": self.expected_next_activity_at,
                 }
             ),
-            provider="fake",
+            provider="test",
             model=self.model,
             route_type=self.route_type,
         )
@@ -98,35 +98,76 @@ class LocalProvider:
         )
 
 
+class CompleteLocalProvider(CompleteProvider):
+    route_type = "local"
+
+
+class MissingLocalModelProvider:
+    route_type = "local"
+    model = "missing-local"
+
+    def complete(self, prompt: str) -> ModelResponse:
+        del prompt
+        raise ModelUnavailableError(
+            "ollama model 'missing-local' is not available at http://ollama; "
+            "choose an installed model or pull it with Ollama"
+        )
+
+
+class EmptyThenCompleteProvider:
+    route_type = "test"
+    model = "test-empty-then-complete"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, prompt: str) -> ModelResponse:
+        del prompt
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                text="",
+                provider="test",
+                model=self.model,
+                route_type=self.route_type,
+            )
+        return ModelResponse(
+            text=json.dumps({"status": "complete", "summary": "recovered after empty"}),
+            provider="test",
+            model=self.model,
+            route_type=self.route_type,
+        )
+
+
 class ProseProvider:
-    route_type = "simulated"
+    route_type = "test"
     model = "test-prose"
 
     def complete(self, prompt: str) -> ModelResponse:
         return ModelResponse(
             text="I made progress, but I am not done yet.",
-            provider="fake",
+            provider="test",
             model=self.model,
             route_type=self.route_type,
         )
 
 
 class MalformedJsonProvider:
-    route_type = "simulated"
+    route_type = "test"
     model = "test-malformed"
 
     def complete(self, prompt: str) -> ModelResponse:
         del prompt
         return ModelResponse(
             text='{"status": "complete", ',
-            provider="fake",
+            provider="test",
             model=self.model,
             route_type=self.route_type,
         )
 
 
 class CapturingProvider:
-    route_type = "simulated"
+    route_type = "test"
     model = "test-capture"
 
     def __init__(self) -> None:
@@ -136,14 +177,14 @@ class CapturingProvider:
         self.prompt = prompt
         return ModelResponse(
             text=json.dumps({"status": "complete", "summary": "done"}),
-            provider="fake",
+            provider="test",
             model=self.model,
             route_type=self.route_type,
         )
 
 
 class ToolUsingProvider:
-    route_type = "simulated"
+    route_type = "test"
     model = "test-tool"
 
     def __init__(self) -> None:
@@ -164,7 +205,7 @@ class ToolUsingProvider:
             text = json.dumps({"status": "complete", "summary": "used memory"})
         return ModelResponse(
             text=text,
-            provider="fake",
+            provider="test",
             model=self.model,
             route_type=self.route_type,
         )
@@ -260,6 +301,28 @@ def test_run_agent_once_blocks_after_repeated_malformed_json(tmp_path):
     assert "malformed provider output" in result.summary
     assert store.assignment_history() == []
     assert store.find_assignment(assignment.assignment_id).status == AssignmentStatus.BLOCKED
+
+
+def test_run_agent_once_retries_empty_provider_response(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    assignment = Assignment(
+        assignment="Recover from empty output",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+    )
+    assignment.transition_to(AssignmentStatus.ASSIGNED)
+    store.add_agent(agent)
+    store.add_assignment(assignment)
+    write_heartbeat_assignment(agent, assignment, tmp_path)
+    provider = EmptyThenCompleteProvider()
+
+    result = run_agent_once("sage", store, provider)
+
+    assert result.status == "complete"
+    assert result.summary == "recovered after empty"
+    assert provider.calls == 2
 
 
 def test_run_agent_once_prompt_injects_agent_floor_without_memory_dump(tmp_path):
@@ -475,6 +538,37 @@ def test_run_managed_agents_uses_per_agent_provider_factory(tmp_path):
     }
 
 
+def test_run_managed_agents_runs_next_local_worker_without_cooldown(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    for agent_id in ("sage", "garde"):
+        agent = Agent(
+            agent_id=agent_id,
+            display_name=agent_id.upper(),
+            workspace_path=f"workspace-{agent_id}",
+        )
+        assignment = Assignment(
+            assignment=f"Complete local work for {agent_id}",
+            assigned_to=agent_id,
+            created_by="human",
+            source="direct_command",
+        )
+        assignment.transition_to(AssignmentStatus.ASSIGNED)
+        store.add_agent(agent)
+        store.add_assignment(assignment)
+        write_heartbeat_assignment(agent, assignment, tmp_path)
+
+    results = run_managed_agents(store, CompleteLocalProvider("installed-local"))
+
+    assert [item.status for item in results] == [
+        AssignmentStatus.COMPLETE.value,
+        AssignmentStatus.COMPLETE.value,
+    ]
+    assert all("local inference unavailable" not in item.summary for item in results)
+    state = store.local_inference()
+    assert state["status"] == "idle"
+    assert state["next_available"] == state["last_completed"]
+
+
 def test_run_managed_agents_falls_back_to_default_provider(tmp_path):
     store = JsonStateStore(tmp_path / "state.json")
     agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
@@ -500,6 +594,33 @@ def test_run_managed_agents_falls_back_to_default_provider(tmp_path):
     assert results[0].status == AssignmentStatus.COMPLETE.value
     assert store.usage_records()[0]["model"] == "default-model"
     assert any("retrying with default provider" in alert for alert in store.alerts())
+
+
+def test_missing_local_model_does_not_cooldown_before_fallback(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    assignment = Assignment(
+        assignment="Retry with installed local model",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+    )
+    assignment.transition_to(AssignmentStatus.ASSIGNED)
+    store.add_agent(agent)
+    store.add_assignment(assignment)
+    write_heartbeat_assignment(agent, assignment, tmp_path)
+
+    results = run_managed_agents(
+        store,
+        CompleteLocalProvider("installed-local"),
+        provider_factory=lambda agent_id: MissingLocalModelProvider(),
+        fallback_provider=CompleteLocalProvider("installed-local"),
+    )
+
+    assert len(results) == 1
+    assert results[0].status == AssignmentStatus.COMPLETE.value
+    assert store.usage_records()[0]["model"] == "installed-local"
+    assert all("local inference unavailable" not in item.summary for item in results)
 
 
 def test_create_subtasks_tool_creates_dependency_linked_children(tmp_path):
@@ -654,7 +775,7 @@ def test_run_agent_once_ignores_queued_or_blocked_backlog_for_agent(tmp_path):
         store.add_assignment(assignment)
     write_heartbeat_assignment(agent, active, tmp_path)
 
-    result = run_agent_once("sage", store, FakeProvider())
+    result = run_agent_once("sage", store, CompleteProvider())
 
     assert result.assignment_id == active.assignment_id
     assert result.status == AssignmentStatus.COMPLETE.value
@@ -681,7 +802,7 @@ def test_run_agent_once_rejects_duplicate_execution_claim_without_side_effects(t
         agent_id="sage",
     )
 
-    result = run_agent_once("sage", store, FakeProvider())
+    result = run_agent_once("sage", store, CompleteProvider())
 
     assert result.status == AssignmentStatus.ASSIGNED.value
     assert result.summary == "assignment already being executed by runner-a"
@@ -706,7 +827,7 @@ def test_run_agent_once_blocks_on_invalid_heartbeat_without_completion_side_effe
     heartbeat = write_heartbeat_assignment(agent, assignment, tmp_path)
     heartbeat.write_text(f"{ASSIGNMENT_MARKER}\n{{ invalid json\n```\n", encoding="utf-8")
 
-    result = run_agent_once("sage", store, FakeProvider())
+    result = run_agent_once("sage", store, CompleteProvider())
 
     assert result.status == AssignmentStatus.BLOCKED.value
     assert "invalid JSON" in result.summary
@@ -740,7 +861,7 @@ def test_run_agent_once_blocks_on_stale_heartbeat_assignment_id(tmp_path):
     store.add_assignment(assignment)
     write_heartbeat_assignment(agent, stale, tmp_path)
 
-    result = run_agent_once("sage", store, FakeProvider())
+    result = run_agent_once("sage", store, CompleteProvider())
 
     assert result.status == AssignmentStatus.BLOCKED.value
     assert "does not match the active stored assignment" in result.summary

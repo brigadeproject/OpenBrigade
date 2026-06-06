@@ -265,6 +265,8 @@ def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
 
 
 def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    from brigade.orchestrator import orchestration_event, record_orchestration_events
+
     guard = _delegation_guard(context, requested_children=1)
     if guard is not None:
         return guard
@@ -289,15 +291,49 @@ def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         goal_statement=_arg_text(arguments, "goal_statement", None),
         assignment_rationale=f"Delegated by {context.agent.agent_id} during active work.",
     )
-    context.store.add_assignment(assignment)
+    persisted = context.store.add_assignment(assignment)
+    mission = context.store.mission()
+    record_orchestration_events(
+        context.store,
+        source="agent_delegate",
+        decision_summary=(
+            f"{context.agent.agent_id} delegated one assignment to {target_agent_id}"
+        ),
+        mission_statement=mission.statement if mission else None,
+        events=[
+            orchestration_event(
+                "delegated_task",
+                (
+                    f"{context.agent.agent_id} delegated assignment "
+                    f"{persisted.assignment_id} to {target_agent_id}."
+                ),
+                source="agent_delegate",
+                decision="delegated",
+                status=persisted.status.value,
+                mission_statement=mission.statement if mission else None,
+                goal_statement=persisted.goal_statement,
+                assignment_id=persisted.assignment_id,
+                assignment_ids=[persisted.assignment_id],
+                agent_id=target_agent_id,
+                parent_assignment_id=context.assignment.assignment_id,
+                child_assignment_ids=[persisted.assignment_id],
+                payload={
+                    "parent_assignment": context.assignment.to_dict(),
+                    "child_assignment": persisted.to_dict(),
+                },
+            )
+        ],
+    )
     return ToolResult(
         True,
-        f"created queued assignment {assignment.assignment_id} for {target_agent_id}",
-        {"assignment_id": assignment.assignment_id, "status": assignment.status.value},
+        f"created queued assignment {persisted.assignment_id} for {target_agent_id}",
+        {"assignment_id": persisted.assignment_id, "status": persisted.status.value},
     )
 
 
 def _create_subtasks(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    from brigade.orchestrator import orchestration_event, record_orchestration_events
+
     raw_subtasks = arguments.get("subtasks")
     if not isinstance(raw_subtasks, list) or not raw_subtasks:
         return ToolResult(False, "subtasks must be a non-empty array")
@@ -351,16 +387,44 @@ def _create_subtasks(context: ToolContext, arguments: dict[str, Any]) -> ToolRes
                 f"Structured subtask {item['index']} created by {context.agent.agent_id}."
             ),
         )
-        context.store.add_assignment(assignment)
-        previous_assignment_id = assignment.assignment_id
+        persisted = context.store.add_assignment(assignment)
+        previous_assignment_id = persisted.assignment_id
         created.append(
             {
-                "assignment_id": assignment.assignment_id,
+                "assignment_id": persisted.assignment_id,
                 "agent_id": item["agent_id"],
                 "dependency_ids": dependency_ids,
-                "status": assignment.status.value,
+                "status": persisted.status.value,
             }
         )
+    mission = context.store.mission()
+    record_orchestration_events(
+        context.store,
+        source="create_subtasks",
+        decision_summary=(
+            f"{context.agent.agent_id} created {len(created)} child assignment(s)"
+        ),
+        mission_statement=mission.statement if mission else None,
+        events=[
+            orchestration_event(
+                "delegated_task",
+                (
+                    f"{context.agent.agent_id} created {len(created)} child assignment(s) "
+                    f"for parent {context.assignment.assignment_id}."
+                ),
+                source="create_subtasks",
+                decision="delegated",
+                status="queued",
+                mission_statement=mission.statement if mission else None,
+                goal_statement=context.assignment.goal_statement,
+                assignment_ids=[item["assignment_id"] for item in created],
+                agent_id=context.agent.agent_id,
+                parent_assignment_id=context.assignment.assignment_id,
+                child_assignment_ids=[item["assignment_id"] for item in created],
+                payload={"created": created, "parent_assignment": context.assignment.to_dict()},
+            )
+        ],
+    )
     return ToolResult(
         True,
         f"created {len(created)} queued subtasks",

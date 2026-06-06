@@ -23,6 +23,7 @@ from brigade.markdown import render_markdown_html
 from brigade.schemas import Agent, Role, User
 from brigade.services import build_settings_payload, set_config_value
 from brigade.state import JsonStateStore
+from tests.helpers import TestProvider
 
 
 class _AsgiResponse:
@@ -375,13 +376,19 @@ def test_live_connector_unknown_user_creates_pending_approval(tmp_path):
     assert any("pending approval" in alert for alert in store.alerts())
 
 
-def test_approved_telegram_user_auto_replies_and_audits_outbound(tmp_path):
+def test_approved_telegram_user_auto_replies_and_audits_outbound(tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
-    from brigade.web import create_app
+    import brigade.web
+
+    monkeypatch.setattr(
+        brigade.web,
+        "provider_from_settings",
+        lambda *args, **kwargs: TestProvider(),
+    )
 
     sent: list[dict[str, object]] = []
 
-    def fake_post(url: str, payload: bytes, headers: dict[str, str]):
+    def stub_post(url: str, payload: bytes, headers: dict[str, str]):
         sent.append({"url": url, "payload": json.loads(payload), "headers": headers})
         return {"ok": True, "result": {"message_id": 99}}
 
@@ -404,11 +411,11 @@ def test_approved_telegram_user_auto_replies_and_audits_outbound(tmp_path):
         telegram_bot_token="bot-token",
         telegram_default_agent="sage",
     )
-    app = create_app(
+    app = brigade.web.create_app(
         settings,
         store,
         connector_rate_limiter=InMemoryConnectorRateLimiter(limit=10, window_seconds=60),
-        telegram_http_post=fake_post,
+        telegram_http_post=stub_post,
     )
 
     response = asyncio.run(
@@ -439,9 +446,15 @@ def test_approved_telegram_user_auto_replies_and_audits_outbound(tmp_path):
     )
 
 
-def test_approved_google_chat_user_returns_thread_reply(tmp_path):
+def test_approved_google_chat_user_returns_thread_reply(tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
-    from brigade.web import create_app
+    import brigade.web
+
+    monkeypatch.setattr(
+        brigade.web,
+        "provider_from_settings",
+        lambda *args, **kwargs: TestProvider(),
+    )
 
     store = JsonStateStore(tmp_path / "state.json")
     store.add_agent(Agent("sage", "SAGE", "workspace-sage"))
@@ -461,7 +474,7 @@ def test_approved_google_chat_user_returns_thread_reply(tmp_path):
         google_chat_secret="secret",
         google_chat_default_agent="sage",
     )
-    app = create_app(
+    app = brigade.web.create_app(
         settings,
         store,
         connector_rate_limiter=InMemoryConnectorRateLimiter(limit=10, window_seconds=60),
@@ -485,7 +498,7 @@ def test_approved_google_chat_user_returns_thread_reply(tmp_path):
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["text"].startswith("FAKE_RESPONSE:")
+    assert payload["text"].startswith("test provider:")
     assert payload["thread"]["name"] == "spaces/abc/threads/def"
     assert any(
         record["provider"] == "google_chat" and record["status"] == "sent"
@@ -569,9 +582,9 @@ def test_live_connector_blocks_oversized_outbound_reply(tmp_path):
                     "text": "x" * 20,
                     "input_tokens": 1,
                     "output_tokens": 20,
-                    "provider": "fake",
+                    "provider": "test",
                     "model": "loud",
-                    "route_type": "simulated",
+                    "route_type": "cloud",
                     "estimated_cost_usd": 0.0,
                 },
             )()
@@ -607,10 +620,10 @@ def test_live_connector_blocks_oversized_outbound_reply(tmp_path):
     assert any("blocked outbound" in alert for alert in store.alerts())
 
 
-def test_telegram_and_google_chat_outbound_helpers_are_fakeable():
+def test_telegram_and_google_chat_outbound_helpers_can_be_stubbed():
     calls: list[dict[str, object]] = []
 
-    def fake_post(url: str, payload: bytes, headers: dict[str, str]):
+    def stub_post(url: str, payload: bytes, headers: dict[str, str]):
         calls.append({"url": url, "payload": json.loads(payload), "headers": headers})
         return {"ok": True, "result": {"message_id": 12}}
 
@@ -618,7 +631,7 @@ def test_telegram_and_google_chat_outbound_helpers_are_fakeable():
         "token",
         chat_id="7",
         text="hello",
-        http_post=fake_post,
+        http_post=stub_post,
     )
     assert result.status == "sent"
     assert calls[0]["payload"]["text"] == "hello"  # type: ignore[index]
@@ -701,10 +714,16 @@ def test_cli_model_oauth_login_status_logout_redacts_tokens(tmp_path, monkeypatc
     assert logout_payload["deleted"] is True
 
 
-def test_web_auth_api_running_service_behaviour(tmp_path):
+def test_web_auth_api_running_service_behaviour(tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
 
-    from brigade.web import create_app
+    import brigade.web
+
+    monkeypatch.setattr(
+        brigade.web,
+        "provider_from_settings",
+        lambda *args, **kwargs: TestProvider(),
+    )
 
     store = JsonStateStore(tmp_path / "state.json")
     owner = User(username="owner", role=Role.OWNER)
@@ -718,7 +737,7 @@ def test_web_auth_api_running_service_behaviour(tmp_path):
         require_auth=True,
         jwt_secret="x" * 40,
     )
-    app = create_app(settings, store)
+    app = brigade.web.create_app(settings, store)
     owner_headers = {"Authorization": f"Bearer {issue_token(settings, owner)}"}
     observer_headers = {"Authorization": f"Bearer {issue_token(settings, observer)}"}
     expired_headers = {"Authorization": f"Bearer {issue_token(settings, owner, ttl_seconds=-60)}"}
@@ -780,14 +799,14 @@ def test_web_auth_api_running_service_behaviour(tmp_path):
     cockpit_payload = cockpit.json()
     assert cockpit_payload["auth"]["require_auth"] is True
     assert cockpit_payload["counts"]["agents"] == 1
-    assert cockpit_payload["models"]["default_provider"] == "fake"
+    assert cockpit_payload["models"]["default_provider"] == "ollama"
     assert cockpit_payload["usage"]["total_tokens"] == 0
 
     models = asyncio.run(_asgi_request(app, "GET", "/api/models", headers=owner_headers))
     assert models.status_code == 200
     model_payload = models.json()
-    assert model_payload["recommended"]["provider"] == "fake"
-    assert any(option["provider"] == "fake" for option in model_payload["options"])
+    assert model_payload["recommended"]["provider"] == "ollama"
+    assert all(option["provider"] != "fake" for option in model_payload["options"])
 
     chat = asyncio.run(_asgi_request(
         app,
@@ -806,7 +825,7 @@ def test_web_auth_api_running_service_behaviour(tmp_path):
         "POST",
         "/api/chat/ask-orchestrator",
         headers=owner_headers,
-        json_payload={"content": "What needs attention?", "provider": "fake"},
+        json_payload={"content": "What needs attention?", "provider": "ollama"},
     ))
     assert orchestrator_chat.status_code == 200
     assert orchestrator_chat.json()["status"] == "complete"
@@ -819,7 +838,10 @@ def test_web_auth_api_running_service_behaviour(tmp_path):
             "POST",
             "/api/chat/ask-orchestrator-markdown",
             headers=owner_headers,
-            json_payload={"content": "Use **bold** and `code` in your answer.", "provider": "fake"},
+            json_payload={
+                "content": "Use **bold** and `code` in your answer.",
+                "provider": "ollama",
+            },
         )
     )
     assert orchestrator_markdown.status_code == 200
@@ -827,6 +849,44 @@ def test_web_auth_api_running_service_behaviour(tmp_path):
     assert markdown_payload["status"] == "complete"
     assert isinstance(markdown_payload["response_markdown"], str)
     assert "<p>" in markdown_payload["response_html"]
+
+
+def test_orchestration_api_payload_is_embedded_in_cockpit_and_ops_room(tmp_path):
+    pytest.importorskip("fastapi")
+
+    from brigade.web import create_app
+
+    store = JsonStateStore(tmp_path / "state.json")
+    store.add_orchestrator_reasoning(
+        {
+            "reasoning_id": "reason-1",
+            "cycle_id": "cycle-1",
+            "ended_at": "2026-01-01T00:00:00+00:00",
+            "source": "test",
+            "mission_statement": "Test mission",
+            "assigned": [],
+            "skipped": [],
+            "decision_summary": "assigned=0 skipped=0 alerts=0",
+        }
+    )
+    app = create_app(
+        Settings(config_path=tmp_path / "brigade.config.json", data_dir=tmp_path),
+        store,
+    )
+
+    orchestration = asyncio.run(_asgi_request(app, "GET", "/api/orchestration")).json()
+    cockpit = asyncio.run(_asgi_request(app, "GET", "/api/cockpit")).json()
+    ops_room = asyncio.run(_asgi_request(app, "GET", "/api/ops-room")).json()
+
+    assert orchestration["latest_event"]["summary"] == "assigned=0 skipped=0 alerts=0"
+    assert (
+        cockpit["orchestration"]["latest_event"]["summary"]
+        == orchestration["latest_event"]["summary"]
+    )
+    assert (
+        ops_room["orchestration"]["latest_event"]["summary"]
+        == orchestration["latest_event"]["summary"]
+    )
 
 
 def test_web_static_root_uses_first_candidate_with_index(tmp_path):

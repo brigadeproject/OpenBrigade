@@ -48,16 +48,17 @@ from brigade.memory import (
 )
 from brigade.orchestrator import (
     CycleResult,
+    ProactiveContinuationConfig,
     build_cycle_reasoning_record,
-    build_idle_agent_assignments,
     derive_agent_states,
     deterministic_cycle,
+    evaluate_mission_continuation,
     evaluate_orchestrator_floor,
+    orchestration_event,
     run_orchestrator_escalation,
 )
 from brigade.prompt_floors import build_orchestrator_floor
 from brigade.providers import (
-    FakeProvider,
     LiteLLMProvider,
     ModelProvider,
     OllamaProvider,
@@ -735,7 +736,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  brigade model complete --prompt \"Summarize the mission\"\n"
-            "  brigade model complete --provider ollama --model llama3.1 "
+            "  brigade model complete --provider ollama --model gpt-oss:20b "
             "--prompt \"Summarize the mission\""
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -797,14 +798,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     route.add_argument(
         "--prefer",
-        choices=["auto", "local", "cloud", "fake"],
+        choices=["auto", "local", "cloud"],
         default="auto",
         help="Routing preference. Default: auto.",
     )
     route.add_argument(
         "--local-model",
-        default="llama3.1",
-        help="Model to recommend for local Ollama work. Default: llama3.1.",
+        default="gpt-oss:20b",
+        help="Model to recommend for local Ollama work. Default: gpt-oss:20b.",
     )
     route.add_argument(
         "--cloud-model",
@@ -922,6 +923,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if argv is None:
+        try:
+            return _main(None)
+        except (PermissionError, RuntimeError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    return _main(argv)
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     normalized_args = _normalize_global_args(argv)
     args = parser.parse_args(normalized_args)
@@ -1525,6 +1536,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "task" and args.task_command == "create":
         current_user = _require_permission(store, settings, actor, "task:write")
+        _require_known_agent(store, args.agent)
         _validate_agent_assignment_authority(
             store,
             creator_agent_id=args.created_by,
@@ -1546,8 +1558,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             created_by_role=current_user.role.value if current_user else None,
             idempotency_key=args.idempotency_key,
         )
-        store.add_assignment(assignment)
-        print(json.dumps(assignment.to_dict(), indent=2, sort_keys=True))
+        persisted = store.add_assignment(assignment)
+        print(json.dumps(persisted.to_dict(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "task" and args.task_command == "prompt":
@@ -1565,6 +1577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         namespace.estimated_cycles = payload["estimated_cycles"]
         namespace.agent = payload["agent"]
         namespace.assignment = payload["assignment"]
+        _require_known_agent(store, namespace.agent)
         current_user = actor.user
         assignment = Assignment(
             assignment=namespace.assignment,
@@ -1581,8 +1594,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             created_by_role=current_user.role.value if current_user else None,
             idempotency_key=namespace.idempotency_key,
         )
-        store.add_assignment(assignment)
-        print(json.dumps(assignment.to_dict(), indent=2, sort_keys=True))
+        persisted = store.add_assignment(assignment)
+        print(json.dumps(persisted.to_dict(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "task" and args.task_command == "list":
@@ -1889,7 +1902,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "orchestrator" and args.orchestrator_command == "cycle":
         _require_permission(store, settings, actor, "orchestrator:write")
-        result = _run_cycle(store, stale_work_seconds=settings.stale_work_seconds)
+        result = _run_cycle(
+            store,
+            stale_work_seconds=settings.stale_work_seconds,
+            proactive_config=_proactive_config_from_settings(settings),
+        )
         print(
             json.dumps(
                 {
@@ -1926,6 +1943,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 store,
                 provider=provider,
                 stale_work_seconds=settings.stale_work_seconds,
+                proactive_config=_proactive_config_from_settings(settings),
             )
             if not args.no_run_agents:
                 agent_results.extend(
@@ -1996,12 +2014,12 @@ def _live_chat_tui_command(
 def _add_provider_args(parser: argparse.ArgumentParser, require_prompt: bool = False) -> None:
     parser.add_argument(
         "--provider",
-        choices=["fake", "ollama", "litellm", "openai", "openai-codex", "anthropic", "gemini"],
+        choices=["ollama", "litellm", "openai", "openai-codex", "anthropic", "gemini"],
         default=None,
         help=(
             "Model provider to use. Default: resolved settings provider "
-            "(fake unless a live default such as Ollama is configured). "
-            "openai/anthropic/gemini are LiteLLM routes."
+            "(Ollama unless configured otherwise). openai/anthropic/gemini "
+            "are LiteLLM routes."
         ),
     )
     parser.add_argument(
@@ -2119,8 +2137,8 @@ def _exchange_oauth_code(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _provider_from_args(args: argparse.Namespace, settings: Settings | None = None):
-    provider = args.provider or (settings.default_provider if settings else "fake")
-    model = args.model or (settings.default_model if settings else "llama3.1")
+    provider = args.provider or (settings.default_provider if settings else "ollama")
+    model = args.model or (settings.default_model if settings else "gpt-oss:20b")
     default_base_url = (
         settings.ollama_base_url
         if settings is not None
@@ -2140,8 +2158,6 @@ def _provider_from_args(args: argparse.Namespace, settings: Settings | None = No
             api_key=args.api_key,
             api_base=api_base,
         )
-    if provider == "fake":
-        return FakeProvider(model=model)
     if provider == "ollama":
         return OllamaProvider(base_url=base_url, model=model)
     if provider in {"openai", "openai-codex"}:
@@ -2332,6 +2348,11 @@ def _format_dashboard_summary(store: StateStore) -> str:
 
 def _find_agent(store: StateStore, agent_id: str) -> Agent | None:
     return next((item for item in store.agents() if item.agent_id == agent_id), None)
+
+
+def _require_known_agent(store: StateStore, agent_id: str) -> None:
+    if _find_agent(store, agent_id) is None:
+        raise ValueError(f"unknown agent: {agent_id}")
 
 
 def _find_team(store: StateStore, team_id: str | None) -> Team | None:
@@ -2655,26 +2676,28 @@ def _delegate_from_crew_chief(
         created_by_role="crew_chief",
         idempotency_key=f"chief:{team_id}:{chief_agent_id}:{target_agent_id}:{assignment_text}",
     )
-    store.add_assignment(assignment)
-    record = _reasoning_event(
-        source="crew_chief_delegate",
-        decision_summary=(
-            f"{chief_agent_id} delegated assignment {assignment.assignment_id} "
-            f"to {target_agent_id}"
-        ),
-        payload={
-            "team_id": team_id,
-            "chief_agent_id": chief_agent_id,
-            "target_agent_id": target_agent_id,
-            "assignment_id": assignment.assignment_id,
-        },
-    )
-    store.add_orchestrator_reasoning(record)
+    persisted = store.add_assignment(assignment)
+    created = persisted.assignment_id == assignment.assignment_id
+    if created:
+        record = _reasoning_event(
+            source="crew_chief_delegate",
+            decision_summary=(
+                f"{chief_agent_id} delegated assignment {persisted.assignment_id} "
+                f"to {target_agent_id}"
+            ),
+            payload={
+                "team_id": team_id,
+                "chief_agent_id": chief_agent_id,
+                "target_agent_id": target_agent_id,
+                "assignment_id": persisted.assignment_id,
+            },
+        )
+        store.add_orchestrator_reasoning(record)
     return {
-        "status": "queued",
+        "status": "queued" if created else "existing",
         "team_id": team_id,
         "chief_agent_id": chief_agent_id,
-        "assignment": assignment.to_dict(),
+        "assignment": persisted.to_dict(),
     }
 
 
@@ -2735,7 +2758,8 @@ def _route_team_work(
         created_by_role="team_router",
         idempotency_key=f"team-route:{team_id}:{scope}:{urgency}:{assignment_text}",
     )
-    store.add_assignment(assignment)
+    persisted = store.add_assignment(assignment)
+    created = persisted.assignment_id == assignment.assignment_id
     decision = {
         "team_id": team_id,
         "assignee": assignee,
@@ -2743,16 +2767,21 @@ def _route_team_work(
         "urgency": urgency,
         "delegation_policy": team.delegation_policy,
         "rationale": rationale,
-        "assignment_id": assignment.assignment_id,
+        "assignment_id": persisted.assignment_id,
     }
-    store.add_orchestrator_reasoning(
-        _reasoning_event(
-            source="team_route",
-            decision_summary=f"routed team {team_id} work to {assignee}",
-            payload=decision,
+    if created:
+        store.add_orchestrator_reasoning(
+            _reasoning_event(
+                source="team_route",
+                decision_summary=f"routed team {team_id} work to {assignee}",
+                payload=decision,
+            )
         )
-    )
-    return {"status": "queued", "decision": decision, "assignment": assignment.to_dict()}
+    return {
+        "status": "queued" if created else "existing",
+        "decision": decision,
+        "assignment": persisted.to_dict(),
+    }
 
 
 def _escalate_team_work(
@@ -2788,41 +2817,48 @@ def _escalate_team_work(
         created_by_role="crew_chief",
         idempotency_key=f"cross-team:{from_team_id}:{to_team_id}:{assignment_text}",
     )
-    store.add_assignment(assignment)
-    message = ChatMessage(
-        channel=f"team-escalation:{from_team_id}:{to_team_id}:{assignment.assignment_id}",
-        sender=chief_agent_id,
-        recipient=to_team.crew_chief_id,
-        content=assignment_text,
-        metadata={
-            "kind": "cross_team_escalation",
-            "from_team": from_team_id,
-            "to_team": to_team_id,
-            "reason": reason,
-            "assignment_id": assignment.assignment_id,
-        },
-    )
-    store.add_message(message)
+    persisted = store.add_assignment(assignment)
+    created = persisted.assignment_id == assignment.assignment_id
+    if created:
+        message = ChatMessage(
+            channel=f"team-escalation:{from_team_id}:{to_team_id}:{persisted.assignment_id}",
+            sender=chief_agent_id,
+            recipient=to_team.crew_chief_id,
+            content=assignment_text,
+            metadata={
+                "kind": "cross_team_escalation",
+                "from_team": from_team_id,
+                "to_team": to_team_id,
+                "reason": reason,
+                "assignment_id": persisted.assignment_id,
+            },
+        )
+        store.add_message(message)
     payload = {
         "from_team": from_team_id,
         "to_team": to_team_id,
         "requesting_chief": chief_agent_id,
         "receiving_chief": to_team.crew_chief_id,
-        "assignment_id": assignment.assignment_id,
-        "message_id": message.message_id,
+        "assignment_id": persisted.assignment_id,
+        "message_id": message.message_id if created else None,
         "reason": reason,
     }
-    store.add_orchestrator_reasoning(
-        _reasoning_event(
-            source="cross_team_escalation",
-            decision_summary=(
-                f"{from_team_id} escalated work to {to_team_id} "
-                f"via {to_team.crew_chief_id}"
-            ),
-            payload=payload,
+    if created:
+        store.add_orchestrator_reasoning(
+            _reasoning_event(
+                source="cross_team_escalation",
+                decision_summary=(
+                    f"{from_team_id} escalated work to {to_team_id} "
+                    f"via {to_team.crew_chief_id}"
+                ),
+                payload=payload,
+            )
         )
-    )
-    return {"status": "queued", "escalation": payload, "assignment": assignment.to_dict()}
+    return {
+        "status": "queued" if created else "existing",
+        "escalation": payload,
+        "assignment": persisted.to_dict(),
+    }
 
 
 def _propose_stalled_goal_work(
@@ -2868,17 +2904,55 @@ def _propose_stalled_goal_work(
                 assignment_rationale="No active assignment is advancing this goal.",
                 idempotency_key=key,
             )
-            store.add_assignment(assignment)
-            active_assignments.append(assignment)
+            persisted = store.add_assignment(assignment)
+            if persisted.assignment_id != assignment.assignment_id:
+                skipped.append({"agent_id": goal_agent_id, "reason": "already handled"})
+                continue
+            active_assignments.append(persisted)
             existing_keys.add(key)
-            created.append(assignment.to_dict())
+            created.append(persisted.to_dict())
 
+    mission = store.mission()
+    events = [
+        orchestration_event(
+            "created_work",
+            f"Created stalled-goal assignment {item['assignment_id']} for {item['assigned_to']}.",
+            source="goal_stall_detector",
+            decision="created",
+            status="created",
+            mission_statement=mission.statement if mission else None,
+            goal_statement=item.get("goal_statement"),
+            trigger="stalled_goal_without_active_work",
+            assignment_id=item["assignment_id"],
+            assignment_ids=[item["assignment_id"]],
+            agent_id=item["assigned_to"],
+            idempotency_key=item.get("idempotency_key"),
+            payload=item,
+        )
+        for item in created
+    ]
+    events.extend(
+        orchestration_event(
+            "proactive_skip",
+            f"Skipped stalled-goal work for {item.get('agent_id')}: {item.get('reason')}.",
+            source="goal_stall_detector",
+            decision="skipped",
+            status="skipped",
+            mission_statement=mission.statement if mission else None,
+            trigger=str(item.get("reason") or "skipped"),
+            agent_id=item.get("agent_id"),
+            payload=item,
+        )
+        for item in skipped
+    )
     record = _reasoning_event(
         source="goal_stall_detector",
         decision_summary=(
             f"created={len(created)} skipped={len(skipped)} stalled-goal assignments"
         ),
         payload={"created": created, "skipped": skipped},
+        events=events,
+        mission_statement=mission.statement if mission else None,
     )
     store.add_orchestrator_reasoning(record)
     return {"created": created, "skipped": skipped}
@@ -2916,28 +2990,34 @@ def _dispatch_cloud_job(
         created_by_role=current_user.role.value if current_user else None,
         idempotency_key=f"cloud-dispatch:{agent_id}:{assignment_text}",
     )
-    store.add_assignment(assignment)
+    persisted = store.add_assignment(assignment)
+    created = persisted.assignment_id == assignment.assignment_id
     job = {
         "job_id": str(uuid4()),
-        "assignment_id": assignment.assignment_id,
+        "assignment_id": persisted.assignment_id,
         "agent_id": agent_id,
         "provider": provider,
         "model": model,
-        "status": "queued",
+        "status": "queued" if created else "existing",
         "max_cost_usd": max_cost_usd,
         "requested_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
         "source": "cloud_dispatch",
     }
-    store.upsert_cloud_job(job)
-    store.add_orchestrator_reasoning(
-        _reasoning_event(
-            source="cloud_dispatch",
-            decision_summary=f"queued cloud job {job['job_id']} for {agent_id}",
-            payload={"job": job, "assignment": assignment.to_dict()},
+    if created:
+        store.upsert_cloud_job(job)
+        store.add_orchestrator_reasoning(
+            _reasoning_event(
+                source="cloud_dispatch",
+                decision_summary=f"queued cloud job {job['job_id']} for {agent_id}",
+                payload={"job": job, "assignment": persisted.to_dict()},
+            )
         )
-    )
-    return {"status": "queued", "job": job, "assignment": assignment.to_dict()}
+    return {
+        "status": "queued" if created else "existing",
+        "job": job,
+        "assignment": persisted.to_dict(),
+    }
 
 
 def _resolve_cloud_job(
@@ -3460,6 +3540,8 @@ def _reasoning_event(
     source: str,
     decision_summary: object,
     payload: dict[str, Any],
+    events: list[dict[str, Any]] | None = None,
+    mission_statement: str | None = None,
 ) -> dict[str, Any]:
     now = utc_now_iso()
     return {
@@ -3468,13 +3550,14 @@ def _reasoning_event(
         "started_at": now,
         "ended_at": now,
         "source": source,
-        "mission_statement": None,
+        "mission_statement": mission_statement,
         "queued_assignments": [],
         "assigned": [],
         "skipped": [],
         "alerts": [],
         "agent_states": {},
         "decision_summary": str(decision_summary),
+        "events": list(events or []),
         "payload": payload,
     }
 
@@ -3547,8 +3630,9 @@ def _run_cycle(
     provider: ModelProvider | None = None,
     *,
     stale_work_seconds: int = 86_400,
+    proactive_config: ProactiveContinuationConfig | None = None,
 ) -> CycleResult:
-    build_idle_agent_assignments(store)
+    evaluate_mission_continuation(store, proactive_config or ProactiveContinuationConfig())
     floor = build_orchestrator_floor(store, stale_seconds=stale_work_seconds)
     floor_triggers = evaluate_orchestrator_floor(
         store,
@@ -3615,6 +3699,15 @@ def _run_cycle(
         store.add_alert(alert)
     persist_financial_report(store, store.data_dir)
     return result
+
+
+def _proactive_config_from_settings(settings: Settings) -> ProactiveContinuationConfig:
+    return ProactiveContinuationConfig(
+        mode=settings.proactive_mode,
+        creation_enabled=settings.proactive_creation_enabled,
+        max_proposals_per_cycle=settings.max_proactive_proposals_per_cycle,
+        max_creations_per_cycle=settings.max_proactive_creations_per_cycle,
+    )
 
 
 def _persist_cycle_assignments(

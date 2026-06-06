@@ -23,7 +23,7 @@ python3 -m pytest
 docker compose --env-file .env.example config
 ```
 
-Run the deterministic MVP flow:
+Run the live MVP flow:
 
 ```bash
 ./ops/brigade-live.sh init mvp --mission "Make enough money to offset operating cost"
@@ -79,7 +79,7 @@ brigade user add --username alice --role operator
 brigade chat send --channel user:alice --sender alice --recipient sage --message "What are you working on?"
 brigade task inspect --id <assignment-id>
 brigade knowledge upload --path ./notes/reference.md
-brigade model complete --provider fake --prompt "Summarize the mission"
+brigade model complete --provider ollama --model gpt-oss:20b --prompt "Summarize the mission"
 brigade model complete --provider openai --model gpt-4.1-mini --prompt "Summarize"
 brigade model complete --provider gemini --model gemini-1.5-flash --prompt "Summarize"
 brigade model route --task-type research --risk normal

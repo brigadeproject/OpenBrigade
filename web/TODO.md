@@ -10,7 +10,7 @@
 - Wire `brigade health` to real Postgres, Redis, Qdrant, and Neo4j checks.
 - Add Ollama integration tests gated by local availability.
 - Add LiteLLM adapter for OpenAI, Anthropic, and Gemini API-key use.
-- Add real agent runner mode using provider responses, not only fake completion.
+- Add real agent runner mode using provider responses, not only stubbed test completions.
 - Add structured orchestrator reasoning records per cycle.
 - Add retry handling for malformed model output, blocked tasks, failed tasks, and 5-failure alerts.
 - Add backup and restore notes for volumes and state.
@@ -109,7 +109,7 @@
 ## v0.9 - Final MVP Testing and Hardening
 - Canonical live architecture is Postgres plus Redis/Qdrant/Neo4j. `Implemented in code and docs; operator workflows fail clearly when Postgres is not configured.`
 - Redis runtime normalization. `Implemented: pending assignment queue, execution claims with leases, alert queue, local inference lock, redis inspection, and recovery queue reconciliation checks.`
-- Local Ollama as internal/default runtime. `Implemented: configured BRIGADE_OLLAMA_BASE_URL makes Ollama the resolved live default; fake remains explicit for deterministic tests.`
+- Local Ollama as internal/default runtime. `Implemented: Ollama is the resolved live default; tests use local stubs instead of a runtime test provider.`
 - Qdrant memory validation. `Implemented: curated episode writes, source refs, inspection source-kind counts, and alerting on failed writes. Clean-stack sentinel rerun remains.`
 - Neo4j provenance relationships. `Implemented: document->chunk, task->agent/goal, decision->assignment, and team->agent relationships plus inspection relationship samples. Clean-stack sentinel rerun remains.`
 - Backend web auth/API hardening. `Implemented: fail-closed auth, malformed/expired token coverage, denied writes, settings redaction, security headers, Docker asset packaging, and ASGI API tests. Auth-enabled live web smoke remains.`
@@ -121,11 +121,11 @@
 ### v0.9.1 - External connections
 - Scope: external/non-default integrations only. Local Ollama is internal/default and belongs to v0.9.0 core runtime.
 - Telegram wrapper:
-  - Inbound fake-payload wrapper, allowlist, and tests are implemented.
-  - Remaining: BotFather setup doc, outbound reply fake/live path, owner approval flow, rate/size limits, connector disable switch, and live disabled-by-default smoke.
+  - Inbound sample-payload wrapper, allowlist, and tests are implemented.
+  - Remaining: BotFather setup doc, outbound reply stub/live path, owner approval flow, rate/size limits, connector disable switch, and live disabled-by-default smoke.
 - Google Chat wrapper:
-  - Inbound fake-event wrapper, allowlist metadata, and tests are implemented.
-  - Remaining: setup doc, outbound reply fake/live path, durable identity mapping/approval, rate/size limits, connector disable switch, and live disabled-by-default smoke.
+  - Inbound sample-event wrapper, allowlist metadata, and tests are implemented.
+  - Remaining: setup doc, outbound reply stub/live path, durable identity mapping/approval, rate/size limits, connector disable switch, and live disabled-by-default smoke.
 - OpenAI/Codex model connection:
   - LiteLLM `openai` alias and redacted settings are implemented.
   - Remaining: supported auth-mode doc, missing/invalid credential behavior, bounded live smoke, usage metadata review, and disable switch.

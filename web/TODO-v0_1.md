@@ -128,9 +128,9 @@ Useful references:
 - `reference/openclaw/extensions/litellm/index.test.ts:31-106` tests non-interactive API-key setup and custom base URL without a real provider call.
 - `reference/pixelagent/blueprints/multi_provider/core/base.py:27-57` is a Python provider-agnostic agent constructor pattern, though it uses Pixeltable rather than LiteLLM.
 
-## Add real agent runner mode using provider responses, not only fake completion
+## Add real agent runner mode using provider responses, not only stubbed test completion
 
-For OpenBrigade, the runner should have fake mode for unit tests and real mode for provider-backed sessions. Real mode should record provider, model, usage, raw/final text, tool calls, errors, and transcript references, then update the Redis assignment record.
+For OpenBrigade, the runner should use test stubs in unit tests and real provider-backed sessions at runtime. Real mode should record provider, model, usage, raw/final text, tool calls, errors, and transcript references, then update the Redis assignment record.
 
 Useful references:
 

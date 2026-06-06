@@ -59,7 +59,7 @@ orchestration story than any single proactive reference.
 
 ## Gaps / risks for RC
 
-1. **The escalation prompt depends on a capable model.** With `FakeProvider` it returns
+1. **The escalation prompt depends on a capable model.** With a test stub it returns
    `no_action`; with `ollama` small models the JSON-action contract may be unreliable.
    The parser is strict (`parse_orchestrator_response` raises on bad JSON). For RC, verify
    the daemon degrades gracefully when the model returns malformed actions (it currently

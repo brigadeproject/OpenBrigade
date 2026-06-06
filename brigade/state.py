@@ -75,10 +75,14 @@ class JsonStateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
-    def add_assignment(self, assignment: Assignment) -> None:
+    def add_assignment(self, assignment: Assignment) -> Assignment:
         state = self.load()
+        existing = _assignment_by_idempotency_key(state, assignment.idempotency_key)
+        if existing is not None:
+            return existing
         state.setdefault("assignments", []).append(assignment.to_dict())
         self.save(state)
+        return assignment
 
     def assignments(self) -> list[Assignment]:
         return [assignment_from_dict(item) for item in self.load().get("assignments", [])]
@@ -91,6 +95,9 @@ class JsonStateStore:
             (item for item in self.assignments() if item.assignment_id == assignment_id),
             None,
         )
+
+    def find_assignment_by_idempotency_key(self, idempotency_key: str) -> Assignment | None:
+        return _assignment_by_idempotency_key(self.load(), idempotency_key)
 
     def replace_assignments(self, assignments: list[Assignment]) -> None:
         state = self.load()
@@ -457,6 +464,22 @@ def _active_assignment_for_agent(assignments: list[Assignment], agent_id: str) -
     if not runnable:
         return None
     return sorted(runnable, key=lambda item: (item.updated_at, item.created_at), reverse=True)[0]
+
+
+def _assignment_by_idempotency_key(
+    state: dict[str, Any],
+    idempotency_key: str | None,
+) -> Assignment | None:
+    if not idempotency_key:
+        return None
+    for item in state.get("assignments", []):
+        if item.get("idempotency_key") == idempotency_key:
+            return assignment_from_dict(item)
+    for item in reversed(state.get("assignment_history", [])):
+        record = item.get("record") or {}
+        if record.get("idempotency_key") == idempotency_key:
+            return assignment_from_dict(record)
+    return None
 
 
 def _goal_identity(goal: dict[str, Any]) -> tuple[object, ...]:

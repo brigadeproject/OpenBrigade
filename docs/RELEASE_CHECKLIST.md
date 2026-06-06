@@ -38,7 +38,7 @@ Use this checklist before publishing a prototype tag or sharing a public snapsho
 ./ops/brigade-live.sh agent onboard --id scout --name SCOUT --role prototype
 ./ops/brigade-live.sh team create --id discovery --name Discovery
 ./ops/brigade-live.sh team assign --team discovery --agent scout --crew-chief
-./ops/brigade-live.sh chat ask-agent --from-agent scout --to-agent scout --message "status?" --provider fake
+./ops/brigade-live.sh chat ask-agent --from-agent scout --to-agent scout --message "status?" --provider ollama --model gpt-oss:20b
 ./ops/brigade-live.sh orchestrator propose-stalled-goals
 ./ops/brigade-live.sh model route --task-type research --risk normal
 ./ops/brigade-live.sh alert audit

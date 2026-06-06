@@ -6,19 +6,15 @@ cd "$ROOT_DIR"
 
 AGENT="${AGENT:-test-stress-builder}"
 SECOND_AGENT="${SECOND_AGENT:-test-stress-scout}"
-PROVIDER="${PROVIDER:-fake}"
-MODEL="${MODEL:-llama3.1}"
+PROVIDER="${PROVIDER:-ollama}"
+MODEL="${MODEL:-gpt-oss:20b}"
 INCLUDE_RUN_ALL="${INCLUDE_RUN_ALL:-0}"
 KEEP_WORK_DIR="${KEEP_WORK_DIR:-0}"
 WORK_DIR="$(mktemp -d /tmp/openbrigade-stress.XXXXXX)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT_PATH="$WORK_DIR/report.json"
 if [[ -z "${CLEANUP_PROVIDER:-}" ]]; then
-  if [[ "$PROVIDER" == "ollama" ]]; then
-    CLEANUP_PROVIDER=fake
-  else
-    CLEANUP_PROVIDER="$PROVIDER"
-  fi
+  CLEANUP_PROVIDER="$PROVIDER"
 else
   CLEANUP_PROVIDER="${CLEANUP_PROVIDER}"
 fi
@@ -47,10 +43,10 @@ usage: $0
 environment:
   AGENT             primary test agent, default test-stress-builder
   SECOND_AGENT      secondary test agent, default test-stress-scout
-  PROVIDER          brigade provider, default fake
-  MODEL             model name, default llama3.1
+  PROVIDER          brigade provider, default ollama
+  MODEL             model name, default gpt-oss:20b
   INCLUDE_RUN_ALL   set to 1 to include agent run-all in the concurrency burst
-  CLEANUP_PROVIDER  provider used to drain leftovers, default fake for ollama else PROVIDER
+  CLEANUP_PROVIDER  provider used to drain leftovers, default PROVIDER
   PRIMARY_CLEANUP_PASSES   cleanup attempts per test agent, default 6 for ollama else 3
   CLEANUP_SLEEP_SECONDS    sleep between cleanup attempts, default 2
   KEEP_WORK_DIR     set to 1 to preserve raw outputs in $WORK_DIR
@@ -76,7 +72,7 @@ ensure_test_agent() {
     --id "$agent_id" \
     --name "${agent_id^^}" \
     --role test_worker \
-    --provider fake \
+    --provider "$PROVIDER" \
     --model "$MODEL" \
     >/dev/null
 }

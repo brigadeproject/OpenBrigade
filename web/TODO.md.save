@@ -10,7 +10,7 @@
 - Wire `brigade health` to real Postgres, Redis, Qdrant, and Neo4j checks.
 - Add Ollama integration tests gated by local availability.
 - Add LiteLLM adapter for OpenAI, Anthropic, and Gemini API-key use.
-- Add real agent runner mode using provider responses, not only fake completion.
+- Add real agent runner mode using provider responses, not only stubbed test completions.
 - Add structured orchestrator reasoning records per cycle.
 - Add retry handling for malformed model output, blocked tasks, failed tasks, and 5-failure alerts.
 - Add backup and restore notes for volumes and state.

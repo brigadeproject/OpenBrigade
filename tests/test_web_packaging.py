@@ -24,6 +24,7 @@ def test_v092_frontend_wires_cockpit_auth_and_ops_room_workflows() -> None:
         "Ops Room",
         "TaskDialog",
         "OrchestratorChat",
+        "OrchestrationActivity",
         "ModelSelect",
         "/api/models",
         "/api/chat/ask-orchestrator",

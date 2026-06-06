@@ -19,7 +19,7 @@ but escalate a hard reasoning task to a cloud model, or fall back when a provide
   installed/available models and is surfaced at `GET /api/models`
   ([`brigade/web.py:315`](../brigade/web.py)). This *advises* a human/UI; it does not let an
   agent route itself.
-- **Route typing exists:** providers carry `route_type` (`local` / `cloud` / `simulated`),
+- **Route typing exists:** providers carry `route_type` (`local` / `cloud`),
   and the runner already treats cloud vs. local differently (cloud single-flight guard,
   local inference lock/cooldown) — [`brigade/runner.py:177`](../brigade/runner.py).
 

@@ -3,10 +3,15 @@ from __future__ import annotations
 import json
 
 from brigade.cli import main
+from tests.helpers import TestProvider
 
 
 def test_user_chat_model_and_db_commands(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "brigade.cli.provider_from_settings",
+        lambda *args, **kwargs: TestProvider(),
+    )
 
     assert main(["user", "add", "--username", "alice", "--role", "operator"]) == 0
     user = json.loads(capsys.readouterr().out)
@@ -36,9 +41,9 @@ def test_user_chat_model_and_db_commands(tmp_path, monkeypatch, capsys):
     messages = json.loads(capsys.readouterr().out)
     assert messages[0]["message_id"] == message["message_id"]
 
-    assert main(["model", "complete", "--provider", "fake", "--prompt", "Summarize"]) == 0
+    assert main(["model", "complete", "--provider", "ollama", "--prompt", "Summarize"]) == 0
     completion = json.loads(capsys.readouterr().out)
-    assert completion["provider"] == "fake"
+    assert completion["provider"] == "test"
 
     assert main(["db", "migrations"]) == 0
     migrations = json.loads(capsys.readouterr().out)

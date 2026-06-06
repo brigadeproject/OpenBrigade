@@ -11,6 +11,7 @@ from brigade.orchestrator import CycleResult
 from brigade.schemas import Agent, Assignment, AssignmentStatus, Goal
 from brigade.state import JsonStateStore
 from brigade.workspace import write_heartbeat_assignment
+from tests.helpers import TestProvider
 
 
 def test_cli_config_show(tmp_path, monkeypatch, capsys):
@@ -66,7 +67,65 @@ def test_cli_task_create_and_cycle(tmp_path, monkeypatch, capsys):
     status = json.loads(capsys.readouterr().out)
     assert status["assignments"][0]["status"] == "assigned"
     assert status["agent_states"]["sage"]["status"] == "working"
-    assert len(status["orchestrator_reasoning"]) == 1
+    cycle_events = [
+        event
+        for record in status["orchestrator_reasoning"]
+        for event in record.get("events", [])
+        if event.get("type") == "cycle_decision"
+    ]
+    assert any(
+        event.get("decision") == "assigned"
+        and event.get("provenance", {}).get("assignment_id") == created["assignment_id"]
+        for event in cycle_events
+    )
+
+
+def test_cli_task_create_rejects_unknown_agent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="unknown agent: missing"):
+        main(["task", "create", "--agent", "missing", "--assignment", "Do work"])
+
+
+def test_cli_task_create_reuses_idempotency_key(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "agent",
+                "add",
+                "--id",
+                "sage",
+                "--name",
+                "SAGE",
+                "--workspace",
+                "workspace-sage",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    command = [
+        "task",
+        "create",
+        "--agent",
+        "sage",
+        "--assignment",
+        "Do work once",
+        "--idempotency-key",
+        "task-key",
+    ]
+    assert main(command) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert main(command) == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert second["assignment_id"] == first["assignment_id"]
+    assert main(["task", "list"]) == 0
+    tasks = json.loads(capsys.readouterr().out)
+    assert [item["assignment_id"] for item in tasks] == [first["assignment_id"]]
 
 
 def test_cli_agent_onboard_validates_workspace_and_assigns_team(tmp_path, monkeypatch, capsys):
@@ -119,6 +178,56 @@ def test_cli_agent_onboard_validates_workspace_and_assigns_team(tmp_path, monkey
     assert team["member_agents"][0]["agent_id"] == "scout"
 
 
+def test_cli_team_delegate_reuses_existing_assignment(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "agent",
+                "onboard",
+                "--id",
+                "chief",
+                "--name",
+                "CHIEF",
+                "--team",
+                "alpha",
+                "--create-team",
+                "--crew-chief",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert main(["agent", "onboard", "--id", "scout", "--name", "SCOUT", "--team", "alpha"]) == 0
+    capsys.readouterr()
+
+    command = [
+        "team",
+        "delegate",
+        "--team",
+        "alpha",
+        "--chief",
+        "chief",
+        "--agent",
+        "scout",
+        "--assignment",
+        "Do work once",
+    ]
+    assert main(command) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["status"] == "queued"
+
+    assert main(command) == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert second["status"] == "existing"
+    assert second["assignment"]["assignment_id"] == first["assignment"]["assignment_id"]
+    assert main(["task", "list"]) == 0
+    tasks = json.loads(capsys.readouterr().out)
+    assert [item["assignment_id"] for item in tasks] == [first["assignment"]["assignment_id"]]
+
+
 def test_cli_team_create_assign_and_dashboard_view(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
 
@@ -159,6 +268,10 @@ def test_cli_team_create_assign_and_dashboard_view(tmp_path, monkeypatch, capsys
 
 def test_cli_chat_ask_agent_records_synchronous_exchange(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "brigade.cli.provider_from_settings",
+        lambda *args, **kwargs: TestProvider(),
+    )
 
     for agent_id, name in (("scout", "SCOUT"), ("builder", "BUILDER")):
         assert (
@@ -197,7 +310,7 @@ def test_cli_chat_ask_agent_records_synchronous_exchange(tmp_path, monkeypatch, 
     assert result["status"] == "complete"
     assert result["from_agent"] == "scout"
     assert result["to_agent"] == "builder"
-    assert result["route_type"] == "simulated"
+    assert result["route_type"] == "test"
     assert result["request_message_id"]
     assert result["response_message_id"]
 
@@ -266,11 +379,15 @@ def test_cli_chat_tui_uses_available_recommended_model_when_not_overridden(tmp_p
         "brigade.cli.available_model_options",
         lambda current_settings: {
             "recommended": {
-                "provider": "fake",
-                "model": "deterministic",
+                "provider": "ollama",
+                "model": "test-model",
                 "base_url": None,
             }
         },
+    )
+    monkeypatch.setattr(
+        "brigade.cli.provider_from_settings",
+        lambda current_settings, **kwargs: TestProvider(model=str(kwargs.get("model"))),
     )
 
     provider = _chat_tui_provider_from_args(
@@ -278,11 +395,15 @@ def test_cli_chat_tui_uses_available_recommended_model_when_not_overridden(tmp_p
         settings,
     )
 
-    assert provider.complete("hello").model == "deterministic"
+    assert provider.complete("hello").model == "test-model"
 
 
 def test_cli_chat_group_records_pass_the_mic_turns(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "brigade.cli.provider_from_settings",
+        lambda *args, **kwargs: TestProvider(),
+    )
 
     for agent_id, name in (
         ("scout", "SCOUT"),
@@ -971,6 +1092,10 @@ def test_cli_daemon_can_run_bounded_cycles(tmp_path, monkeypatch, capsys):
 
 def test_cli_daemon_runs_assigned_agents_by_default(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "brigade.cli.provider_from_settings",
+        lambda *args, **kwargs: TestProvider(),
+    )
     assert (
         main(["agent", "add", "--id", "sage", "--name", "SAGE", "--workspace", "workspace-sage"])
         == 0
@@ -987,11 +1112,84 @@ def test_cli_daemon_runs_assigned_agents_by_default(tmp_path, monkeypatch, capsy
     assert main(["status", "--json"]) == 0
     status = json.loads(capsys.readouterr().out)
     assert status["assignments"] == []
-    assert status["assignment_history"][0]["executive_summary"].startswith("FAKE_RESPONSE:")
+    assert status["assignment_history"][0]["executive_summary"].startswith("test provider:")
+
+
+def test_cli_daemon_records_one_idle_mission_proposal_without_creating_assignment(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "brigade.cli.provider_from_settings",
+        lambda *args, **kwargs: TestProvider(),
+    )
+    assert (
+        main(
+            [
+                "mission",
+                "set",
+                "--statement",
+                "Coordinate alpha",
+                "--success",
+                "plan exists",
+                "--not",
+                "spawn agents",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "agent",
+                "onboard",
+                "--id",
+                "chief",
+                "--name",
+                "CHIEF",
+                "--role",
+                "crew_chief",
+                "--team",
+                "alpha",
+                "--create-team",
+                "--crew-chief",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert main(["orchestrator", "daemon", "--max-cycles", "2", "--sleep-seconds", "0"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["cycles"] == 2
+    assert payload["agent_runs"] == []
+    assert main(["status", "--json"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["assignments"] == []
+    assert status["assignment_history"] == []
+    proposals = [
+        event
+        for record in status["orchestrator_reasoning"]
+        for event in record.get("events", [])
+        if event.get("type") == "proactive_proposal"
+    ]
+    assert len(proposals) == 1
+    assert proposals[0]["source"] == "orchestrator_mission_continuation"
+    assert proposals[0]["provenance"]["idempotency_key"].startswith(
+        "orchestrator-proactive:v1:"
+    )
 
 
 def test_cli_mission_agent_goal_and_heartbeat_flow(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "brigade.cli.provider_from_settings",
+        lambda *args, **kwargs: TestProvider(),
+    )
 
     assert (
         main(
@@ -1152,14 +1350,14 @@ def test_run_cycle_does_not_reinsert_assignment_completed_concurrently(tmp_path,
     store.add_assignment(assignment)
     write_heartbeat_assignment(agent, assignment, tmp_path)
 
-    def fake_cycle(assignments, **kwargs):
+    def stub_cycle(assignments, **kwargs):
         current = store.find_assignment(assignment.assignment_id)
         assert current is not None
         current.mark_complete("finished elsewhere")
         store.archive_assignment(current, executive_summary="finished elsewhere")
         return CycleResult(assigned=[], skipped=[], alerts=[])
 
-    monkeypatch.setattr("brigade.cli.deterministic_cycle", fake_cycle)
+    monkeypatch.setattr("brigade.cli.deterministic_cycle", stub_cycle)
 
     _run_cycle(store)
 
@@ -1311,7 +1509,7 @@ def test_cli_user_agent_dashboard_and_model_help_show_defaults(capsys):
     assert excinfo.value.code == 0
     model_help = capsys.readouterr().out
     assert "Model provider to use. Default: resolved settings" in model_help
-    assert "provider (fake unless a live default such as Ollama is" in model_help
+    assert "Ollama unless configured otherwise" in model_help
     assert "Model name. Default: resolved settings model." in model_help
     assert "BRIGADE_OLLAMA_BASE_URL" in model_help
     assert "http://127.0.0.1:11434." in model_help

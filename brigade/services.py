@@ -9,6 +9,7 @@ from uuid import uuid4
 from brigade.auth import AuthResult, build_user_identity_context
 from brigade.config import Settings
 from brigade.health import HealthCheck
+from brigade.orchestrator import build_orchestration_telemetry
 from brigade.providers import ModelProvider
 from brigade.runner import _acquire_local_inference_lock
 from brigade.schemas import Assignment, AssignmentStatus, ChatMessage, User
@@ -169,6 +170,10 @@ SAFE_CONFIG_KEYS = {
     "log_level": str,
     "orchestrator_cadence_seconds": int,
     "stale_work_seconds": int,
+    "proactive_mode": str,
+    "proactive_creation_enabled": bool,
+    "max_proactive_proposals_per_cycle": int,
+    "max_proactive_creations_per_cycle": int,
     "require_auth": bool,
     "default_provider": str,
     "default_model": str,
@@ -464,6 +469,10 @@ def build_hierarchy_payload(store: StateStore) -> dict[str, Any]:
     }
 
 
+def build_orchestration_payload(store: StateStore) -> dict[str, Any]:
+    return build_orchestration_telemetry(store.orchestrator_reasoning())
+
+
 def build_ops_room_payload(
     store: StateStore,
 ) -> dict[str, Any]:
@@ -474,6 +483,7 @@ def build_ops_room_payload(
     states = store.agent_states()
     goals = store.goals()
     reasoning = store.orchestrator_reasoning()
+    orchestration = build_orchestration_payload(store)
     usage = _usage_by_agent(store.usage_records())
     active_by_agent = _active_assignment_by_agent(assignments)
     chief_team_ids = {
@@ -507,6 +517,7 @@ def build_ops_room_payload(
         "generated_at": utc_now_iso(),
         "mission": mission.to_dict() if mission else None,
         "latest_reasoning": reasoning[-1] if reasoning else None,
+        "orchestration": orchestration,
         "rooms": OPS_ROOM_ROOMS,
         "agents": visual_agents,
         "teams": [team.to_dict() for team in teams],
@@ -570,6 +581,7 @@ def build_cockpit_payload(
         },
         "mission": ops_room["mission"],
         "latest_reasoning": ops_room["latest_reasoning"],
+        "orchestration": ops_room["orchestration"],
         "agents": agents,
         "teams": ops_room["teams"],
         "tasks": {
@@ -626,6 +638,10 @@ def build_settings_payload(settings: Settings) -> dict[str, Any]:
         "log_level": settings.log_level,
         "orchestrator_cadence_seconds": settings.orchestrator_cadence_seconds,
         "stale_work_seconds": settings.stale_work_seconds,
+        "proactive_mode": settings.proactive_mode,
+        "proactive_creation_enabled": settings.proactive_creation_enabled,
+        "max_proactive_proposals_per_cycle": settings.max_proactive_proposals_per_cycle,
+        "max_proactive_creations_per_cycle": settings.max_proactive_creations_per_cycle,
         "require_auth": settings.require_auth,
         "jwt_issuer": settings.jwt_issuer,
         "jwt_audience": settings.jwt_audience,

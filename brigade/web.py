@@ -44,6 +44,7 @@ from brigade.services import (
     build_cockpit_payload,
     build_hierarchy_payload,
     build_ops_room_payload,
+    build_orchestration_payload,
     build_settings_payload,
     send_orchestrator_chat,
     send_user_chat,
@@ -303,6 +304,11 @@ def create_app(
             uptime_seconds=int(time.monotonic() - started_monotonic),
         )
 
+    @app.get("/api/orchestration")
+    async def orchestration(current: AuthResult = auth_dependency) -> dict[str, object]:
+        require("status:read", current)
+        return build_orchestration_payload(store)
+
     @app.get("/api/models")
     async def models(current: AuthResult = auth_dependency) -> dict[str, object]:
         require("status:read", current)
@@ -460,9 +466,12 @@ def create_app(
         work_room_ids = {room["id"] for room in OPS_ROOM_ROOMS if room.get("kind") == "work"}
         if room_id and room_id not in work_room_ids:
             raise HTTPException(status_code=400, detail="unknown task room")
+        agent_id = str(payload["agent_id"])
+        if agent_id not in {agent.agent_id for agent in store.agents()}:
+            raise HTTPException(status_code=400, detail=f"unknown agent: {agent_id}")
         assignment = Assignment(
             assignment=str(payload["assignment"]),
-            assigned_to=str(payload["agent_id"]),
+            assigned_to=agent_id,
             created_by=user.username if user else "web",
             source="web_gateway",
             priority=Priority(str(payload.get("priority") or "normal")),
@@ -474,8 +483,8 @@ def create_app(
             idempotency_key=payload.get("idempotency_key"),
             room_id=room_id,
         )
-        store.add_assignment(assignment)
-        return assignment.to_dict()
+        persisted = store.add_assignment(assignment)
+        return persisted.to_dict()
 
     @app.get("/api/tasks/{assignment_id}")
     async def task(

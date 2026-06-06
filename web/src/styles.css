@@ -376,6 +376,7 @@ ul {
 
 .reasoning-box p,
 .current-work p,
+.activity-row p,
 .stack-list article p,
 .task-row p,
 .message-row p {
@@ -458,6 +459,7 @@ ul {
 }
 
 .stack-list article,
+.activity-row,
 .task-row,
 .message-row {
   border: 1px solid #d8ded8;
@@ -465,6 +467,44 @@ ul {
   border-radius: 8px;
   padding: 9px;
   background: #ffffff;
+}
+
+.activity-list {
+  display: grid;
+  max-height: 360px;
+  overflow: auto;
+  gap: 8px;
+}
+
+.activity-row {
+  display: grid;
+  gap: 7px;
+}
+
+.activity-row header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.activity-row small {
+  color: #62706a;
+  font-size: 12px;
+}
+
+.activity-row.proposed {
+  border-left-color: #c28a23;
+  background: #fffaf0;
+}
+
+.activity-row.active {
+  border-left-color: #2a7a54;
+}
+
+.activity-row.blocked {
+  border-left-color: #bb4436;
+  background: #fff8f4;
 }
 
 .task-row {
@@ -507,6 +547,11 @@ ul {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: end;
+}
+
+.chat-actions {
+  display: flex;
+  gap: 7px;
 }
 
 .compact-chat .chat-compose textarea {
@@ -999,6 +1044,7 @@ ul {
   .mode-toggle,
   .segmented,
   .button-row,
+  .chat-actions,
   .toolbar-row,
   .room-toolbar {
     align-items: stretch;

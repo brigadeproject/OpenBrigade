@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from brigade.providers import FakeProvider
 from brigade.runner import run_agent_once
 from brigade.schemas import Agent, Assignment
 from brigade.state import JsonStateStore
 from brigade.workspace import write_heartbeat_assignment
+from tests.helpers import TestProvider
 
 
 def test_run_agent_once_completes_and_archives_assignment(tmp_path):
@@ -21,7 +21,7 @@ def test_run_agent_once_completes_and_archives_assignment(tmp_path):
     store.add_assignment(assignment)
     write_heartbeat_assignment(agent, assignment, tmp_path)
 
-    result = run_agent_once("sage", store, FakeProvider())
+    result = run_agent_once("sage", store, TestProvider())
 
     assert result.status == "complete"
     assert store.assignments() == []

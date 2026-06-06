@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -36,6 +37,10 @@ PRIORITY_RANK = {
     Priority.LOW: 3,
 }
 LOGGER = logging.getLogger(__name__)
+ORCHESTRATION_TELEMETRY_VERSION = 1
+ORCHESTRATION_EVENT_VERSION = 1
+MISSION_CONTINUATION_SOURCE = "orchestrator_mission_continuation"
+MISSION_CONTINUATION_TRIGGER = "mission_idle_no_active_or_queued_work"
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,606 @@ class ParsedOrchestratorResponse:
     status: str
     summary: str
     actions: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ProactiveContinuationConfig:
+    mode: str = "propose"
+    creation_enabled: bool = False
+    max_proposals_per_cycle: int = 1
+    max_creations_per_cycle: int = 1
+
+
+def orchestration_event(
+    event_type: str,
+    summary: str,
+    *,
+    source: str,
+    decision: str | None = None,
+    status: str | None = None,
+    mission_statement: str | None = None,
+    goal_statement: str | None = None,
+    trigger: str | None = None,
+    assignment_id: str | None = None,
+    assignment_ids: list[str] | None = None,
+    agent_id: str | None = None,
+    parent_assignment_id: str | None = None,
+    child_assignment_ids: list[str] | None = None,
+    idempotency_key: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    provenance = {
+        "mission_statement": mission_statement,
+        "goal_statement": goal_statement,
+        "trigger": trigger,
+        "assignment_id": assignment_id,
+        "assignment_ids": list(assignment_ids or []),
+        "agent_id": agent_id,
+        "parent_assignment_id": parent_assignment_id,
+        "child_assignment_ids": list(child_assignment_ids or []),
+        "idempotency_key": idempotency_key,
+        "source": source,
+    }
+    return {
+        "event_id": str(uuid4()),
+        "schema_version": ORCHESTRATION_EVENT_VERSION,
+        "recorded_at": utc_now_iso(),
+        "type": event_type,
+        "decision": decision,
+        "status": status,
+        "summary": summary,
+        "source": source,
+        "provenance": {key: value for key, value in provenance.items() if value not in (None, [])},
+        "payload": payload or {},
+    }
+
+
+def build_orchestration_reasoning_record(
+    *,
+    source: str,
+    decision_summary: str,
+    events: list[dict[str, Any]] | None = None,
+    mission_statement: str | None = None,
+    queued_assignments: list[str] | None = None,
+    assigned: list[str] | None = None,
+    skipped: list[str] | None = None,
+    alerts: list[str] | None = None,
+    payload: dict[str, Any] | None = None,
+    previous_reasoning_id: str | None = None,
+) -> dict[str, Any]:
+    now = utc_now_iso()
+    return {
+        "reasoning_id": str(uuid4()),
+        "cycle_id": str(uuid4()),
+        "started_at": now,
+        "ended_at": now,
+        "source": source,
+        "mission_statement": mission_statement,
+        "previous_reasoning_id": previous_reasoning_id,
+        "queued_assignments": list(queued_assignments or []),
+        "assigned": list(assigned or []),
+        "skipped": list(skipped or []),
+        "alerts": list(alerts or []),
+        "agent_states": {},
+        "decision_summary": decision_summary,
+        "events": list(events or []),
+        "payload": payload or {},
+    }
+
+
+def record_orchestration_events(
+    store: StateStore,
+    *,
+    source: str,
+    decision_summary: str,
+    events: list[dict[str, Any]],
+    mission_statement: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    previous = store.orchestrator_reasoning()
+    record = build_orchestration_reasoning_record(
+        source=source,
+        decision_summary=decision_summary,
+        events=events,
+        mission_statement=mission_statement,
+        payload=payload,
+        previous_reasoning_id=previous[-1].get("reasoning_id") if previous else None,
+    )
+    store.add_orchestrator_reasoning(record)
+    return record
+
+
+def build_orchestration_telemetry(
+    reasoning_records: list[dict[str, Any]],
+    *,
+    limit: int = 40,
+) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    for record in reasoning_records:
+        raw_events = record.get("events")
+        if isinstance(raw_events, list) and raw_events:
+            events.extend(_normalize_orchestration_event(item, record) for item in raw_events)
+        else:
+            events.extend(_legacy_orchestration_events(record))
+
+    events = [event for event in events if event.get("summary")]
+    events.sort(key=lambda item: str(item.get("recorded_at") or ""))
+    latest = list(reversed(events))[:limit]
+    decisions = [
+        event
+        for event in latest
+        if event.get("type") == "cycle_decision" or event.get("decision") is not None
+    ]
+    proposals = [
+        event
+        for event in latest
+        if event.get("type") in {"proactive_proposal", "created_work"}
+        or event.get("status") in {"proposed", "created"}
+    ]
+    return {
+        "version": ORCHESTRATION_TELEMETRY_VERSION,
+        "generated_at": utc_now_iso(),
+        "latest_event": latest[0] if latest else None,
+        "events": latest,
+        "decisions": decisions,
+        "proposals": proposals,
+        "counts": _orchestration_event_counts(events),
+    }
+
+
+def evaluate_mission_continuation(
+    store: StateStore,
+    config: ProactiveContinuationConfig | None = None,
+) -> dict[str, Any]:
+    config = config or ProactiveContinuationConfig()
+    mode = config.mode.strip().lower()
+    if mode not in {"propose", "create", "off"}:
+        mode = "propose"
+
+    mission = store.mission()
+    if mission is None:
+        return _record_mission_continuation_skip(
+            store,
+            reason="no_mission",
+            summary="No mission is set, so the Orchestrator cannot propose continuation work.",
+            config=config,
+        )
+
+    crew_chiefs = _crew_chief_agents(store)
+    if not crew_chiefs:
+        return _record_mission_continuation_skip(
+            store,
+            reason="no_crew_chief",
+            summary="No Crew Chief exists for the current mission.",
+            config=config,
+            mission_statement=mission.statement,
+        )
+
+    active_next_work = _active_or_queued_assignments(store.assignments())
+    if active_next_work:
+        return _record_mission_continuation_skip(
+            store,
+            reason="active_or_queued_work_exists",
+            summary=(
+                f"{len(active_next_work)} active or queued assignment(s) already exist, "
+                "so no proactive continuation was proposed."
+            ),
+            config=config,
+            mission_statement=mission.statement,
+            payload={"assignment_ids": [item.assignment_id for item in active_next_work]},
+        )
+
+    if mode == "off":
+        return _record_mission_continuation_skip(
+            store,
+            reason="proactive_mode_off",
+            summary="Proactive mission continuation is disabled.",
+            config=config,
+            mission_statement=mission.statement,
+        )
+
+    if config.max_proposals_per_cycle <= 0:
+        return _record_mission_continuation_skip(
+            store,
+            reason="proposal_cap_zero",
+            summary="The proactive proposal cap is zero for this cycle.",
+            config=config,
+            mission_statement=mission.statement,
+        )
+
+    target = crew_chiefs[0]
+    supported_goal = _supported_goal_for_chief(store, target.agent_id)
+    proposed_assignment = _mission_continuation_assignment_text()
+    idempotency_key = _mission_continuation_idempotency_key(
+        mission_statement=mission.statement,
+        goal_statement=supported_goal.statement if supported_goal else None,
+        trigger=MISSION_CONTINUATION_TRIGGER,
+        crew_chief_id=target.agent_id,
+        assignment_text=proposed_assignment,
+    )
+
+    if _idempotency_seen(store, idempotency_key):
+        return _record_mission_continuation_skip(
+            store,
+            reason="duplicate_idempotency_key",
+            summary="A matching proactive continuation proposal or assignment already exists.",
+            config=config,
+            mission_statement=mission.statement,
+            goal_statement=supported_goal.statement if supported_goal else None,
+            agent_id=target.agent_id,
+            idempotency_key=idempotency_key,
+        )
+
+    proposal = {
+        "assignment": proposed_assignment,
+        "assigned_to": target.agent_id,
+        "goal_statement": supported_goal.statement if supported_goal else mission.statement,
+        "trigger": MISSION_CONTINUATION_TRIGGER,
+        "idempotency_key": idempotency_key,
+        "mode": mode,
+        "creation_enabled": config.creation_enabled,
+    }
+    events = [
+        orchestration_event(
+            "proactive_proposal",
+            f"Proposed Crew Chief continuation work for {target.agent_id}.",
+            source=MISSION_CONTINUATION_SOURCE,
+            decision="proposed",
+            status="proposed",
+            mission_statement=mission.statement,
+            goal_statement=supported_goal.statement if supported_goal else None,
+            trigger=MISSION_CONTINUATION_TRIGGER,
+            agent_id=target.agent_id,
+            idempotency_key=idempotency_key,
+            payload=proposal,
+        )
+    ]
+    created: list[dict[str, Any]] = []
+    creation_reasons: list[str] = []
+    if mode == "create" and config.creation_enabled:
+        if config.max_creations_per_cycle <= 0:
+            creation_reasons.append("creation_cap_zero")
+        else:
+            assignment = Assignment(
+                assignment=proposed_assignment,
+                assigned_to=target.agent_id,
+                created_by="orchestrator",
+                source=MISSION_CONTINUATION_SOURCE,
+                priority=Priority.NORMAL,
+                work_mode=WorkMode.HEARTBEAT,
+                goal_statement=supported_goal.statement if supported_goal else mission.statement,
+                assignment_rationale=(
+                    "The mission has no active or queued next work; Orchestrator generated "
+                    "one Crew Chief-level continuation assignment."
+                ),
+                created_by_role="orchestrator",
+                idempotency_key=idempotency_key,
+            )
+            persisted = store.add_assignment(assignment)
+            if persisted.assignment_id == assignment.assignment_id:
+                created.append(persisted.to_dict())
+                events.append(
+                    orchestration_event(
+                        "created_work",
+                        f"Created Crew Chief continuation assignment for {target.agent_id}.",
+                        source=MISSION_CONTINUATION_SOURCE,
+                        decision="created",
+                        status="created",
+                        mission_statement=mission.statement,
+                        goal_statement=supported_goal.statement if supported_goal else None,
+                        trigger=MISSION_CONTINUATION_TRIGGER,
+                        assignment_id=persisted.assignment_id,
+                        assignment_ids=[persisted.assignment_id],
+                        agent_id=target.agent_id,
+                        idempotency_key=idempotency_key,
+                        payload=persisted.to_dict(),
+                    )
+                )
+            else:
+                creation_reasons.append("duplicate_assignment")
+    else:
+        creation_reasons.append("creation_disabled")
+
+    decision_summary = (
+        f"proposed=1 created={len(created)} trigger={MISSION_CONTINUATION_TRIGGER}"
+    )
+    record_orchestration_events(
+        store,
+        source=MISSION_CONTINUATION_SOURCE,
+        decision_summary=decision_summary,
+        events=events,
+        mission_statement=mission.statement,
+        payload={
+            "proposal": proposal,
+            "created": created,
+            "creation_reasons": creation_reasons,
+            "config": _proactive_config_payload(config),
+        },
+    )
+    return {
+        "status": "created" if created else "proposed",
+        "proposal": proposal,
+        "created": created,
+        "skipped": [],
+        "creation_reasons": creation_reasons,
+    }
+
+
+def _normalize_orchestration_event(
+    raw_event: Any,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(raw_event, dict):
+        raw_event = {"summary": str(raw_event)}
+    provenance = (
+        raw_event.get("provenance")
+        if isinstance(raw_event.get("provenance"), dict)
+        else {}
+    )
+    payload = raw_event.get("payload") if isinstance(raw_event.get("payload"), dict) else {}
+    event_id = raw_event.get("event_id") or raw_event.get("id") or str(uuid4())
+    return {
+        "id": str(event_id),
+        "schema_version": int(raw_event.get("schema_version") or ORCHESTRATION_EVENT_VERSION),
+        "recorded_at": str(
+            raw_event.get("recorded_at")
+            or record.get("ended_at")
+            or record.get("started_at")
+            or ""
+        ),
+        "type": str(raw_event.get("type") or "reasoning_summary"),
+        "decision": _optional_text(raw_event.get("decision")),
+        "status": _optional_text(raw_event.get("status")),
+        "summary": str(raw_event.get("summary") or record.get("decision_summary") or ""),
+        "source": str(raw_event.get("source") or record.get("source") or "orchestrator"),
+        "mission_statement": _optional_text(
+            provenance.get("mission_statement") or raw_event.get("mission_statement")
+            or record.get("mission_statement")
+        ),
+        "goal_statement": _optional_text(
+            provenance.get("goal_statement") or raw_event.get("goal_statement")
+        ),
+        "trigger": _optional_text(provenance.get("trigger") or raw_event.get("trigger")),
+        "assignment_id": _optional_text(
+            provenance.get("assignment_id") or raw_event.get("assignment_id")
+        ),
+        "assignment_ids": _text_list(
+            provenance.get("assignment_ids") or raw_event.get("assignment_ids")
+        ),
+        "agent_id": _optional_text(provenance.get("agent_id") or raw_event.get("agent_id")),
+        "parent_assignment_id": _optional_text(
+            provenance.get("parent_assignment_id") or raw_event.get("parent_assignment_id")
+        ),
+        "child_assignment_ids": _text_list(
+            provenance.get("child_assignment_ids") or raw_event.get("child_assignment_ids")
+        ),
+        "idempotency_key": _optional_text(
+            provenance.get("idempotency_key") or raw_event.get("idempotency_key")
+        ),
+        "payload": payload,
+        "record_id": _optional_text(record.get("reasoning_id")),
+        "cycle_id": _optional_text(record.get("cycle_id")),
+    }
+
+
+def _legacy_orchestration_events(record: dict[str, Any]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    assigned = _text_list(record.get("assigned"))
+    skipped = _text_list(record.get("skipped"))
+    source = str(record.get("source") or "legacy_reasoning")
+    mission_statement = _optional_text(record.get("mission_statement"))
+    for assignment_id in assigned:
+        events.append(
+            _normalize_orchestration_event(
+                orchestration_event(
+                    "cycle_decision",
+                    f"Assigned queued assignment {assignment_id}.",
+                    source=source,
+                    decision="assigned",
+                    status="assigned",
+                    mission_statement=mission_statement,
+                    assignment_id=assignment_id,
+                    assignment_ids=[assignment_id],
+                ),
+                record,
+            )
+        )
+    for assignment_id in skipped:
+        events.append(
+            _normalize_orchestration_event(
+                orchestration_event(
+                    "cycle_decision",
+                    f"Skipped queued assignment {assignment_id}.",
+                    source=source,
+                    decision="skipped",
+                    status="skipped",
+                    mission_statement=mission_statement,
+                    assignment_id=assignment_id,
+                    assignment_ids=[assignment_id],
+                ),
+                record,
+            )
+        )
+    if not events:
+        summary = str(record.get("decision_summary") or "").strip()
+        if summary:
+            events.append(
+                _normalize_orchestration_event(
+                    orchestration_event(
+                        "reasoning_summary",
+                        summary,
+                        source=source,
+                        decision="no-action" if "assigned=0" in summary else None,
+                        mission_statement=mission_statement,
+                        payload={"legacy_record": True},
+                    ),
+                    record,
+                )
+            )
+    return events
+
+
+def _orchestration_event_counts(events: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        event_type = str(event.get("type") or "unknown")
+        counts[event_type] = counts.get(event_type, 0) + 1
+        decision = event.get("decision")
+        if decision:
+            key = f"decision:{decision}"
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _record_mission_continuation_skip(
+    store: StateStore,
+    *,
+    reason: str,
+    summary: str,
+    config: ProactiveContinuationConfig,
+    mission_statement: str | None = None,
+    goal_statement: str | None = None,
+    agent_id: str | None = None,
+    idempotency_key: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    event = orchestration_event(
+        "proactive_skip",
+        summary,
+        source=MISSION_CONTINUATION_SOURCE,
+        decision="skipped",
+        status="skipped",
+        mission_statement=mission_statement,
+        goal_statement=goal_statement,
+        trigger=reason,
+        agent_id=agent_id,
+        idempotency_key=idempotency_key,
+        payload={
+            "reason": reason,
+            "config": _proactive_config_payload(config),
+            **(payload or {}),
+        },
+    )
+    record_orchestration_events(
+        store,
+        source=MISSION_CONTINUATION_SOURCE,
+        decision_summary=f"proactive continuation skipped: {reason}",
+        events=[event],
+        mission_statement=mission_statement,
+        payload=event["payload"],
+    )
+    return {
+        "status": "skipped",
+        "proposal": None,
+        "created": [],
+        "skipped": [{"reason": reason, "summary": summary}],
+    }
+
+
+def _active_or_queued_assignments(assignments: list[Assignment]) -> list[Assignment]:
+    return [
+        assignment
+        for assignment in assignments
+        if assignment.status
+        in {
+            AssignmentStatus.QUEUED,
+            AssignmentStatus.ASSIGNED,
+            AssignmentStatus.WORKING,
+        }
+    ]
+
+
+def _crew_chief_agents(store: StateStore) -> list[Agent]:
+    agents = {agent.agent_id: agent for agent in store.agents()}
+    chief_ids = {
+        team.crew_chief_id
+        for team in store.teams()
+        if team.crew_chief_id and team.crew_chief_id in agents
+    }
+    for agent in agents.values():
+        if agent.role == "crew_chief":
+            chief_ids.add(agent.agent_id)
+    return [agents[agent_id] for agent_id in sorted(chief_ids)]
+
+
+def _supported_goal_for_chief(store: StateStore, chief_id: str) -> Goal | None:
+    goals = store.goals().get(chief_id, [])
+    if not goals:
+        return None
+    confirmed = [goal for goal in goals if goal.human_confirmed]
+    return sorted(confirmed or goals, key=lambda goal: (goal.set_at, goal.statement))[0]
+
+
+def _mission_continuation_assignment_text() -> str:
+    return (
+        "Review the current mission, define the next Crew Chief coordination plan, "
+        "and identify which existing team or agent should own each follow-up."
+    )
+
+
+def _mission_continuation_idempotency_key(
+    *,
+    mission_statement: str,
+    goal_statement: str | None,
+    trigger: str,
+    crew_chief_id: str,
+    assignment_text: str,
+) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "mission": _normalize_identity_text(mission_statement),
+                "goal": _normalize_identity_text(goal_statement),
+                "trigger": trigger,
+                "crew_chief": crew_chief_id,
+                "assignment": _normalize_identity_text(assignment_text),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"orchestrator-proactive:v1:{digest}"
+
+
+def _idempotency_seen(store: StateStore, idempotency_key: str) -> bool:
+    if store.find_assignment_by_idempotency_key(idempotency_key) is not None:
+        return True
+    for record in store.orchestrator_reasoning():
+        try:
+            encoded = json.dumps(record, sort_keys=True)
+        except TypeError:
+            encoded = str(record)
+        if idempotency_key in encoded:
+            return True
+    return False
+
+
+def _proactive_config_payload(config: ProactiveContinuationConfig) -> dict[str, Any]:
+    return {
+        "mode": config.mode,
+        "creation_enabled": config.creation_enabled,
+        "max_proposals_per_cycle": config.max_proposals_per_cycle,
+        "max_creations_per_cycle": config.max_creations_per_cycle,
+    }
+
+
+def _normalize_identity_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return " ".join(value.lower().split())
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item is not None]
 
 
 def deterministic_cycle(
@@ -190,11 +795,30 @@ def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
             created_by_role="orchestrator",
             idempotency_key=key,
         )
-        store.add_assignment(assignment)
+        persisted = store.add_assignment(assignment)
         active_keys.add(key)
-        created.append(assignment)
+        if persisted.assignment_id == assignment.assignment_id:
+            created.append(persisted)
 
     if created:
+        events = [
+            orchestration_event(
+                "created_work",
+                f"Created idle-agent assignment for {item.assigned_to}.",
+                source="orchestrator_idle_task_builder",
+                decision="created",
+                status="created",
+                mission_statement=mission.statement if mission else None,
+                goal_statement=item.goal_statement,
+                trigger="idle_agent_without_active_work",
+                assignment_id=item.assignment_id,
+                assignment_ids=[item.assignment_id],
+                agent_id=item.assigned_to,
+                idempotency_key=item.idempotency_key,
+                payload=item.to_dict(),
+            )
+            for item in created
+        ]
         store.add_orchestrator_reasoning(
             {
                 "reasoning_id": str(uuid4()),
@@ -209,6 +833,7 @@ def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
                 "alerts": [],
                 "agent_states": {},
                 "decision_summary": f"queued={len(created)} idle-agent assignments",
+                "events": events,
                 "payload": {"created": [item.to_dict() for item in created]},
             }
         )
@@ -511,12 +1136,21 @@ def _apply_create_assignment(store: StateStore, action: dict[str, Any]) -> dict[
         created_by_role="orchestrator",
         idempotency_key=idempotency_key,
     )
-    store.add_assignment(assignment)
+    persisted = store.add_assignment(assignment)
+    if persisted.assignment_id != assignment.assignment_id:
+        return {
+            "type": "create_assignment",
+            "status": "skipped_existing",
+            "assignment_id": persisted.assignment_id,
+            "agent_id": agent_id,
+            "idempotency_key": idempotency_key,
+        }
     return {
         "type": "create_assignment",
         "status": "created",
-        "assignment_id": assignment.assignment_id,
+        "assignment_id": persisted.assignment_id,
         "agent_id": agent_id,
+        "idempotency_key": idempotency_key,
     }
 
 
@@ -719,11 +1353,18 @@ def build_cycle_reasoning_record(
     floor_triggers: list[dict[str, Any]] | None = None,
     escalation: dict[str, Any] | None = None,
 ) -> dict[str, object]:
+    events = _cycle_decision_events(
+        mission_statement,
+        result,
+        escalation=escalation,
+        floor_triggers=floor_triggers or [],
+    )
     return {
         "reasoning_id": str(uuid4()),
         "cycle_id": str(uuid4()),
         "started_at": utc_now_iso(),
         "ended_at": utc_now_iso(),
+        "source": "orchestrator_cycle",
         "mission_statement": mission_statement,
         "previous_reasoning_id": previous_reasoning_id,
         "queued_assignments": [
@@ -736,6 +1377,7 @@ def build_cycle_reasoning_record(
         "floor": floor,
         "floor_triggers": floor_triggers or [],
         "escalation": escalation,
+        "events": events,
         "decision_summary": (
             "assigned="
             f"{len(result.assigned)} "
@@ -745,3 +1387,140 @@ def build_cycle_reasoning_record(
             f"{len(result.alerts)}"
         ),
     }
+
+
+def _cycle_decision_events(
+    mission_statement: str | None,
+    result: CycleResult,
+    *,
+    escalation: dict[str, Any] | None,
+    floor_triggers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for assignment in result.assigned:
+        events.append(
+            orchestration_event(
+                "cycle_decision",
+                (
+                    f"Assigned queued assignment {assignment.assignment_id} "
+                    f"to {assignment.assigned_to}."
+                ),
+                source="orchestrator_cycle",
+                decision="assigned",
+                status=assignment.status.value,
+                mission_statement=mission_statement,
+                goal_statement=assignment.goal_statement,
+                assignment_id=assignment.assignment_id,
+                assignment_ids=[assignment.assignment_id],
+                agent_id=assignment.assigned_to,
+                parent_assignment_id=assignment.parent_assignment_id,
+                idempotency_key=assignment.idempotency_key,
+                payload=assignment.to_dict(),
+            )
+        )
+    for assignment in result.skipped:
+        decision = "blocked" if assignment.status == AssignmentStatus.BLOCKED else "skipped"
+        summary = (
+            assignment.progress_summary
+            if assignment.progress_summary
+            else (
+                f"Skipped queued assignment {assignment.assignment_id} "
+                f"for {assignment.assigned_to}."
+            )
+        )
+        events.append(
+            orchestration_event(
+                "cycle_decision",
+                summary,
+                source="orchestrator_cycle",
+                decision=decision,
+                status=assignment.status.value,
+                mission_statement=mission_statement,
+                goal_statement=assignment.goal_statement,
+                assignment_id=assignment.assignment_id,
+                assignment_ids=[assignment.assignment_id],
+                agent_id=assignment.assigned_to,
+                parent_assignment_id=assignment.parent_assignment_id,
+                idempotency_key=assignment.idempotency_key,
+                payload=assignment.to_dict(),
+            )
+        )
+    if not result.assigned and not result.skipped:
+        trigger = "idle_no_next_work" if not floor_triggers else "no_assignment_action"
+        events.append(
+            orchestration_event(
+                "cycle_decision",
+                "No queued assignment was assigned during this orchestrator cycle.",
+                source="orchestrator_cycle",
+                decision="no-action",
+                status="no-action",
+                mission_statement=mission_statement,
+                trigger=trigger,
+                payload={"floor_triggers": floor_triggers},
+            )
+        )
+    if escalation:
+        events.extend(_escalation_events(mission_statement, escalation))
+    return events
+
+
+def _escalation_events(
+    mission_statement: str | None,
+    escalation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for action in escalation.get("actions_applied") or []:
+        if not isinstance(action, dict):
+            continue
+        action_type = str(action.get("type") or "")
+        if action_type == "create_assignment":
+            status = str(action.get("status") or "")
+            assignment_id = _optional_text(action.get("assignment_id"))
+            events.append(
+                orchestration_event(
+                    "created_work" if status == "created" else "proactive_skip",
+                    (
+                        f"Escalation created assignment {assignment_id}."
+                        if status == "created" and assignment_id
+                        else "Escalation create-assignment action found existing work."
+                    ),
+                    source="orchestrator_escalation",
+                    decision="created" if status == "created" else "skipped",
+                    status=status or None,
+                    mission_statement=mission_statement,
+                    trigger="orchestrator_floor_trigger",
+                    assignment_id=assignment_id,
+                    assignment_ids=[assignment_id] if assignment_id else [],
+                    agent_id=_optional_text(action.get("agent_id")),
+                    idempotency_key=_optional_text(action.get("idempotency_key")),
+                    payload=action,
+                )
+            )
+        elif action_type == "request_human":
+            events.append(
+                orchestration_event(
+                    "cycle_decision",
+                    str(action.get("message") or "Orchestrator requested human review."),
+                    source="orchestrator_escalation",
+                    decision="blocked",
+                    status="request_human",
+                    mission_statement=mission_statement,
+                    trigger="orchestrator_floor_trigger",
+                    payload=action,
+                )
+            )
+    for rejected in escalation.get("actions_rejected") or []:
+        if isinstance(rejected, dict):
+            events.append(
+                orchestration_event(
+                    "cycle_decision",
+                    str(rejected.get("reason") or "Orchestrator action was rejected."),
+                    source="orchestrator_escalation",
+                    decision="blocked",
+                    status="rejected",
+                    mission_statement=mission_statement,
+                    trigger="orchestrator_floor_trigger",
+                    payload=rejected,
+                )
+            )
+    return events

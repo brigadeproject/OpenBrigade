@@ -6,8 +6,8 @@ cd "$ROOT_DIR"
 
 CONTAINER="${BRIGADE_LIVE_CONTAINER:-brigade_orchestrator}"
 AGENT="${AGENT:-test-builder}"
-PROVIDER="${PROVIDER:-fake}"
-MODEL="${MODEL:-llama3.1}"
+PROVIDER="${PROVIDER:-ollama}"
+MODEL="${MODEL:-gpt-oss:20b}"
 KEEP_WORK_DIR="${KEEP_WORK_DIR:-0}"
 WORK_DIR="$(mktemp -d /tmp/openbrigade-heartbeat.XXXXXX)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -27,8 +27,8 @@ usage: $0
 
 environment:
   AGENT      test agent to exercise, default test-builder
-  PROVIDER   brigade provider, default fake
-  MODEL      model name, default llama3.1
+  PROVIDER   brigade provider, default ollama
+  MODEL      model name, default gpt-oss:20b
   EXPECTED_CASE_COUNT   number of malformed heartbeat cases, default 6
   KEEP_WORK_DIR   set to 1 to preserve raw outputs in $WORK_DIR
 EOF
@@ -48,7 +48,7 @@ ensure_test_agent() {
     --id "$agent_id" \
     --name "${agent_id^^}" \
     --role test_worker \
-    --provider fake \
+    --provider "$PROVIDER" \
     --model "$MODEL" \
     >/dev/null
 }
@@ -218,7 +218,7 @@ PY
   ./ops/brigade-live.sh status --json >"$case_dir/status-after.json"
 
   docker cp "$case_dir/heartbeat-valid.md" "$CONTAINER:$HEARTBEAT_PATH"
-  ./ops/brigade-live.sh agent run --id "$AGENT" --provider fake --model "$MODEL" \
+  ./ops/brigade-live.sh agent run --id "$AGENT" --provider "$PROVIDER" --model "$MODEL" \
     >"$case_dir/cleanup.out" 2>"$case_dir/cleanup.err" || true
   cleanup_assignment "$assignment_id" >"$case_dir/archive-cleanup.json"
 done

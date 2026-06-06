@@ -9,8 +9,9 @@ from typing import Any
 from uuid import uuid4
 
 from brigade.finance import persist_financial_report
+from brigade.orchestrator import orchestration_event, record_orchestration_events
 from brigade.prompt_floors import build_agent_floor, compact_json
-from brigade.providers import ModelProvider, ModelResponse
+from brigade.providers import ModelProvider, ModelResponse, ModelUnavailableError
 from brigade.schemas import AgentState, Assignment, AssignmentStatus
 from brigade.store import StateStore
 from brigade.time import add_seconds_iso, parse_utc_iso, utc_now, utc_now_iso
@@ -26,7 +27,8 @@ from brigade.workspace import (
     write_heartbeat_assignment,
 )
 
-LOCAL_INFERENCE_COOLDOWN_SECONDS = 600
+LOCAL_INFERENCE_LOCK_TTL_SECONDS = 600
+LOCAL_INFERENCE_RELEASE_COOLDOWN_SECONDS = 0
 LOCAL_INFERENCE_BACKPRESSURE_PREFIXES = (
     "local inference unavailable until ",
     "local inference already held by ",
@@ -262,6 +264,7 @@ def run_agent_once(
 
     cloud_job: dict[str, object] | None = None
     lock_acquired = False
+    local_release_cooldown_seconds = LOCAL_INFERENCE_RELEASE_COOLDOWN_SECONDS
     try:
         if route_type == "local":
             _acquire_local_inference_lock(store, agent_id)
@@ -285,7 +288,7 @@ def run_agent_once(
             provider=getattr(provider, "__class__", type(provider))
             .__name__.replace("Provider", "")
             .lower(),
-            model=getattr(provider, "model", "deterministic"),
+            model=getattr(provider, "model", "unknown"),
         )
         responses, parsed, observations = _complete_assignment_with_tools(
             agent,
@@ -355,6 +358,8 @@ def run_agent_once(
         persist_financial_report(store, store.data_dir)
         return result
     except Exception as exc:
+        if route_type == "local" and isinstance(exc, ModelUnavailableError):
+            local_release_cooldown_seconds = 0
         if cloud_job is not None:
             cloud_job["status"] = "failed"
             cloud_job["updated_at"] = utc_now_iso()
@@ -363,7 +368,11 @@ def run_agent_once(
         raise
     finally:
         if lock_acquired:
-            _release_local_inference_lock(store, agent_id)
+            _release_local_inference_lock(
+                store,
+                agent_id,
+                cooldown_seconds=local_release_cooldown_seconds,
+            )
         if execution_claim_acquired:
             store.release_assignment_execution_claim(
                 assignment.assignment_id,
@@ -618,6 +627,7 @@ def _apply_agent_response(
     if parsed.status == "complete":
         assignment.mark_complete(parsed.summary)
         write_heartbeat_assignment(agent, assignment, store.data_dir)
+        _record_parent_synthesis_if_needed(store, assignment, parsed.summary)
         store.archive_assignment(assignment, executive_summary=parsed.summary)
         store.upsert_agent_state(
             AgentState(
@@ -715,6 +725,67 @@ def _apply_agent_response(
     )
 
 
+def _record_parent_synthesis_if_needed(
+    store: StateStore,
+    assignment: Assignment,
+    summary: str,
+) -> None:
+    child_assignments = [
+        item
+        for item in store.assignments()
+        if item.parent_assignment_id == assignment.assignment_id
+    ]
+    child_history = [
+        item
+        for item in store.assignment_history()
+        if (item.get("record") or {}).get("parent_assignment_id") == assignment.assignment_id
+    ]
+    child_ids = [
+        *[item.assignment_id for item in child_assignments],
+        *[
+            str(item.get("assignment_id"))
+            for item in child_history
+            if item.get("assignment_id") is not None
+        ],
+    ]
+    if not child_ids:
+        return
+    mission = store.mission()
+    record_orchestration_events(
+        store,
+        source="parent_synthesis",
+        decision_summary=(
+            f"parent {assignment.assignment_id} completed with {len(child_ids)} child assignment(s)"
+        ),
+        mission_statement=mission.statement if mission else None,
+        events=[
+            orchestration_event(
+                "parent_synthesis",
+                (
+                    f"Parent assignment {assignment.assignment_id} completed after "
+                    f"{len(child_ids)} child assignment(s)."
+                ),
+                source="parent_synthesis",
+                decision="completed",
+                status=assignment.status.value,
+                mission_statement=mission.statement if mission else None,
+                goal_statement=assignment.goal_statement,
+                assignment_id=assignment.assignment_id,
+                assignment_ids=[assignment.assignment_id],
+                agent_id=assignment.assigned_to,
+                parent_assignment_id=assignment.assignment_id,
+                child_assignment_ids=child_ids,
+                idempotency_key=assignment.idempotency_key,
+                payload={
+                    "parent_assignment": assignment.to_dict(),
+                    "child_assignment_ids": child_ids,
+                    "summary": summary,
+                },
+            )
+        ],
+    )
+
+
 def _handle_heartbeat_validation_failure(
     agent_id: str,
     assignment: Assignment,
@@ -757,8 +828,7 @@ def _complete_with_retries(provider: ModelProvider, prompt: str) -> ModelRespons
         try:
             response = provider.complete(prompt)
             last_response = response
-            if response.text.strip().startswith("{"):
-                parse_agent_response(response.text)
+            parse_agent_response(response.text)
             return response
         except (MalformedProviderOutput, RuntimeError) as exc:
             last_error = exc
@@ -852,7 +922,7 @@ def _write_transcript(
 def _acquire_local_inference_lock(store: StateStore, agent_id: str) -> None:
     acquire = getattr(store, "acquire_local_inference_lock", None)
     if callable(acquire):
-        acquire(agent_id, lock_ttl_seconds=LOCAL_INFERENCE_COOLDOWN_SECONDS)
+        acquire(agent_id, lock_ttl_seconds=LOCAL_INFERENCE_LOCK_TTL_SECONDS)
         return
     state = store.local_inference()
     next_available = state.get("next_available")
@@ -868,10 +938,15 @@ def _acquire_local_inference_lock(store: StateStore, agent_id: str) -> None:
     )
 
 
-def _release_local_inference_lock(store: StateStore, agent_id: str) -> None:
+def _release_local_inference_lock(
+    store: StateStore,
+    agent_id: str,
+    *,
+    cooldown_seconds: int = LOCAL_INFERENCE_RELEASE_COOLDOWN_SECONDS,
+) -> None:
     release = getattr(store, "release_local_inference_lock", None)
     if callable(release):
-        release(agent_id, cooldown_seconds=LOCAL_INFERENCE_COOLDOWN_SECONDS)
+        release(agent_id, cooldown_seconds=cooldown_seconds)
         return
     state = store.local_inference()
     if state.get("holder") != agent_id:
@@ -882,6 +957,6 @@ def _release_local_inference_lock(store: StateStore, agent_id: str) -> None:
             "status": "idle",
             "holder": None,
             "last_completed": completed_at,
-            "next_available": add_seconds_iso(completed_at, LOCAL_INFERENCE_COOLDOWN_SECONDS),
+            "next_available": add_seconds_iso(completed_at, cooldown_seconds),
         }
     )

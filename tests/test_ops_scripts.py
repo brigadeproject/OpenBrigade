@@ -32,6 +32,7 @@ def test_ops_scripts_are_bash_syntax_valid() -> None:
             str(OPS_DIR / "test-bad-heartbeats.sh"),
             str(OPS_DIR / "check-recovery.sh"),
             str(OPS_DIR / "v07-wipe-reseed.sh"),
+            str(OPS_DIR / "full-wipe.sh"),
         ],
         cwd=ROOT,
         check=True,
@@ -48,6 +49,22 @@ def test_v07_wipe_reseed_script_requires_confirmation() -> None:
     assert "./ops/brigade-live.sh init mvp --force" in script
 
 
+def test_full_wipe_script_requires_confirmation_and_does_not_reseed() -> None:
+    script = _read_script("full-wipe.sh")
+
+    assert "--confirm-full-wipe" in script
+    assert "A backup will be created before deleting brigade_ runtime volumes." in script
+    assert "./ops/backup-prototype.sh" in script
+    assert "./ops/recreate-stack.sh --drop-volumes" in script
+    assert "./ops/brigade-live.sh db migrate" in script
+    assert "./ops/brigade-live.sh health --json" in script
+    assert "./ops/brigade-live.sh status --json" in script
+    assert "empty_userland" in script
+    assert "runtime_telemetry" in script
+    assert "missions, users, agents, teams, goals, assignments" in script
+    assert "init mvp --force" not in script
+
+
 def test_stress_concurrency_script_exposes_defaults_and_invariant_checks() -> None:
     help_text = _run_help("stress-concurrency.sh")
     script = _read_script("stress-concurrency.sh")
@@ -60,8 +77,7 @@ def test_stress_concurrency_script_exposes_defaults_and_invariant_checks() -> No
     assert "agent onboard" in script
     assert 'status.get("agents", [])' in script
     assert '{"status": "idle"}' in script
-    assert 'if [[ "$PROVIDER" == "ollama" ]]; then' in script
-    assert 'CLEANUP_PROVIDER=fake' in script
+    assert 'CLEANUP_PROVIDER="$PROVIDER"' in script
     assert "PRIMARY_CLEANUP_PASSES=6" in script
     assert "PRIMARY_CLEANUP_PASSES=3" in script
     assert 'CLEANUP_SLEEP_SECONDS="${CLEANUP_SLEEP_SECONDS:-2}"' in script

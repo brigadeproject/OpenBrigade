@@ -79,6 +79,7 @@ def test_ops_room_web_routes_are_registered(tmp_path):
 
     assert "/api/ops-room" in paths
     assert "/api/ops-room/events" in paths
+    assert "/api/orchestration" in paths
     assert "/api/ops-room/layout" not in paths
     assert "/api/mission" in paths
     assert "/api/goals" in paths

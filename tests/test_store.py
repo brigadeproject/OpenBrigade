@@ -5,6 +5,7 @@ import json
 import pytest
 
 from brigade.config import Settings
+from brigade.schemas import Assignment, AssignmentStatus
 from brigade.state import JsonStateStore
 from brigade.store import PostgresStateStore, RedisRuntimeClient, open_state_store
 
@@ -65,6 +66,91 @@ def test_json_state_store_releases_claim_by_owner(tmp_path):
     assert store.assignment_execution_claim("assignment-1") is not None
     assert store.release_assignment_execution_claim("assignment-1", owner="runner-a")
     assert store.assignment_execution_claim("assignment-1") is None
+
+
+def test_json_state_store_reuses_active_assignment_by_idempotency_key(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    first = Assignment(
+        assignment="Same work",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+        idempotency_key="same-key",
+    )
+    duplicate = Assignment(
+        assignment="Same work",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+        idempotency_key="same-key",
+    )
+
+    created = store.add_assignment(first)
+    reused = store.add_assignment(duplicate)
+
+    assert reused.assignment_id == created.assignment_id
+    assert [item.assignment_id for item in store.assignments()] == [created.assignment_id]
+
+
+def test_json_state_store_reuses_archived_assignment_by_idempotency_key(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    first = Assignment(
+        assignment="Same work",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+        idempotency_key="same-key",
+    )
+    first.transition_to(AssignmentStatus.ASSIGNED)
+    first.mark_complete("done")
+    store.add_assignment(first)
+    store.archive_assignment(first, executive_summary="done")
+    duplicate = Assignment(
+        assignment="Same work",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+        idempotency_key="same-key",
+    )
+
+    reused = store.add_assignment(duplicate)
+
+    assert reused.assignment_id == first.assignment_id
+    assert store.assignments() == []
+    assert len(store.assignment_history()) == 1
+
+
+def test_postgres_archive_assignment_detaches_active_children_before_delete() -> None:
+    parent = Assignment(
+        assignment="Parent work",
+        assigned_to="chief",
+        created_by="human",
+        source="direct_command",
+    )
+    parent.transition_to(AssignmentStatus.ASSIGNED)
+    parent.mark_complete("done")
+    child = Assignment(
+        assignment="Child work",
+        assigned_to="builder",
+        created_by="chief",
+        source="agent_delegate",
+        parent_assignment_id=parent.assignment_id,
+    )
+    cursor = _FakeArchiveCursor(parent.assignment_id)
+    store = PostgresStateStore.__new__(PostgresStateStore)
+    store._connect = lambda: _FakeArchiveConnection(cursor)
+    store._remove_assignment_runtime = lambda assignment_id: None
+    store._record_assignment_provenance = lambda assignment: None
+    store.assignments = lambda: [child]
+    synced: list[list[Assignment]] = []
+    store._sync_assignments_runtime = lambda assignments: synced.append(assignments)
+
+    store.archive_assignment(parent, executive_summary="done")
+
+    assert cursor.detached_children is True
+    assert cursor.deleted_parent is True
+    assert cursor.inserted_history is True
+    assert synced == [[child]]
 
 
 def test_json_state_store_local_inference_lock_rejects_overlap(tmp_path):
@@ -204,6 +290,57 @@ class _FakePostgresConnection:
 
     def cursor(self):
         return _FakePostgresCursor(self._holder)
+
+
+class _FakeArchiveCursor:
+    def __init__(self, parent_assignment_id: str) -> None:
+        self.parent_assignment_id = parent_assignment_id
+        self.detached_children = False
+        self.deleted_parent = False
+        self.inserted_history = False
+        self.rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def execute(self, sql: str, params=()) -> None:
+        normalized = " ".join(sql.split())
+        if normalized.startswith(
+            "update brigade_assignments set parent_assignment_id = null"
+        ):
+            assert params[1] == self.parent_assignment_id
+            self.detached_children = True
+            self.rowcount = 1
+            return
+        if normalized == "delete from brigade_assignments where id = %s":
+            assert self.detached_children is True
+            assert params == (self.parent_assignment_id,)
+            self.deleted_parent = True
+            self.rowcount = 1
+            return
+        if normalized.startswith("insert into brigade_assignment_history"):
+            assert self.deleted_parent is True
+            self.inserted_history = True
+            self.rowcount = 1
+            return
+        raise AssertionError(f"unexpected SQL: {normalized}")
+
+
+class _FakeArchiveConnection:
+    def __init__(self, cursor: _FakeArchiveCursor) -> None:
+        self._cursor = cursor
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def cursor(self):
+        return self._cursor
 
 
 def test_postgres_state_store_rejects_duplicate_claim(monkeypatch, tmp_path):

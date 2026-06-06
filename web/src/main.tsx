@@ -136,11 +136,45 @@ type Message = {
   created_at: string;
 };
 
+type OrchestrationEvent = {
+  id: string;
+  schema_version: number;
+  recorded_at: string;
+  type: string;
+  decision?: string | null;
+  status?: string | null;
+  summary: string;
+  source: string;
+  mission_statement?: string | null;
+  goal_statement?: string | null;
+  trigger?: string | null;
+  assignment_id?: string | null;
+  assignment_ids: string[];
+  agent_id?: string | null;
+  parent_assignment_id?: string | null;
+  child_assignment_ids: string[];
+  idempotency_key?: string | null;
+  payload?: Record<string, unknown>;
+  record_id?: string | null;
+  cycle_id?: string | null;
+};
+
+type OrchestrationPayload = {
+  version: number;
+  generated_at: string;
+  latest_event?: OrchestrationEvent | null;
+  events: OrchestrationEvent[];
+  decisions: OrchestrationEvent[];
+  proposals: OrchestrationEvent[];
+  counts: Record<string, number>;
+};
+
 type OpsRoomSnapshot = {
   version: number;
   generated_at: string;
   mission: Mission | null;
   latest_reasoning?: { decision_summary?: string; cycle_id?: string } | null;
+  orchestration?: OrchestrationPayload | null;
   rooms?: OpsRoomRoom[];
   agents: VisualAgent[];
   teams: Team[];
@@ -173,6 +207,7 @@ type CockpitPayload = {
   };
   mission: Mission | null;
   latest_reasoning?: { decision_summary?: string; cycle_id?: string } | null;
+  orchestration?: OrchestrationPayload | null;
   agents: VisualAgent[];
   teams: Team[];
   tasks: {
@@ -215,6 +250,10 @@ type SettingsPayload = {
   web_port: number;
   default_provider: string;
   default_model: string;
+  proactive_mode?: string;
+  proactive_creation_enabled?: boolean;
+  max_proactive_proposals_per_cycle?: number;
+  max_proactive_creations_per_cycle?: number;
   postgres_configured: boolean;
   redis_configured: boolean;
   qdrant_configured: boolean;
@@ -261,6 +300,10 @@ type ModelRoute = {
 };
 
 type ApiOptions = RequestInit & { json?: unknown };
+type TaskDialogDraft = {
+  agentId?: string;
+  assignment?: string;
+};
 
 class ApiError extends Error {
   status: number;
@@ -297,6 +340,7 @@ function App() {
   const [activePanel, setActivePanel] = useState<"tasks" | "chat" | "goals">("tasks");
   const [view, setView] = useState<"cockpit" | "ops">(() => initialView());
   const [taskDialogOpen, setTaskDialogOpen] = useState(false);
+  const [taskDialogDraft, setTaskDialogDraft] = useState<TaskDialogDraft | null>(null);
 
   const headers = useMemo(() => {
     const next: Record<string, string> = { "Content-Type": "application/json" };
@@ -537,6 +581,19 @@ function App() {
     setView("ops");
   }, []);
 
+  const openTaskDialog = useCallback((draft?: TaskDialogDraft) => {
+    setTaskDialogDraft(draft || null);
+    if (draft?.agentId) {
+      setSelectedAgentId(draft.agentId);
+    }
+    setTaskDialogOpen(true);
+  }, []);
+
+  const closeTaskDialog = useCallback(() => {
+    setTaskDialogOpen(false);
+    setTaskDialogDraft(null);
+  }, []);
+
   const setSelectedAgentModel = useCallback((route: ModelRoute) => {
     if (!selectedAgentId) {
       return;
@@ -654,7 +711,7 @@ function App() {
           onSettingsChange={setSettings}
           onRefresh={refreshAll}
           setStatus={setStatus}
-          onOpenTaskDialog={() => setTaskDialogOpen(true)}
+          onOpenTaskDialog={openTaskDialog}
         />
       ) : (
         <OpsRoomView
@@ -670,7 +727,7 @@ function App() {
           onSelectAgent={setSelectedAgentId}
           onRefresh={refreshAll}
           setStatus={setStatus}
-          onOpenTaskDialog={() => setTaskDialogOpen(true)}
+          onOpenTaskDialog={openTaskDialog}
         />
       )}
 
@@ -678,9 +735,10 @@ function App() {
         <TaskDialog
           agents={agents}
           selectedAgentId={selectedAgentId}
+          draft={taskDialogDraft}
           canCreate={can("task:write")}
           api={api}
-          onClose={() => setTaskDialogOpen(false)}
+          onClose={closeTaskDialog}
           onDone={refreshAll}
           setStatus={setStatus}
         />
@@ -764,7 +822,7 @@ function CockpitView({
   onSettingsChange: (settings: SettingsPayload) => void;
   onRefresh: () => Promise<void>;
   setStatus: (status: string) => void;
-  onOpenTaskDialog: () => void;
+  onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
 }) {
   const selectedAgent = cockpit?.agents.find((agent) => agent.agent_id === selectedAgentId) || null;
   return (
@@ -809,6 +867,9 @@ function CockpitView({
             onDone={onRefresh}
             setStatus={setStatus}
           />
+        </Widget>
+        <Widget title="Orchestration Activity" wide>
+          <OrchestrationActivity telemetry={cockpit?.orchestration || null} />
         </Widget>
         <Widget title="Tasks" wide>
           <TaskBoard
@@ -1018,7 +1079,7 @@ function ModelSelect({
 }) {
   const visibleOptions = visibleModelOptions(inventory);
   const fallback = visibleOptions.find((option) => option.is_default) || visibleOptions[0] || null;
-  const value = route && route.provider !== "fake"
+  const value = route
     ? modelRouteKey(route)
     : fallback
       ? modelOptionKey(fallback)
@@ -1180,6 +1241,105 @@ function ListBlock({ title, items }: { title: string; items: string[] }) {
   );
 }
 
+function OrchestrationActivity({ telemetry }: { telemetry: OrchestrationPayload | null }) {
+  const events = telemetry?.events?.slice(0, 8) || [];
+  if (!events.length) {
+    return <p className="muted">No orchestration activity recorded.</p>;
+  }
+  return (
+    <div className="activity-list">
+      {events.map((event) => (
+        <article key={event.id} className={`activity-row ${orchestrationEventClass(event)}`}>
+          <header>
+            <span className="status-pill">{orchestrationEventKind(event)}</span>
+            <small>{formatTime(event.recorded_at)}</small>
+          </header>
+          <p>{event.summary}</p>
+          <dl className="compact-dl">
+            {event.mission_statement && (
+              <>
+                <dt>Mission</dt>
+                <dd>{shortText(event.mission_statement, 96)}</dd>
+              </>
+            )}
+            {event.goal_statement && (
+              <>
+                <dt>Goal</dt>
+                <dd>{shortText(event.goal_statement, 96)}</dd>
+              </>
+            )}
+            {event.trigger && (
+              <>
+                <dt>Trigger</dt>
+                <dd>{event.trigger}</dd>
+              </>
+            )}
+            {event.agent_id && (
+              <>
+                <dt>Agent</dt>
+                <dd>{event.agent_id}</dd>
+              </>
+            )}
+            {event.parent_assignment_id && (
+              <>
+                <dt>Parent</dt>
+                <dd>{shortText(event.parent_assignment_id, 24)}</dd>
+              </>
+            )}
+            {event.child_assignment_ids.length > 0 && (
+              <>
+                <dt>Children</dt>
+                <dd>{event.child_assignment_ids.length}</dd>
+              </>
+            )}
+            {event.idempotency_key && (
+              <>
+                <dt>Idempotency</dt>
+                <dd>{shortText(event.idempotency_key, 76)}</dd>
+              </>
+            )}
+          </dl>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function orchestrationEventKind(event: OrchestrationEvent) {
+  if (event.status === "proposed" || event.type === "proactive_proposal") {
+    return "proposal";
+  }
+  if (event.status === "created" || event.decision === "created") {
+    return "created";
+  }
+  if (event.type === "delegated_task") {
+    return "delegated";
+  }
+  if (event.type === "parent_synthesis") {
+    return "synthesis";
+  }
+  return event.decision || event.type.replace(/_/g, " ");
+}
+
+function orchestrationEventClass(event: OrchestrationEvent) {
+  const kind = orchestrationEventKind(event);
+  if (kind === "proposal") {
+    return "proposed";
+  }
+  if (["created", "assigned", "delegated", "synthesis"].includes(kind)) {
+    return "active";
+  }
+  if (["blocked", "skipped"].includes(kind)) {
+    return "blocked";
+  }
+  return "neutral";
+}
+
+function orchestrationEventText(event: OrchestrationEvent) {
+  const kind = orchestrationEventKind(event);
+  return `${kind}: ${event.summary}`;
+}
+
 function AlertList({
   alerts,
   canClear,
@@ -1240,7 +1400,7 @@ function TaskBoard({
   tasks: CockpitPayload["tasks"] | null;
   agents: VisualAgent[];
   canCreate: boolean;
-  onOpenTaskDialog: () => void;
+  onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
   onSelectAgent: (agentId: string) => void;
 }) {
   const [filter, setFilter] = useState<"active" | "queued" | "blocked" | "all">("active");
@@ -1653,7 +1813,7 @@ function OpsRoomView({
   onSelectAgent: (agentId: string) => void;
   onRefresh: () => Promise<void>;
   setStatus: (status: string) => void;
-  onOpenTaskDialog: () => void;
+  onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
 }) {
   return (
     <section className="ops-layout">
@@ -1703,7 +1863,9 @@ function OpsRoomView({
             selectedAgentId={selectedAgentId}
             modelRoute={selectedAgentModel}
             canChat={can("chat:write")}
+            canCreateTask={can("task:write")}
             api={api}
+            onOpenTaskDialog={onOpenTaskDialog}
             onDone={onRefresh}
             setStatus={setStatus}
           />
@@ -1779,7 +1941,7 @@ function TasksPanel({
   snapshot: OpsRoomSnapshot | null;
   selectedAgentId: string;
   canCreate: boolean;
-  onOpenTaskDialog: () => void;
+  onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
 }) {
   const tasks = (snapshot?.assignments || [])
     .filter((task) => task.assigned_to === selectedAgentId)
@@ -1820,7 +1982,9 @@ function AgentChatPanel({
   selectedAgentId,
   modelRoute,
   canChat,
+  canCreateTask,
   api,
+  onOpenTaskDialog,
   onDone,
   setStatus,
 }: {
@@ -1828,7 +1992,9 @@ function AgentChatPanel({
   selectedAgentId: string;
   modelRoute: ModelRoute | null;
   canChat: boolean;
+  canCreateTask: boolean;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
   onDone: () => Promise<void>;
   setStatus: (status: string) => void;
 }) {
@@ -1866,11 +2032,20 @@ function AgentChatPanel({
         },
       });
       setMessage("");
-      setStatus("Chat complete");
+      setStatus("Chat reply saved");
       await onDone();
     } finally {
       setPending(false);
     }
+  }
+
+  function createTaskFromDraft() {
+    const draft = message.trim();
+    if (!draft || !selectedAgentId || !canCreateTask) {
+      return;
+    }
+    setStatus("Preparing task draft");
+    onOpenTaskDialog({ agentId: selectedAgentId, assignment: draft });
   }
 
   return (
@@ -1894,12 +2069,21 @@ function AgentChatPanel({
           onChange={(event) => setMessage(event.target.value)}
           placeholder="Message the selected agent"
         />
-        <button
-          disabled={!canChat || pending || !message.trim() || !selectedAgentId}
-          onClick={() => send().catch((error) => setStatus(errorMessage(error)))}
-        >
-          {pending ? "Sending" : "Send"}
-        </button>
+        <div className="chat-actions">
+          <button
+            disabled={!canCreateTask || pending || !message.trim() || !selectedAgentId}
+            onClick={createTaskFromDraft}
+            title="Create an assignment for the selected agent from this text"
+          >
+            Create Task
+          </button>
+          <button
+            disabled={!canChat || pending || !message.trim() || !selectedAgentId}
+            onClick={() => send().catch((error) => setStatus(errorMessage(error)))}
+          >
+            {pending ? "Sending" : "Send"}
+          </button>
+        </div>
       </div>
       <PermissionNotice
         allowed={canChat}
@@ -2007,6 +2191,7 @@ function GoalsPanel({
 function TaskDialog({
   agents,
   selectedAgentId,
+  draft,
   canCreate,
   api,
   onClose,
@@ -2015,14 +2200,15 @@ function TaskDialog({
 }: {
   agents: VisualAgent[];
   selectedAgentId: string;
+  draft: TaskDialogDraft | null;
   canCreate: boolean;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
   onClose: () => void;
   onDone: () => Promise<void>;
   setStatus: (status: string) => void;
 }) {
-  const [agentId, setAgentId] = useState(selectedAgentId || agents[0]?.agent_id || "");
-  const [assignment, setAssignment] = useState("");
+  const [agentId, setAgentId] = useState(draft?.agentId || selectedAgentId || agents[0]?.agent_id || "");
+  const [assignment, setAssignment] = useState(draft?.assignment || "");
   const [priority, setPriority] = useState("normal");
   const [workMode, setWorkMode] = useState("heartbeat");
   const [roomId, setRoomId] = useState("");
@@ -2173,7 +2359,9 @@ function OpsRoomFloor({
           const occupants = agentsByRoom.get(room.id) || [];
           const isRest = room.kind === "rest";
           const isOrchestrator = room.id === "orchestrator";
-          const isActiveOrchestrator = isOrchestrator && Boolean(snapshot?.latest_reasoning);
+          const latestOrchestrationEvent = snapshot?.orchestration?.latest_event || null;
+          const isActiveOrchestrator =
+            isOrchestrator && Boolean(latestOrchestrationEvent || snapshot?.latest_reasoning);
           const tokenUse = occupants.reduce(
             (sum, agent) => sum + (agent.usage?.total_tokens || 0),
             0,
@@ -2220,8 +2408,10 @@ function OpsRoomFloor({
                   ))
                 ) : (
                   <p className="floor-empty">
-                    {isOrchestrator && snapshot?.latest_reasoning?.decision_summary
-                      ? shortText(snapshot.latest_reasoning.decision_summary, 72)
+                    {isOrchestrator && latestOrchestrationEvent
+                      ? shortText(orchestrationEventText(latestOrchestrationEvent), 72)
+                      : isOrchestrator && snapshot?.latest_reasoning?.decision_summary
+                        ? shortText(snapshot.latest_reasoning.decision_summary, 72)
                       : isRest
                         ? "-"
                         : "empty"}
@@ -2435,7 +2625,7 @@ function modelRouteFromOption(option: ModelOption | null | undefined): ModelRout
 }
 
 function modelRoutePayload(route: ModelRoute | null): Record<string, string> {
-  if (!route || route.provider === "fake") {
+  if (!route) {
     return {};
   }
   return {
@@ -2446,7 +2636,7 @@ function modelRoutePayload(route: ModelRoute | null): Record<string, string> {
 }
 
 function visibleModelOptions(inventory: ModelInventory | null) {
-  return (inventory?.options || []).filter((option) => option.provider !== "fake");
+  return inventory?.options || [];
 }
 
 function allAgents(cockpit: CockpitPayload | null, snapshot: OpsRoomSnapshot | null) {

@@ -66,13 +66,15 @@ class StateStore(Protocol):
         cooldown_seconds: int,
     ) -> None: ...
 
-    def add_assignment(self, assignment: Assignment) -> None: ...
+    def add_assignment(self, assignment: Assignment) -> Assignment: ...
 
     def assignments(self) -> list[Assignment]: ...
 
     def active_assignment_for_agent(self, agent_id: str) -> Assignment | None: ...
 
     def find_assignment(self, assignment_id: str) -> Assignment | None: ...
+
+    def find_assignment_by_idempotency_key(self, idempotency_key: str) -> Assignment | None: ...
 
     def replace_assignments(self, assignments: list[Assignment]) -> None: ...
 
@@ -571,10 +573,14 @@ class PostgresStateStore:
                 )
         return True
 
-    def add_assignment(self, assignment: Assignment) -> None:
+    def add_assignment(self, assignment: Assignment) -> Assignment:
+        existing = self.find_assignment_by_idempotency_key(assignment.idempotency_key or "")
+        if existing is not None:
+            return existing
         self._upsert_assignment(assignment)
         self._sync_assignment_runtime(assignment)
         self._record_assignment_provenance(assignment)
+        return assignment
 
     def assignments(self) -> list[Assignment]:
         assignments = [
@@ -595,6 +601,33 @@ class PostgresStateStore:
             (assignment_id,),
         )
         return assignment_from_dict(record) if record else None
+
+    def find_assignment_by_idempotency_key(self, idempotency_key: str) -> Assignment | None:
+        if not idempotency_key:
+            return None
+        active = self._record_or_none(
+            """
+            select record
+            from brigade_assignments
+            where idempotency_key = %s
+            order by created_at desc, id desc
+            limit 1
+            """,
+            (idempotency_key,),
+        )
+        if active is not None:
+            return assignment_from_dict(active)
+        archived = self._record_or_none(
+            """
+            select record
+            from brigade_assignment_history
+            where record->>'idempotency_key' = %s
+            order by archived_at desc, id desc
+            limit 1
+            """,
+            (idempotency_key,),
+        )
+        return assignment_from_dict(archived) if archived else None
 
     def replace_assignments(self, assignments: list[Assignment]) -> None:
         keep_ids = [item.assignment_id for item in assignments]
@@ -619,8 +652,25 @@ class PostgresStateStore:
         self._record_assignment_provenance(assignment)
 
     def archive_assignment(self, assignment: Assignment, executive_summary: str) -> None:
+        detached_children = False
         with self._connect() as conn:
             with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    update brigade_assignments
+                    set parent_assignment_id = null,
+                        updated_at = %s,
+                        record = jsonb_set(
+                          record,
+                          '{parent_assignment_id}',
+                          'null'::jsonb,
+                          true
+                        )
+                    where parent_assignment_id = %s
+                    """,
+                    (utc_now_iso(), assignment.assignment_id),
+                )
+                detached_children = getattr(cursor, "rowcount", 0) > 0
                 cursor.execute(
                     "delete from brigade_assignments where id = %s",
                     (assignment.assignment_id,),
@@ -651,6 +701,8 @@ class PostgresStateStore:
                     ),
                 )
         self._remove_assignment_runtime(assignment.assignment_id)
+        if detached_children:
+            self._sync_assignments_runtime(self.assignments())
         self._record_assignment_provenance(assignment)
 
     def assignment_history(self) -> list[dict[str, Any]]:

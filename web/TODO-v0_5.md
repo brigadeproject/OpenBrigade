@@ -11,7 +11,7 @@ The first full v0.5 prototype pass is implemented:
 - `dashboard --plain --view teams` shows team hierarchy.
 - `chat ask-agent` and `chat group` persist inter-agent exchanges, usage, and episode summaries.
 - `orchestrator propose-stalled-goals` creates idempotent queued work for goals with no active assignment.
-- `model route` recommends local/cloud/simulated routing from financial and cloud in-flight state.
+- `model route` recommends local/cloud routing from financial and cloud in-flight state.
 - `cloud dispatch/list/resolve` creates, inspects, and terminally resolves extended-work cloud-job records.
 - `alert audit` raises prototype alerts for goal drift, repeated task failures, failed cloud jobs, and optional datastore health failures.
 - `RELEASE_CHECKLIST.md`, README, and PROTOTYPE docs now cover the v0.5 MVP commands.

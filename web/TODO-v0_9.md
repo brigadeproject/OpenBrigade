@@ -197,10 +197,10 @@ connection milestone.
 - Add auth and allowlist controls.
   Acceptance: unknown Telegram users are blocked or routed to owner approval by default.
   Status: initial allowlist blocking implemented; owner approval flow remains.
-- Add tests with fake Telegram payloads.
+- Add tests with sample Telegram payloads.
   Acceptance: no live Telegram network is required for unit tests.
   Status: implemented.
-  Remaining: live disabled-by-default smoke, outbound send fake, size/rate limits, and operator setup doc.
+  Remaining: live disabled-by-default smoke, outbound send stub, size/rate limits, and operator setup doc.
 
 ### Google Chat Wrapper
 
@@ -215,10 +215,10 @@ connection milestone.
 - Add user identity mapping.
   Acceptance: Google identities map to OpenBrigade users or pending approval records.
   Status: initial allowlist metadata implemented; durable identity approval flow remains.
-- Add tests with fake Google Chat events.
+- Add tests with sample Google Chat events.
   Acceptance: no live Google network is required for unit tests.
   Status: implemented.
-  Remaining: live disabled-by-default smoke, outbound send fake, size/rate limits, and operator setup doc.
+  Remaining: live disabled-by-default smoke, outbound send stub, size/rate limits, and operator setup doc.
 
 ### OpenAI/Codex Model Connection
 
@@ -364,7 +364,7 @@ browser workflow, information architecture, responsive layout, and role-aware in
 - Run baseline commands.
   Acceptance: tests, lint, compile, health, migration status, dashboard, TUI, web, stress, heartbeat, and recovery checks pass.
   Status: tests/lint/frontend build/Compose config/Docker build/live health/db status/web smoke/bad
-  heartbeat with cleanup/fake stress/non-dropping recovery pass.
+  heartbeat with cleanup/stress/non-dropping recovery pass.
 
 ### Manual Existing-Agent Migration Pass
 

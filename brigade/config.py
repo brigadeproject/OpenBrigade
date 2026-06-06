@@ -14,6 +14,10 @@ class Settings:
     log_level: str = "INFO"
     orchestrator_cadence_seconds: int = 900
     stale_work_seconds: int = 86_400
+    proactive_mode: str = "propose"
+    proactive_creation_enabled: bool = False
+    max_proactive_proposals_per_cycle: int = 1
+    max_proactive_creations_per_cycle: int = 1
     postgres_dsn: str | None = None
     redis_url: str | None = None
     qdrant_url: str | None = None
@@ -30,8 +34,8 @@ class Settings:
     require_auth: bool = False
     web_host: str = "0.0.0.0"
     web_port: int = 8080
-    default_provider: str = "fake"
-    default_model: str = "llama3.1"
+    default_provider: str = "ollama"
+    default_model: str = "gpt-oss:20b"
     ollama_base_url: str = "http://127.0.0.1:11434"
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
@@ -181,11 +185,6 @@ def load_settings(
             neo4j_http_url = f"http://{host}:{neo4j_http_port}"
     neo4j_auth = _env("BRIGADE_NEO4J_AUTH", dotenv, config.get("neo4j_auth"))
     web_port_raw = _env("BRIGADE_WEB_PORT", dotenv, str(config.get("web_port", 8080)))
-    ollama_base_url_configured = (
-        "BRIGADE_OLLAMA_BASE_URL" in os.environ
-        or "BRIGADE_OLLAMA_BASE_URL" in dotenv
-        or "ollama_base_url" in config
-    )
     ollama_base_url = _env(
         "BRIGADE_OLLAMA_BASE_URL",
         dotenv,
@@ -197,7 +196,9 @@ def load_settings(
         config.get("default_provider"),
     )
     if not default_provider:
-        default_provider = "ollama" if ollama_base_url_configured else "fake"
+        default_provider = "ollama"
+    if default_provider == "fake":
+        default_provider = "ollama"
 
     return Settings(
         config_path=config_file,
@@ -208,6 +209,25 @@ def load_settings(
             "BRIGADE_STALE_WORK_SECONDS",
             dotenv,
             config.get("stale_work_seconds", 86_400),
+        ),
+        proactive_mode=(
+            _env("BRIGADE_PROACTIVE_MODE", dotenv, config.get("proactive_mode", "propose"))
+            or "propose"
+        ),
+        proactive_creation_enabled=_env_bool(
+            "BRIGADE_PROACTIVE_CREATION_ENABLED",
+            dotenv,
+            config.get("proactive_creation_enabled", False),
+        ),
+        max_proactive_proposals_per_cycle=_env_int(
+            "BRIGADE_MAX_PROACTIVE_PROPOSALS_PER_CYCLE",
+            dotenv,
+            config.get("max_proactive_proposals_per_cycle", 1),
+        ),
+        max_proactive_creations_per_cycle=_env_int(
+            "BRIGADE_MAX_PROACTIVE_CREATIONS_PER_CYCLE",
+            dotenv,
+            config.get("max_proactive_creations_per_cycle", 1),
         ),
         postgres_dsn=postgres_dsn,
         redis_url=redis_url,
@@ -273,9 +293,9 @@ def load_settings(
         default_model=_env(
             "BRIGADE_DEFAULT_MODEL",
             dotenv,
-            config.get("default_model", "llama3.1"),
+            config.get("default_model", "gpt-oss:20b"),
         )
-        or "llama3.1",
+        or "gpt-oss:20b",
         ollama_base_url=ollama_base_url,
         openai_api_key=_env("OPENAI_API_KEY", dotenv, config.get("openai_api_key")),
         anthropic_api_key=_env("ANTHROPIC_API_KEY", dotenv, config.get("anthropic_api_key")),

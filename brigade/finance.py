@@ -12,9 +12,6 @@ def build_financial_report(store: StateStore) -> dict[str, object]:
     usage_records = store.usage_records()
     local_records = [record for record in usage_records if record.get("route_type") == "local"]
     cloud_records = [record for record in usage_records if record.get("route_type") == "cloud"]
-    simulated_records = [
-        record for record in usage_records if record.get("route_type") == "simulated"
-    ]
     active_cloud_jobs = [
         job for job in store.cloud_jobs() if job.get("status") not in {"complete", "failed"}
     ]
@@ -23,8 +20,6 @@ def build_financial_report(store: StateStore) -> dict[str, object]:
     local_output = sum(int(record.get("output_tokens", 0)) for record in local_records)
     cloud_input = sum(int(record.get("input_tokens", 0)) for record in cloud_records)
     cloud_output = sum(int(record.get("output_tokens", 0)) for record in cloud_records)
-    simulated_input = sum(int(record.get("input_tokens", 0)) for record in simulated_records)
-    simulated_output = sum(int(record.get("output_tokens", 0)) for record in simulated_records)
     total_cost = round(
         sum(float(record.get("estimated_cost_usd", 0.0)) for record in usage_records),
         6,
@@ -43,10 +38,6 @@ def build_financial_report(store: StateStore) -> dict[str, object]:
             "input": cloud_input,
             "output": cloud_output,
         },
-        "simulated_tokens": {
-            "input": simulated_input,
-            "output": simulated_output,
-        },
         "total_estimated_cost_usd": total_cost,
         "cloud_jobs_in_flight": len(active_cloud_jobs),
         "block_cloud_dispatch": block_cloud_dispatch,
@@ -61,7 +52,7 @@ def build_model_routing_decision(
     task_type: str,
     risk: str = "normal",
     prefer: str = "auto",
-    local_model: str = "llama3.1",
+    local_model: str = "gpt-oss:20b",
     cloud_model: str = "gpt-4.1-mini",
 ) -> dict[str, object]:
     report = build_financial_report(store)
@@ -85,10 +76,6 @@ def build_model_routing_decision(
         recommended_provider = "litellm"
         recommended_model = cloud_model
         rationale = "Cloud is allowed for higher-risk or explicitly cloud-preferred work."
-    elif prefer == "fake":
-        recommended_provider = "fake"
-        recommended_model = "llama3.1"
-        rationale = "Simulated routing requested for deterministic prototype testing."
     else:
         recommended_provider = "ollama"
         recommended_model = local_model
@@ -129,4 +116,4 @@ def _route_type_for_provider(provider: str) -> str:
         return "local"
     if provider == "litellm":
         return "cloud"
-    return "simulated"
+    return "unknown"

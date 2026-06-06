@@ -7,7 +7,6 @@ import pytest
 from brigade.auth import AuthResult
 from brigade.cli import main
 from brigade.config import Settings
-from brigade.providers import FakeProvider
 from brigade.schemas import Agent, Role, User
 from brigade.services import build_settings_payload, send_user_chat, set_config_value
 from brigade.state import JsonStateStore
@@ -19,6 +18,7 @@ from brigade.tui import (
     render_dashboard_view,
     render_settings_view,
 )
+from tests.helpers import TestProvider
 
 
 def test_v07_config_inspect_set_and_db_status_without_postgres(tmp_path, monkeypatch, capsys):
@@ -51,7 +51,7 @@ def test_v08_user_chat_service_records_response_usage_and_episode(tmp_path):
         user=user,
         agent_id="sage",
         content="What should we do next?",
-        provider=FakeProvider(),
+        provider=TestProvider(),
         idempotency_key="chat-1",
     )
 
@@ -69,14 +69,14 @@ def test_v08_user_chat_service_records_response_usage_and_episode(tmp_path):
         user=user,
         agent_id="sage",
         content="What should we do next?",
-        provider=FakeProvider(),
+        provider=TestProvider(),
         idempotency_key="chat-1",
     )
     assert duplicate["status"] == "duplicate"
 
 
 def test_v08_user_chat_local_route_does_not_apply_agent_run_cooldown(tmp_path):
-    class LocalProvider(FakeProvider):
+    class LocalProvider(TestProvider):
         route_type = "local"
 
     store = JsonStateStore(tmp_path / "state.json")

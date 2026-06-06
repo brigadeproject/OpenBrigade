@@ -37,3 +37,10 @@ def test_external_connections_migration_exists():
     assert "create table if not exists brigade_external_identities" in sql
     assert "external_user_id text not null" in sql
     assert "redacted_metadata jsonb not null" in sql
+
+
+def test_assignment_idempotency_migration_exists():
+    sql = Path("migrations/0007_assignment_idempotency.sql").read_text(encoding="utf-8")
+
+    assert "brigade_assignments_idempotency_key_unique_idx" in sql
+    assert "where idempotency_key is not null" in sql

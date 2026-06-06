@@ -7,7 +7,6 @@ import pytest
 
 from brigade.config import Settings
 from brigade.providers import (
-    FakeProvider,
     LiteLLMProvider,
     ProviderAuthError,
     available_model_options,
@@ -17,13 +16,14 @@ from brigade.secrets import oauth_credential_status, write_oauth_credential
 from brigade.services import build_settings_payload
 
 
-def test_fake_provider_is_deterministic():
-    response = FakeProvider().complete("Summarize the current mission")
+def test_retired_test_provider_is_not_available(tmp_path):
+    settings = Settings(config_path=tmp_path / "brigade.config.json", data_dir=tmp_path)
 
-    assert response.provider == "fake"
-    assert response.model == "deterministic"
-    assert response.text.startswith("FAKE_RESPONSE:")
-    assert response.input_tokens == 4
+    payload = available_model_options(settings)
+
+    assert all(option["provider"] != "fake" for option in payload["options"])
+    with pytest.raises(ValueError, match="has been removed"):
+        provider_from_settings(settings, provider="fake")
 
 
 def test_litellm_provider_missing_api_key_is_actionable_without_importing_litellm():

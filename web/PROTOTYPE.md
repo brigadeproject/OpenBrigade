@@ -119,7 +119,8 @@ Run a synchronous 1:1 inter-agent chat:
   --from-agent test-scout \
   --to-agent test-builder \
   --message "What should we test next?" \
-  --provider fake
+  --provider ollama \
+  --model gpt-oss:20b
 ```
 
 For local inference, use an installed Ollama model:
@@ -142,7 +143,8 @@ Run a bounded pass-the-mic group chat:
   --participant v05-scout \
   --agenda "Pick the next v0.5 break test." \
   --max-turns 3 \
-  --provider fake
+  --provider ollama \
+  --model gpt-oss:20b
 ```
 
 Delegate work as a Crew Chief:

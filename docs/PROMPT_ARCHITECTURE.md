@@ -49,6 +49,34 @@ Team delegation and escalation prompts should include:
 
 This keeps team movement auditable and prevents implicit cross-team authority.
 
+## Proactive Mission Continuation
+
+Mission continuation is bounded and observable. The default mode is propose-only:
+the Orchestrator may record one Crew Chief-level continuation proposal for an
+idle mission cycle, but it does not create a task unless both controls are set:
+
+- `proactive_mode` is `create`.
+- `proactive_creation_enabled` is `true`.
+
+The continuation evaluator only fires when a mission exists, at least one Crew
+Chief exists, and there is no active or queued next work. It generates leadership
+planning or coordination work for an existing Crew Chief. It must not create
+low-level worker tasks or dynamic agents in this step.
+
+Every proposal or creation carries provenance in `orchestrator_reasoning`:
+mission, supported goal when available, trigger condition, target Crew Chief,
+parent or child assignment IDs when relevant, source, and idempotency key. The
+idempotency key is:
+
+```text
+orchestrator-proactive:v1:<sha256>
+```
+
+The hash is built from normalized mission text, supported goal text if any,
+trigger condition, target Crew Chief, and proposed assignment text. Active
+assignments, archived assignments, and prior proposals are checked before a new
+proposal or task is recorded.
+
 ## Rumination and Self-Improvement
 
 Future dreaming/rumination cycles should be separate from normal assignment execution. They should
@@ -63,9 +91,8 @@ They should not silently rewrite identity, tools, secrets, or operator policy.
 
 ## Provider Behavior
 
-`fake` is for deterministic tests. `ollama` is the local/default runtime model path. External model
-routes belong to v0.9.1 connection work and should fail with clear errors when credentials are
-missing.
+`ollama` is the local/default runtime model path. External model routes should fail with clear
+errors when credentials are missing.
 
 All provider responses should be parsed into structured status: `complete`, `working`, `blocked`,
 `awaiting_human`, or `failed`. Unsupported or malformed provider output should retry when safe and

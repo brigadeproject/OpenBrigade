@@ -31,6 +31,31 @@ def test_load_settings_reads_dotenv(tmp_path):
 
     assert settings.orchestrator_cadence_seconds == 30
     assert settings.stale_work_seconds == 3600
+    assert settings.proactive_mode == "propose"
+    assert settings.proactive_creation_enabled is False
+
+
+def test_load_settings_reads_proactive_controls(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "\n".join(
+            [
+                "BRIGADE_PROACTIVE_MODE=create",
+                "BRIGADE_PROACTIVE_CREATION_ENABLED=true",
+                "BRIGADE_MAX_PROACTIVE_PROPOSALS_PER_CYCLE=2",
+                "BRIGADE_MAX_PROACTIVE_CREATIONS_PER_CYCLE=1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=tmp_path / "missing.json", env_path=env)
+
+    assert settings.proactive_mode == "create"
+    assert settings.proactive_creation_enabled is True
+    assert settings.max_proactive_proposals_per_cycle == 2
+    assert settings.max_proactive_creations_per_cycle == 1
 
 
 def test_load_settings_uses_configured_ollama_as_live_default(tmp_path):
@@ -48,7 +73,7 @@ def test_load_settings_uses_configured_ollama_as_live_default(tmp_path):
     assert settings.default_model == "gpt-oss:20b"
 
 
-def test_load_settings_explicit_provider_overrides_ollama_default(tmp_path):
+def test_load_settings_retired_provider_falls_back_to_ollama(tmp_path):
     env = tmp_path / ".env"
     env.write_text(
         "\n".join(
@@ -63,7 +88,7 @@ def test_load_settings_explicit_provider_overrides_ollama_default(tmp_path):
 
     settings = load_settings(config_path=tmp_path / "missing.json", env_path=env)
 
-    assert settings.default_provider == "fake"
+    assert settings.default_provider == "ollama"
 
 
 def test_load_settings_derives_host_datastore_urls_from_compose_env(tmp_path):

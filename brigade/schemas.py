@@ -233,8 +233,8 @@ class Agent:
     workspace_path: str
     role: str = "line_worker"
     team_id: str | None = None
-    model_provider: str = "fake"
-    model_name: str = "llama3.1"
+    model_provider: str = "ollama"
+    model_name: str = "gpt-oss:20b"
     created_at: str = field(default_factory=utc_now_iso)
 
     def __post_init__(self) -> None:
@@ -380,8 +380,8 @@ def agent_from_dict(item: dict[str, Any]) -> Agent:
         workspace_path=item["workspace_path"],
         role=item.get("role", "line_worker"),
         team_id=item.get("team_id"),
-        model_provider=item.get("model_provider", "fake"),
-        model_name=item.get("model_name", "llama3.1"),
+        model_provider=item.get("model_provider", "ollama"),
+        model_name=item.get("model_name", "gpt-oss:20b"),
         created_at=item["created_at"],
     )
 

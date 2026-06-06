@@ -63,9 +63,8 @@ They should not silently rewrite identity, tools, secrets, or operator policy.
 
 ## Provider Behavior
 
-`fake` is for deterministic tests. `ollama` is the local/default runtime model path. External model
-routes belong to v0.9.1 connection work and should fail with clear errors when credentials are
-missing.
+`ollama` is the local/default runtime model path. External model routes should fail with clear
+errors when credentials are missing.
 
 All provider responses should be parsed into structured status: `complete`, `working`, `blocked`,
 `awaiting_human`, or `failed`. Unsupported or malformed provider output should retry when safe and

@@ -16,6 +16,7 @@ PREFERRED_OLLAMA_MODELS = (
     "mistral:7b",
     "devstral-small",
 )
+RETIRED_MODEL_PROVIDERS = {"fake"}
 
 
 @dataclass(frozen=True)
@@ -23,9 +24,9 @@ class ModelResponse:
     text: str
     input_tokens: int = 0
     output_tokens: int = 0
-    provider: str = "fake"
-    model: str = "deterministic"
-    route_type: str = "simulated"
+    provider: str = "unknown"
+    model: str = "unknown"
+    route_type: str = "unknown"
     estimated_cost_usd: float = 0.0
 
 
@@ -36,6 +37,10 @@ class ModelProvider(Protocol):
 
 class ProviderAuthError(RuntimeError):
     """Actionable model-provider credential failure."""
+
+
+class ModelUnavailableError(RuntimeError):
+    """Configured provider model is not installed or otherwise unavailable."""
 
 
 @dataclass(frozen=True)
@@ -64,45 +69,14 @@ class ModelOption:
         }
 
 
-class FakeProvider:
-    route_type = "simulated"
-
-    def __init__(self, model: str = "deterministic") -> None:
-        self.model = model
-
-    def complete(self, prompt: str) -> ModelResponse:
-        if "OpenBrigade orchestrator escalation protocol:" in prompt:
-            text = json.dumps(
-                {
-                    "status": "no_action",
-                    "summary": "FAKE_RESPONSE: no orchestrator action",
-                    "actions": [],
-                }
-            )
-        elif "OpenBrigade agent response protocol:" in prompt:
-            text = json.dumps(
-                {
-                    "status": "complete",
-                    "summary": f"FAKE_RESPONSE: {prompt[:120]}",
-                    "blockers": [],
-                }
-            )
-        else:
-            text = f"FAKE_RESPONSE: {prompt[:120]}"
-        return ModelResponse(
-            text=text,
-            input_tokens=len(prompt.split()),
-            output_tokens=len(text.split()),
-            provider="fake",
-            model=self.model,
-            route_type=self.route_type,
-        )
-
-
 class OllamaProvider:
     route_type = "local"
 
-    def __init__(self, base_url: str = "http://127.0.0.1:11434", model: str = "llama3.1") -> None:
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:11434",
+        model: str = "gpt-oss:20b",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
 
@@ -131,7 +105,7 @@ class OllamaProvider:
         except urllib.error.HTTPError as exc:
             body = _read_http_error(exc)
             if exc.code == 404:
-                raise RuntimeError(
+                raise ModelUnavailableError(
                     f"ollama model '{self.model}' is not available at {self.base_url}; "
                     "choose an installed model or pull it with Ollama"
                 ) from exc
@@ -250,8 +224,11 @@ def provider_from_settings(
 ):
     provider_name = provider or settings.default_provider
     model_name = model or settings.default_model
-    if provider_name == "fake":
-        return FakeProvider(model=model_name)
+    if provider_name in RETIRED_MODEL_PROVIDERS:
+        raise ValueError(
+            f"model provider '{provider_name}' has been removed; "
+            "configure ollama or a cloud provider"
+        )
     if provider_name == "ollama":
         return OllamaProvider(base_url=api_base or settings.ollama_base_url, model=model_name)
     if provider_name in {"openai", "openai-codex"}:
@@ -300,18 +277,7 @@ def provider_from_settings(
 def available_model_options(settings: Any) -> dict[str, Any]:
     default_provider = settings.default_provider
     default_model = settings.default_model
-    fake_model = default_model if default_provider == "fake" else "deterministic"
-    options: list[ModelOption] = [
-        ModelOption(
-            provider="fake",
-            model=fake_model,
-            label=f"Fake / {fake_model}",
-            route_type="simulated",
-            available=True,
-            configured=True,
-            is_default=default_provider == "fake" and fake_model == default_model,
-        )
-    ]
+    options: list[ModelOption] = []
     options.extend(_ollama_model_options(settings))
 
     if settings.openai_api_key or settings.openai_auth_mode == "oauth" or default_provider in {

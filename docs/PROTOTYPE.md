@@ -28,6 +28,16 @@ after a backup:
 ./ops/v07-wipe-reseed.sh --confirm-wipe
 ```
 
+For brand-new-user testing without seeded MVP defaults, run:
+
+```bash
+./ops/full-wipe.sh --confirm-full-wipe
+```
+
+The full wipe backs up the current prototype, drops runtime volumes, rebuilds the stack, runs
+migrations, verifies health, and asserts that mission, users, agents, teams, goals, assignments,
+messages, transcripts, alerts, memory, and provenance records are empty.
+
 Current migration hardening includes:
 
 - `brigade db status` and `brigade db migrate`
@@ -119,7 +129,8 @@ Run a synchronous 1:1 inter-agent chat:
   --from-agent test-scout \
   --to-agent test-builder \
   --message "What should we test next?" \
-  --provider fake
+  --provider ollama \
+  --model gpt-oss:20b
 ```
 
 For local inference, use an installed Ollama model:
@@ -142,7 +153,8 @@ Run a bounded pass-the-mic group chat:
   --participant v05-scout \
   --agenda "Pick the next v0.5 break test." \
   --max-turns 3 \
-  --provider fake
+  --provider ollama \
+  --model gpt-oss:20b
 ```
 
 Delegate work as a Crew Chief:
