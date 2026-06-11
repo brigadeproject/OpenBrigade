@@ -29,6 +29,7 @@ All in [`brigade/orchestrator.py`](../brigade/orchestrator.py) unless noted.
    the model return bounded actions: `create_assignment`, `rebalance_queued_assignment`,
    `request_human`. Actions are validated and applied (`apply_orchestrator_actions`), with
    rejects audited. It explicitly **refuses to move active work** — only queued items.
+   Malformed model responses now degrade to `no_action` instead of crashing the daemon path.
 
 5. **Stalled-goal proposal** — CLI `orchestrator propose-stalled-goals`
    ([`cli.py:1882`](../brigade/cli.py)).
@@ -59,16 +60,15 @@ orchestration story than any single proactive reference.
 
 ## Gaps / risks for RC
 
-1. **The escalation prompt depends on a capable model.** With a test stub it returns
-   `no_action`; with `ollama` small models the JSON-action contract may be unreliable.
-   The parser is strict (`parse_orchestrator_response` raises on bad JSON). For RC, verify
-   the daemon degrades gracefully when the model returns malformed actions (it currently
-   raises `ValueError` up the stack from `run_orchestrator_escalation`).
-2. **Single global provider for the daemon.** `run_managed_agents(store, provider)` uses one
-   provider for all agents — see report [06 — Model Self-Selection](06-model-self-selection.md).
-3. **Crew-chief planning is "create an assignment to plan," not structured decomposition.**
-   The chief is told to build a task plan; the actual breakdown into child assignments
-   relies on the chief agent calling `delegate` — see report
+1. **The escalation prompt still depends on a capable model.** With `ollama` small models the
+   JSON-action contract may be unreliable, but malformed output is now handled by returning
+   `no_action` with warning telemetry rather than propagating a parser exception.
+2. **Full model self-selection remains partial.** The daemon honors per-agent model settings
+   and default-provider fallback during managed runs, but task-difficulty and cost-aware
+   routing remain roadmap work — see report [06 — Model Self-Selection](06-model-self-selection.md).
+3. **Crew-chief decomposition is tool-mediated.** The `create_subtasks` tool now creates
+   dependency-linked child assignments with guardrails, but the quality of decomposition
+   still depends on the chief model choosing and filling that tool correctly — see report
    [05 — Sub-agents & Synthesis](05-subagents-delegation-synthesis.md).
 
 ## RC assessment
@@ -76,5 +76,5 @@ orchestration story than any single proactive reference.
 **Not a blocker — this is a strength.** Required before RC: an **end-to-end proactivity
 demo** (mission set → daemon runs → idle chief gets a planning task → chief delegates →
 worker executes → orchestrator escalates a stalled task), captured so it is reproducible.
-If that loop runs against a real model, the proactivity claim is substantiated. Harden the
-malformed-action path (#1) so the daemon never crashes on a bad model response.
+If that loop runs against a real model, the proactivity claim is substantiated. Keep
+`docs/RC_PROACTIVITY_DEMO.md` current and rerun it during final release validation.

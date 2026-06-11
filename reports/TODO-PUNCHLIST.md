@@ -16,11 +16,12 @@ idle/stale detection and bounded LLM escalation, working Telegram, multi-provide
 access (Claude/OpenAI/Gemini API + Ollama), and **both** a web GUI and a TUI wired to the
 same backend. You are *ahead* of the proactive reference set on orchestration and at parity
 with Hermes on GUI/TUI. **Per the scope decisions below, there are no hard RC blockers
-left** — the remaining work is (1) make the README match reality so nothing is
-over-promised, (2) land a handful of cheap fixes for *latent* features the code advertises
-but the runtime ignores (per-agent model selection; structured task synthesis; daemon
-robustness), and (3) treat **MCP client** as the flagship first post-RC milestone. None of
-the gaps are architectural dead-ends.
+left.** Several former latent-feature gaps have since landed: per-agent model selection
+during managed runs, structured subtask creation, delegation guards, malformed
+orchestrator-output degradation, default-provider fallback for managed agent runs, connector
+rate/size limits, and packaged web build serving all exist in code and tests. The remaining
+work is final live/operator validation, keeping README wording honest, and treating **MCP
+client** as the flagship first post-RC milestone.
 
 ---
 
@@ -61,38 +62,43 @@ each becomes a documentation change now + a roadmap item later.
 
 ## B. Should-fix before RC ⚠️ — latent features & visible stubs
 
-5. **⚠️ Honor per-agent models in the daemon.** — **S**
-   - *Why:* `Agent.model_provider`/`model_name` are stored and shown in the UI but the daemon
-     runs everyone through one global provider
-     ([`brigade/runner.py:73`](../brigade/runner.py), [`cli.py:1898`](../brigade/cli.py)).
-     This mismatch will be noticed.
-   - *Do:* build each agent's provider via `provider_from_settings` inside
-     `run_managed_agents`. *Report:* [06](06-model-self-selection.md).
+5. **✅ Honor per-agent models in the daemon.** — **S**
+   - *Why:* `Agent.model_provider`/`model_name` are stored and shown in the UI; managed runs
+     need to honor those fields rather than flattening every agent through one operator-selected
+     provider.
+   - *Status:* implemented through the managed-agent provider factory used by `agent run-all`
+     and `orchestrator daemon`; covered by `test_run_managed_agents_uses_per_agent_provider_factory`.
+     *Report:* [06](06-model-self-selection.md).
 
-6. **⚠️ Structured task synthesis for crew chiefs.** — **M**
+6. **✅ Structured task synthesis for crew chiefs.** — **M**
    - *Why:* Chiefs are told to "build a task plan," but nothing converts the plan into
      tracked, dependency-linked child assignments
      ([report 05](05-subagents-delegation-synthesis.md)). `dependency_ids` exists but is
      never populated by synthesis.
-   - *Do:* add a `decompose` / `create_subtasks` orchestrator action (or chief tool) that
-     emits N child assignments with `dependency_ids` wired.
+   - *Status:* implemented as the `create_subtasks` tool with dependency linking and
+     delegation guard coverage.
 
-7. **⚠️ Harden the orchestrator escalation against bad model output.** — **S**
+7. **✅ Harden the orchestrator escalation against bad model output.** — **S**
    - *Why:* `run_orchestrator_escalation` lets `parse_orchestrator_response` raise on
      malformed JSON ([`brigade/orchestrator.py:393`](../brigade/orchestrator.py)); a weak
      model could crash the daemon loop.
-   - *Do:* catch/parse-fail → record alert + `no_action`, never propagate.
+   - *Status:* implemented as parse-fail → `no_action` with warning telemetry; covered by
+     `test_orchestrator_escalation_degrades_on_malformed_model_output`.
 
-8. **⚠️ Model fallback chain.** — **S/M**
+8. **✅ Default-provider fallback for managed agent runs.** — **S/M**
    - *Why:* `LiteLLMProvider` raises on provider failure with no fallback
      ([`brigade/providers.py:174`](../brigade/providers.py)). One provider outage stalls work.
-   - *Do:* wrap providers so an auth/availability error tries the next configured route.
+   - *Status:* implemented for per-agent provider failures by retrying with the default
+     provider during `agent run`, `agent run-all`, and daemon-managed runs. A richer ordered
+     multi-provider route chain remains a post-RC model-routing enhancement.
 
-9. **⚠️ Finish or label Google Chat outbound.** — **S**
+9. **✅ Label Google Chat outbound accurately.** — **S**
    - *Why:* `google_chat_reply_sender` builds a body but never POSTs
      ([`brigade/connectors.py:449`](../brigade/connectors.py)). Inbound works, outbound is a
      stub.
-   - *Do:* implement the real Chat API POST, or mark the connector "inbound-only" in docs.
+   - *Status:* docs label Google Chat as inbound-only for RC. The webhook can return a
+     threaded response body for approved senders, but it still does not POST to the Google
+     Chat API.
 
 10. **⚠️ Automate OAuth login + refresh-token rotation.** — **M**
     - *Why:* Current flow is manual code-exchange/import; expired tokens error instead of
@@ -101,15 +107,19 @@ each becomes a documentation change now + a roadmap item later.
     - *Do:* add a browser/device-code flow for the supported providers and auto-refresh on
       expiry.
 
-11. **⚠️ Verify the web GUI build ships.** — **S**
+11. **✅ Verify the web GUI build ships.** — **S**
     - *Why:* RC must install clean; confirm `vite build` output (`web/dist`) is packaged or
       built on first run and served by [`brigade/web.py`](../brigade/web.py).
-    - *Do:* add a build/package step (and a smoke test that `GET /` returns the SPA).
+    - *Status:* Dockerfiles copy `web/dist`, `brigade.web` serves the built SPA when present,
+      and `test_web_index_serves_built_spa` covers `GET /`.
 
-12. **⚠️ Capture an end-to-end proactivity demo.** — **S**
+12. **⚠️ Keep the end-to-end proactivity demo current.** — **S**
     - *Why:* Proactivity is your headline differentiator; it must be reproducibly
       demonstrable (mission → daemon → idle chief planning task → delegate → execute →
       stale-task escalation), ideally visible in the ops-room SSE stream.
+    - *Status:* propose-only mission-continuation behavior and idempotency are covered by
+      tests and documented in `docs/RC_PROACTIVITY_DEMO.md`; rerun the documented live demo
+      during the final RC gate.
     - *Report:* [04](04-orchestrator-proactivity.md).
 
 ---
@@ -151,12 +161,13 @@ README matches reality and the cheap "latent feature" fixes land:
 - MCP + Google-tools = roadmap, not current features. — items 1, 3
 - Delegation = fixed agent roster; dynamic sub-agent spawn = v1.1. — item 4
 
-**2. Cheap fixes that make advertised features real / robust:**
-- **Item 5** — honor per-agent models in the daemon (UI-visible feature, ~hours).
-- **Item 7** — don't let a malformed model response crash the orchestrator daemon.
-- **Item 15** — delegation depth/fan-out guard (prevents runaway delegation on the fixed roster).
-- **Item 11** — verify the web GUI build ships on a clean install.
-- **Item 12** — capture a reproducible end-to-end proactivity demo (the headline differentiator).
+**2. Fixes that already landed and need final gate verification:**
+- **Item 5** — per-agent models are honored during managed runs.
+- **Item 6** — Crew Chiefs can create structured, dependency-linked subtasks.
+- **Item 7** — malformed orchestrator model output degrades to `no_action`.
+- **Item 8** — managed runs retry per-agent provider failures with the default provider.
+- **Item 11** — the built web GUI is packaged and served.
+- **Item 12** — rerun the documented proactivity demo during final RC validation.
 
 **3. MCP Client:**
 - MCP client **(Item 1)** — unlocks Google tools and broad third-party tooling in one stroke.

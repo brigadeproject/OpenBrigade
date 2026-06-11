@@ -7,14 +7,14 @@ overhaul, not a blocker for the v0.9.0 core hardening pass. The next Pixel Agent
 Room buildout is tracked separately in v0.9.4 so break testing and RC hardening can continue in
 parallel.
 
-Status on 2026-05-27: v0.9.0 core hardening is implemented against the current live stack.
-Automated tests, lint, frontend build, Docker rebuild, Redis runtime normalization, backend web auth
-tests, Qdrant inspection, Neo4j relationship writes, TUI hardening, bad-heartbeat cleanup, web asset
-packaging, non-dropping recovery, and local Ollama default selection pass locally. Operator workflows
-now require Postgres-backed state. Remaining
-release validation is clean empty-volume/auth-enabled smoke, partial migration failure recovery,
-controlled backup/wipe/reseed/restore, clean-stack datastore sentinels, local Ollama live smoke, and
-public repo cleanup.
+Status scrubbed on 2026-06-11: v0.9.0 through v0.9.3 implementation is mostly ahead of this
+historical TODO. Automated tests cover Postgres-required live state, migration reporting, Redis
+runtime normalization, Qdrant/Neo4j inspection paths, TUI hardening, bad-heartbeat cleanup, web asset
+packaging, authenticated ASGI web behavior, connector approval/rate/size/audit paths, per-agent model
+selection during managed runs, malformed orchestrator-output degradation, structured subtask creation,
+and propose-only mission-continuation telemetry. Remaining release work is final clean-clone and
+clean-stack validation, any operator-supplied live external-provider smokes, final public-doc review,
+and post-RC MCP/advanced Ops Room work.
 
 ## Goals and PR Candidate Definition
 
@@ -193,14 +193,16 @@ connection milestone.
   Status: implemented as CLI/testable payload wrapper.
 - Add outbound reply support.
   Acceptance: agent response can be sent back to the Telegram conversation.
-  Status: remaining.
+  Status: implemented for approved Telegram users through the bot `sendMessage` path; live smoke
+  still requires operator-supplied Telegram credentials.
 - Add auth and allowlist controls.
   Acceptance: unknown Telegram users are blocked or routed to owner approval by default.
-  Status: initial allowlist blocking implemented; owner approval flow remains.
+  Status: implemented with allowlists, pending external identities, owner approval/rejection commands,
+  and durable audit records.
 - Add tests with sample Telegram payloads.
   Acceptance: no live Telegram network is required for unit tests.
   Status: implemented.
-  Remaining: live disabled-by-default smoke, outbound send stub, size/rate limits, and operator setup doc.
+  Remaining: operator-supplied live disabled-by-default smoke only.
 
 ### Google Chat Wrapper
 
@@ -211,14 +213,17 @@ connection milestone.
   Status: implemented as CLI/testable payload wrapper.
 - Add outbound reply support.
   Acceptance: agent response can be returned to the originating Google Chat space/thread.
-  Status: remaining.
+  Status: documented as inbound-only for RC. Approved senders can receive a threaded webhook response
+  body, but OpenBrigade still does not POST outbound replies to the Google Chat API.
 - Add user identity mapping.
   Acceptance: Google identities map to OpenBrigade users or pending approval records.
-  Status: initial allowlist metadata implemented; durable identity approval flow remains.
+  Status: implemented with allowlists, pending external identities, owner approval/rejection commands,
+  and durable audit records.
 - Add tests with sample Google Chat events.
   Acceptance: no live Google network is required for unit tests.
   Status: implemented.
-  Remaining: live disabled-by-default smoke, outbound send stub, size/rate limits, and operator setup doc.
+  Remaining: operator-supplied live disabled-by-default smoke; real Google Chat API outbound posting
+  remains deferred.
 
 ### OpenAI/Codex Model Connection
 
@@ -227,13 +232,15 @@ connection milestone.
   Status: implemented through LiteLLM `openai` alias and redacted settings.
 - Add OAuth/API-key documentation for the supported first pass.
   Acceptance: setup doc states exactly which auth mode is implemented and which is future work.
-  Status: remaining.
+  Status: implemented in `README.md` and `docs/CONNECTORS_RUNBOOK.md`; hosted browser/device-code
+  login and token refresh remain deferred.
 - Add model route smoke test.
   Acceptance: a configured model can complete a bounded prompt and record usage metadata.
-  Status: remaining for live external route; unit alias tests are implemented.
+  Status: unit alias tests are implemented; live external smoke remains credential-gated.
 - Add failure behavior for missing/invalid credentials.
   Acceptance: missing credentials produce actionable errors and alerts, not tracebacks.
-  Status: remaining.
+  Status: implemented through provider auth errors and documented rollback; live invalid-credential
+  smoke remains credential-gated.
 
 ### Google/Gemini Model Connection
 
@@ -242,10 +249,11 @@ connection milestone.
   Status: implemented through LiteLLM `gemini` alias and redacted settings.
 - Add Gemini route smoke test.
   Acceptance: a configured Gemini model can complete a bounded prompt and record usage metadata.
-  Status: remaining for live external route; unit alias tests are implemented.
+  Status: unit alias tests are implemented; live external smoke remains credential-gated.
 - Add failure behavior for missing/invalid credentials.
   Acceptance: missing credentials produce actionable errors and alerts.
-  Status: remaining.
+  Status: implemented through provider auth errors and documented rollback; live invalid-credential
+  smoke remains credential-gated.
 
 ### External Connection Security
 
@@ -253,12 +261,15 @@ connection milestone.
   Acceptance: secrets live only in `.env`, secret store, or explicitly documented local config.
 - Add connector rate limits and message size limits.
   Acceptance: oversized or repeated inbound messages are rejected or throttled.
+  Status: implemented for live connector routes with audit coverage.
 - Add connector audit records.
   Acceptance: inbound and outbound external events are traceable by provider, user, and conversation.
-  Status: initial inbound audit metadata exists for Telegram and Google Chat; outbound audit remains.
+  Status: implemented for inbound, approval, rejection, rate-limit, size-limit, and Telegram outbound
+  paths; Google Chat API outbound remains deferred.
 - Add connector disable switches.
   Acceptance: each external connection can be disabled without editing code.
-  Status: remaining.
+  Status: implemented for Telegram and Google Chat webhook routes; model-provider rollback is by
+  unsetting API keys or removing local OAuth credentials.
 
 ## v0.9.2 Web UI/UX Overhaul
 
@@ -270,22 +281,22 @@ browser workflow, information architecture, responsive layout, and role-aware in
 
 - Threat-model zero users.
   Acceptance: bootstrap behavior is documented and safe.
-  Status: backend behavior covered by ASGI tests; operator-facing UI state remains.
+  Status: backend behavior covered by ASGI tests; browser UI presents bootstrap/auth state.
 - Threat-model one user and one owner.
   Acceptance: implicit-user behavior cannot accidentally expose write access when auth is required.
-  Status: backend behavior covered by ASGI tests; browser messaging remains.
+  Status: backend behavior covered by ASGI tests; browser UI shows authenticated role and permissions.
 - Threat-model `require_auth=false` on a reachable host.
   Acceptance: web gateway warns loudly or refuses unsafe configuration.
-  Status: backend warning/audit implemented; browser warning banner remains.
+  Status: backend warning/audit implemented; browser warning banner implemented.
 - Threat-model stale, expired, malformed, and CR/LF-bearing bearer tokens.
   Acceptance: all fail cleanly with no route execution.
-  Status: backend malformed/expired token coverage implemented; React expiry handling remains.
+  Status: backend malformed/expired token coverage implemented; React expiry warning implemented.
 
 ### Reliable API Integration Tests
 
 - Replace route-registration-only web tests with running-service tests.
   Acceptance: tests hit a live `brigade_web` process or equivalent reliable ASGI harness.
-  Status: implemented with direct ASGI harness; live auth-enabled smoke remains.
+  Status: implemented with direct ASGI harness; browser smoke supports auth token seeding.
 - Cover `/api/auth/me`.
   Acceptance: valid, missing, malformed, and expired token cases are tested.
 - Cover `/api/auth/token`.
@@ -308,13 +319,14 @@ browser workflow, information architecture, responsive layout, and role-aware in
   Status: implemented by default absence of permissive CORS.
 - Add token expiry handling in the React UI.
   Acceptance: expired token state is visible and does not loop or silently fail.
-  Status: remaining.
+  Status: implemented with visible token-expired/auth warnings.
 - Add role-aware UI behavior.
   Acceptance: observer/operator/owner see appropriate controls and denied actions are clear.
-  Status: remaining.
+  Status: implemented for permission-aware controls and auth-state messaging; keep expanding as new
+  write controls are added.
 - Add web smoke with auth enabled.
   Acceptance: full web workflow passes with `BRIGADE_REQUIRE_AUTH=true`.
-  Status: remaining live validation.
+  Status: smoke tooling supports `BRIGADE_TOKEN`; rerun during final clean-stack gate.
 
 ### Operator UX
 

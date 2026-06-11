@@ -15,9 +15,13 @@ Covers three of your stated concerns:
   ([`brigade/cli.py:2514`](../brigade/cli.py)) enforces that a chief may direct agents on
   its own team; `Team.delegation_policy` defaults to `chief_only`
   ([`brigade/schemas.py:256`](../brigade/schemas.py)).
+- **Structured subtasks:** the `create_subtasks` tool creates multiple queued child
+  assignments with `parent_assignment_id`, optional goal text, dependency links, and the same
+  delegation guard used by `delegate`.
 
 So a chief *can* fan work out to its team, and lineage is tracked via
-`parent_assignment_id`. This satisfies "delegation."
+`parent_assignment_id`. This satisfies "delegation" and gives Crew Chiefs a structured way
+to turn plans into tracked work.
 
 ## Dynamic sub-agent spawning — ❌ missing
 
@@ -37,26 +41,24 @@ Your `delegate` is closest to a *task hand-off*, not a *child-agent spawn*. For 
 acceptable **if positioned as "delegate to a fixed roster."** If the product promise is
 "agents spin up sub-agents," it is a **blocker**.
 
-## Goal/task synthesis for delegation — ⚠️ partial
+## Goal/task synthesis for delegation — ✅ fixed-roster path works
 
 What exists:
 - The orchestrator **synthesizes assignments** from goals/mission for idle agents
   (`build_idle_agent_assignments`) and from stalled goals (`propose-stalled-goals`).
 - A crew chief is handed a *meta-assignment*: "Build the next concrete task plan for the
   current mission and identify which agent should execute each step."
+- The chief can call `create_subtasks` to emit a bounded batch of child assignments.
+  `depends_on_previous` wires ordered dependency chains, and tests cover the dependency-linked
+  child creation path.
 
-What is missing:
-- There is **no structured decomposition primitive**. The chief produces a plan as free
-  text in its transcript; turning that plan into child assignments depends on the chief
-  agent voluntarily emitting `delegate` tool calls. Nothing parses a plan into a task graph,
-  and nothing guarantees the steps become tracked assignments with dependencies.
-- `dependency_ids` exists on `Assignment` and the orchestrator honors it, but **no code
-  path populates dependencies during synthesis** — they can only be set by a human/admin at
-  creation. So synthesized multi-step plans don't get dependency wiring automatically.
+What remains:
+- The chief model must still choose the tool and supply a good task breakdown. OpenBrigade
+  does not yet parse arbitrary prose plans into tasks automatically.
 
-This is the weakest link in the "Crew Chief synthesizes goals and tasks" story: the
-*mechanism to ask* exists; the *mechanism to reliably produce a structured, dependency-
-linked task breakdown* does not.
+This is strong enough for the fixed-roster RC story: the mechanism to ask exists, and the
+mechanism to produce bounded, dependency-linked child work exists. The remaining risk is
+model/tool-use quality, not missing task-graph plumbing.
 
 ## Gap analysis
 
@@ -66,9 +68,9 @@ linked task breakdown* does not.
 | Lineage (`parent_assignment_id`) | ✅ | ✅ | ✅ | ✅ Complete |
 | Chief→team authorization | ✅ | ✅ | ✅ | ✅ Complete |
 | Spawn **new** sub-agent at runtime | ❌ | ✅ | ✅ | ❌ Missing |
-| Recursion guard on delegation | ⚠️ none | ✅ | ✅ | ⚠️ Partial |
-| Structured plan → child tasks | ❌ | ✅ | ✅ (kanban) | ❌ Missing |
-| Auto dependency wiring on synthesis | ❌ | ✅ | ✅ | ❌ Missing |
+| Recursion guard on delegation | ✅ | ✅ | ✅ | ✅ Complete |
+| Structured plan → child tasks | ✅ tool-mediated | ✅ | ✅ (kanban) | ✅ Complete for fixed roster |
+| Auto dependency wiring on synthesis | ✅ via `create_subtasks` | ✅ | ✅ | ✅ Complete for fixed roster |
 
 ## RC assessment
 
@@ -77,12 +79,8 @@ linked task breakdown* does not.
 > delegation across a fixed agent roster.
 
 - **Sub-agent spawning (→ v1.1):** For RC, keep the fixed roster and document it as such.
-  Add the cheap **`delegate` recursion/fan-out guard** (cap depth and children per parent via
-  the `parent_assignment_id` chain) so delegation can't explode. True dynamic spawn lands in
-  v1.1.
-- **Goal/task synthesis:** Recommended pre-RC — add a structured **`decompose`/
-  `create_subtasks` orchestrator action (or chief tool)** that takes a plan and emits N
-  child assignments with `dependency_ids` populated. This converts the current "ask the
-  chief to think" into "the chief produces tracked, ordered work," which is what your design
-  doc (`agent-system-design-v1.3.md`) actually promises. Without it, the delegation story
-  works in a demo but is fragile in practice.
+  The fixed-roster path now has delegation depth/fan-out guardrails. True dynamic spawn lands
+  in v1.1.
+- **Goal/task synthesis:** The pre-RC `create_subtasks` fix has landed for fixed-roster
+  task graphs. Continue improving prompts and demos so chiefs reliably choose the tool and
+  produce useful decomposition.

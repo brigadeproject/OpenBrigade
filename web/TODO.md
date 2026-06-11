@@ -121,20 +121,26 @@
 ### v0.9.1 - External connections
 - Scope: external/non-default integrations only. Local Ollama is internal/default and belongs to v0.9.0 core runtime.
 - Telegram wrapper:
-  - Inbound sample-payload wrapper, allowlist, and tests are implemented.
-  - Remaining: BotFather setup doc, outbound reply stub/live path, owner approval flow, rate/size limits, connector disable switch, and live disabled-by-default smoke.
+  - Inbound sample-payload wrapper, allowlist, owner approval flow, outbound send path, rate/size
+    limits, audit records, disable switch, and tests are implemented.
+  - Remaining: operator-supplied live disabled-by-default smoke with real Telegram credentials.
 - Google Chat wrapper:
-  - Inbound sample-event wrapper, allowlist metadata, and tests are implemented.
-  - Remaining: setup doc, outbound reply stub/live path, durable identity mapping/approval, rate/size limits, connector disable switch, and live disabled-by-default smoke.
+  - Inbound sample-event wrapper, allowlist metadata, durable identity approval, webhook response
+    body, rate/size limits, audit records, disable switch, and tests are implemented.
+  - Remaining: operator-supplied live disabled-by-default smoke; real Google Chat API outbound POST
+    remains deferred and documented as inbound-only for RC.
 - OpenAI/Codex model connection:
-  - LiteLLM `openai` alias and redacted settings are implemented.
-  - Remaining: supported auth-mode doc, missing/invalid credential behavior, bounded live smoke, usage metadata review, and disable switch.
+  - LiteLLM `openai` alias, redacted settings, supported auth-mode docs, and provider auth-error
+    behavior are implemented.
+  - Remaining: operator-supplied bounded live smoke and credential-specific usage review.
 - Google/Gemini model connection:
-  - LiteLLM `gemini` alias and redacted settings are implemented.
-  - Remaining: supported auth-mode doc, missing/invalid credential behavior, bounded live smoke, usage metadata review, and disable switch.
+  - LiteLLM `gemini` alias, redacted settings, supported auth-mode docs, and provider auth-error
+    behavior are implemented.
+  - Remaining: operator-supplied bounded live smoke and credential-specific usage review.
 - External connection security:
   - Keep secrets out of agent workspaces.
-  - Add per-connector rate limits, message size limits, disable switches, and inbound/outbound audit records.
+  - Per-connector rate limits, message size limits, disable switches, and audit records are
+    implemented for current live connector paths.
 
 ### v0.9.2 - Web UI/UX Overhaul
 - Scope: make the web interface useful for daily operation. Backend auth/API safety is now a v0.9.0 core gate and covered by automated ASGI tests.

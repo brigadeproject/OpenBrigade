@@ -10,7 +10,7 @@ but escalate a hard reasoning task to a cloud model, or fall back when a provide
 
 ## What OpenBrigade has
 
-**The ingredients, but not the behavior.**
+**The first behavior is now real; the full self-selection loop is still roadmap.**
 
 - **Per-agent model config exists in the data model:** `Agent.model_provider` /
   `Agent.model_name` ([`brigade/schemas.py:235`](../brigade/schemas.py)).
@@ -22,17 +22,18 @@ but escalate a hard reasoning task to a cloud model, or fall back when a provide
 - **Route typing exists:** providers carry `route_type` (`local` / `cloud`),
   and the runner already treats cloud vs. local differently (cloud single-flight guard,
   local inference lock/cooldown) — [`brigade/runner.py:177`](../brigade/runner.py).
+- **Per-agent model config is honored during managed runs:** `agent run`, `agent run-all`,
+  and `orchestrator daemon` build providers from each agent's configured provider/model when
+  no explicit provider override is supplied. Managed runs also retry a per-agent provider
+  failure with the default provider.
 
 ## The gap
 
-- **The daemon runs every agent through one global provider.**
-  `run_managed_agents(store, provider)` ([`runner.py:73`](../brigade/runner.py)) is called
-  with a single `_provider_from_args(args, settings)`
-  ([`cli.py:1898`](../brigade/cli.py)). The per-agent `model_provider`/`model_name` fields
-  are **stored but never consulted at run time** in the daemon path.
-- **No runtime switch / fallback.** `LiteLLMProvider` does not implement a fallback chain;
-  on auth/availability failure it raises (`_map_litellm_error`) rather than degrading to
-  another model. There is no "this task is hard → escalate model" decision anywhere.
+- **No ordered multi-provider fallback chain.** Managed agent runs fall back from an agent's
+  configured provider to the default provider, but `LiteLLMProvider` does not yet own a
+  configured route list such as `openai -> gemini -> ollama`.
+- **No task-difficulty runtime switch.** There is no "this task is hard -> escalate model"
+  decision anywhere.
 - **No cost-driven routing.** The design doc's **ABACUS** financial agent (the intended
   cost-router that would set `block_cloud_dispatch`) is only partially realized:
   `persist_financial_report` ([`brigade/finance.py`](../brigade/finance.py)) records spend,
@@ -43,10 +44,10 @@ but escalate a hard reasoning task to a cloud model, or fall back when a provide
 
 | Capability | OpenBrigade | OpenClaw | Hermes | proactive set |
 |---|---|---|---|---|
-| Per-agent model config | ✅ (stored only) | ✅ | ✅ | fixed |
-| Honor per-agent model at runtime | ❌ | ✅ | ✅ | n/a |
+| Per-agent model config | ✅ | ✅ | ✅ | fixed |
+| Honor per-agent model at runtime | ✅ managed runs | ✅ | ✅ | n/a |
 | Live model switch mid-session | ❌ | ✅ (`live-model-switch.ts`) | ❌ | ❌ |
-| Automatic fallback chain | ❌ | ✅ (`model-fallback.ts`) | ❌ | ❌ |
+| Automatic fallback chain | ⚠️ default-provider retry | ✅ (`model-fallback.ts`) | ❌ | ❌ |
 | Cost/difficulty-based routing | ❌ | partial | partial (metadata only) | design-doc only (ABACUS) |
 | Model metadata (cost/ctx/caps) | ❌ | ✅ | ✅ (models.dev) | ❌ |
 
@@ -57,21 +58,17 @@ mature competitor, because no competitor fully does it either.
 
 ## RC assessment
 
-⚠️ **Partial → likely a soft blocker**, because today the feature is *latent*: the UI shows
-model options and agents carry a model field, but the daemon ignores both. That mismatch
-will be noticed. Minimum viable closes in two steps, in order of value:
+⚠️ **Partial, no longer a soft blocker.** The UI-visible per-agent model setting is now
+honored during managed runs, so the former latent-feature mismatch is closed. The remaining
+work is richer routing rather than basic correctness:
 
-1. **Honor per-agent models** — make `run_managed_agents` build the provider from each
-   agent's `model_provider`/`model_name` (via `provider_from_settings`) instead of one
-   global provider. This makes the stored config *real* and is a small change. **Do this for
-   RC.**
-2. **Add a fallback chain** in `LiteLLMProvider` (or a wrapping provider): on
+1. **Add an ordered fallback chain** in `LiteLLMProvider` (or a wrapping provider): on
    auth/availability error, try the next configured route. Low effort, high reliability
    payoff.
 
 Defer to post-RC (document as roadmap):
 
-3. **Difficulty/cost-aware routing** — wire ABACUS so the orchestrator can downgrade routine
+2. **Difficulty/cost-aware routing** — wire ABACUS so the orchestrator can downgrade routine
    work to local and reserve cloud for hard/extended tasks, honoring `block_cloud_dispatch`.
    This is the full realization of "self-selection" and matches your design doc, but it is
    not needed to ship a credible RC.

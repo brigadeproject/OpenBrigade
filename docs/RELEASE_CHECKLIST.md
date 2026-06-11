@@ -8,10 +8,14 @@ Use this checklist before publishing a prototype tag or sharing a public snapsho
 - Run unit tests: `python3 -m pytest`
 - Run lint: `python3 -m ruff check .`
 - Compile Python entry points: `python3 -m compileall brigade tests ops/ollama_bridge_proxy.py`
+- Build the web UI: `cd web && npm run build`
 - Validate Compose config: `docker compose --env-file .env.example config`
 - Check migration status: `brigade db status` or `./ops/brigade-live.sh db status`
 - Smoke v0.8 plain interfaces: `brigade chat tui --agent sage --plain` and `brigade settings tui --plain`
 - Smoke the live prototype when available: `./ops/check-recovery.sh`
+- Run authenticated browser smoke when the app profile is up:
+  `BRIGADE_TOKEN=<owner-or-operator-token> ./ops/web-browser-smoke.sh http://127.0.0.1:58080`
+- Reproduce the proactivity demo in `docs/RC_PROACTIVITY_DEMO.md` during the final RC gate.
 
 ## Runtime Safety
 
@@ -30,6 +34,8 @@ Use this checklist before publishing a prototype tag or sharing a public snapsho
 - Review `reference/` usage for license and attribution before copying code.
 - Check for secrets or host-specific paths in docs, examples, and committed config.
 - Keep README and `docs/PROTOTYPE.md` commands aligned with the actual CLI.
+- Keep `reports/TODO-PUNCHLIST.md`, `web/TODO.md`, and `web/TODO-v0_9.md` aligned with
+  current code before tagging.
 - Confirm external connectors follow `docs/CONNECTORS_RUNBOOK.md` and remain disabled by default.
 
 ## v0.5 MVP Smoke
