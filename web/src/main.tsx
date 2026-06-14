@@ -304,6 +304,53 @@ type TaskDialogDraft = {
   agentId?: string;
   assignment?: string;
 };
+type CockpitWidgetId =
+  | "alerts"
+  | "health"
+  | "models"
+  | "mission"
+  | "orchestration"
+  | "tasks"
+  | "orchestrator-chat"
+  | "usage"
+  | "teams"
+  | "selected-agent"
+  | "settings";
+type CockpitWidgetSize = "compact" | "standard" | "wide" | "full";
+type CockpitLayoutItem = {
+  id: CockpitWidgetId;
+  size: CockpitWidgetSize;
+};
+
+const COCKPIT_LAYOUT_KEY = "brigade_cockpit_layout_v1";
+const COCKPIT_WIDGET_TITLES: Record<CockpitWidgetId, string> = {
+  alerts: "Current Alerts",
+  health: "Uptime / Service Health",
+  models: "Models Available",
+  mission: "Current Mission",
+  orchestration: "Orchestration Activity",
+  tasks: "Tasks",
+  "orchestrator-chat": "Orchestrator Chat",
+  usage: "Token Usage / Spend",
+  teams: "Teams",
+  "selected-agent": "Selected Agent",
+  settings: "Settings / Status",
+};
+const DEFAULT_COCKPIT_LAYOUT: CockpitLayoutItem[] = [
+  { id: "alerts", size: "standard" },
+  { id: "health", size: "wide" },
+  { id: "models", size: "standard" },
+  { id: "mission", size: "wide" },
+  { id: "orchestration", size: "wide" },
+  { id: "tasks", size: "wide" },
+  { id: "orchestrator-chat", size: "wide" },
+  { id: "usage", size: "standard" },
+  { id: "teams", size: "standard" },
+  { id: "selected-agent", size: "standard" },
+  { id: "settings", size: "wide" },
+];
+const COCKPIT_WIDGET_IDS = new Set(DEFAULT_COCKPIT_LAYOUT.map((item) => item.id));
+const COCKPIT_WIDGET_SIZES = new Set<CockpitWidgetSize>(["compact", "standard", "wide", "full"]);
 
 class ApiError extends Error {
   status: number;
@@ -321,6 +368,53 @@ function initialView(): "cockpit" | "ops" {
   }
   const saved = localStorage.getItem("brigade_view");
   return saved === "ops" ? "ops" : "cockpit";
+}
+
+function initialCockpitLayout(): CockpitLayoutItem[] {
+  const saved = localStorage.getItem(COCKPIT_LAYOUT_KEY);
+  if (!saved) {
+    return DEFAULT_COCKPIT_LAYOUT;
+  }
+  try {
+    return normalizeCockpitLayout(JSON.parse(saved));
+  } catch {
+    return DEFAULT_COCKPIT_LAYOUT;
+  }
+}
+
+function normalizeCockpitLayout(value: unknown): CockpitLayoutItem[] {
+  if (!Array.isArray(value)) {
+    return DEFAULT_COCKPIT_LAYOUT;
+  }
+  const seen = new Set<CockpitWidgetId>();
+  const layout: CockpitLayoutItem[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const id = (item as { id?: unknown }).id;
+    const size = (item as { size?: unknown }).size;
+    if (
+      typeof id === "string" &&
+      COCKPIT_WIDGET_IDS.has(id as CockpitWidgetId) &&
+      !seen.has(id as CockpitWidgetId)
+    ) {
+      const fallback = DEFAULT_COCKPIT_LAYOUT.find((defaultItem) => defaultItem.id === id);
+      layout.push({
+        id: id as CockpitWidgetId,
+        size: typeof size === "string" && COCKPIT_WIDGET_SIZES.has(size as CockpitWidgetSize)
+          ? (size as CockpitWidgetSize)
+          : fallback?.size || "standard",
+      });
+      seen.add(id as CockpitWidgetId);
+    }
+  }
+  for (const defaultItem of DEFAULT_COCKPIT_LAYOUT) {
+    if (!seen.has(defaultItem.id)) {
+      layout.push(defaultItem);
+    }
+  }
+  return layout;
 }
 
 function App() {
@@ -825,110 +919,157 @@ function CockpitView({
   onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
 }) {
   const selectedAgent = cockpit?.agents.find((agent) => agent.agent_id === selectedAgentId) || null;
+  const [layout, setLayout] = useState<CockpitLayoutItem[]>(() => initialCockpitLayout());
+
+  useEffect(() => {
+    localStorage.setItem(COCKPIT_LAYOUT_KEY, JSON.stringify(layout));
+  }, [layout]);
+
+  function moveWidget(id: CockpitWidgetId, direction: -1 | 1) {
+    setLayout((current) => {
+      const index = current.findIndex((item) => item.id === id);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= current.length) {
+        return current;
+      }
+      const next = [...current];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      return next;
+    });
+  }
+
+  function resizeWidget(id: CockpitWidgetId, size: CockpitWidgetSize) {
+    setLayout((current) => current.map((item) => (item.id === id ? { ...item, size } : item)));
+  }
+
+  const widgetContent: Record<CockpitWidgetId, React.ReactNode> = {
+    alerts: (
+      <AlertList
+        alerts={cockpit?.alerts || []}
+        canClear={can("orchestrator:write")}
+        api={api}
+        onDone={onRefresh}
+        setStatus={setStatus}
+      />
+    ),
+    health: (
+      <div className="two-column-widget">
+        <div>
+          <div className="stat-large">{formatDuration(cockpit?.uptime_seconds || 0)}</div>
+          <p className="muted">Started {formatTime(cockpit?.started_at)}</p>
+        </div>
+        <HealthList checks={cockpit?.datastores || []} />
+      </div>
+    ),
+    models: (
+      <ModelSummary
+        cockpit={cockpit}
+        models={models}
+        canEdit={can("admin")}
+        api={api}
+        onModelsChange={onModelsChange}
+        onSettingsChange={onSettingsChange}
+        onDone={onRefresh}
+        setStatus={setStatus}
+      />
+    ),
+    mission: (
+      <MissionWidget
+        mission={cockpit?.mission || null}
+        latestReasoning={cockpit?.latest_reasoning || null}
+        canEdit={can("mission:write")}
+        api={api}
+        onDone={onRefresh}
+        setStatus={setStatus}
+      />
+    ),
+    orchestration: <OrchestrationActivity telemetry={cockpit?.orchestration || null} />,
+    tasks: (
+      <TaskBoard
+        tasks={cockpit?.tasks || null}
+        agents={cockpit?.agents || []}
+        canCreate={can("task:write")}
+        onOpenTaskDialog={onOpenTaskDialog}
+        onSelectAgent={(agentId) => onSelectAgent(agentId, "tasks")}
+      />
+    ),
+    "orchestrator-chat": (
+      <OrchestratorChat
+        canChat={can("chat:write")}
+        api={api}
+        inventory={models}
+        route={orchestratorModel}
+        onRouteChange={onOrchestratorModelChange}
+        setStatus={setStatus}
+      />
+    ),
+    usage: <UsageSummary usage={cockpit?.usage || null} />,
+    teams: (
+      <TeamBoard
+        teams={cockpit?.teams || []}
+        agents={cockpit?.agents || []}
+        canEdit={can("team:write")}
+        api={api}
+        onDone={onRefresh}
+        setStatus={setStatus}
+      />
+    ),
+    "selected-agent": (
+      <>
+        <AgentInspector agent={selectedAgent} teams={cockpit?.teams || []} />
+        {selectedAgent && (
+          <>
+            <ModelSelect
+              label="Agent model"
+              inventory={models}
+              route={selectedAgentModel}
+              onChange={onSelectedAgentModelChange}
+            />
+            <div className="button-row">
+              <button onClick={() => onSelectAgent(selectedAgent.agent_id, "chat")}>Chat</button>
+              <button onClick={() => onSelectAgent(selectedAgent.agent_id, "tasks")}>Tasks</button>
+            </div>
+          </>
+        )}
+      </>
+    ),
+    settings: (
+      <SettingsStatus
+        settings={settings}
+        cockpit={cockpit}
+        auth={auth}
+        authMessage={authMessage}
+        tokenExpired={tokenExpired}
+      />
+    ),
+  };
+
   return (
     <section className="cockpit">
+      <div className="cockpit-toolbar">
+        <div>
+          <strong>Cockpit Layout</strong>
+          <span>Pane order and size are saved in this browser.</span>
+        </div>
+        <button onClick={() => setLayout(DEFAULT_COCKPIT_LAYOUT.map((item) => ({ ...item })))}>
+          Reset layout
+        </button>
+      </div>
       <div className="widget-grid">
-        <Widget title="Current Alerts">
-          <AlertList
-            alerts={cockpit?.alerts || []}
-            canClear={can("orchestrator:write")}
-            api={api}
-            onDone={onRefresh}
-            setStatus={setStatus}
-          />
-        </Widget>
-        <Widget title="Uptime / Service Health" className="health-combo">
-          <div className="two-column-widget">
-            <div>
-              <div className="stat-large">{formatDuration(cockpit?.uptime_seconds || 0)}</div>
-              <p className="muted">Started {formatTime(cockpit?.started_at)}</p>
-            </div>
-            <HealthList checks={cockpit?.datastores || []} />
-          </div>
-        </Widget>
-        <Widget title="Models Available">
-          <ModelSummary
-            cockpit={cockpit}
-            models={models}
-            canEdit={can("admin")}
-            api={api}
-            onModelsChange={onModelsChange}
-            onSettingsChange={onSettingsChange}
-            onDone={onRefresh}
-            setStatus={setStatus}
-          />
-        </Widget>
-        <Widget title="Current Mission" wide>
-          <MissionWidget
-            mission={cockpit?.mission || null}
-            latestReasoning={cockpit?.latest_reasoning || null}
-            canEdit={can("mission:write")}
-            api={api}
-            onDone={onRefresh}
-            setStatus={setStatus}
-          />
-        </Widget>
-        <Widget title="Orchestration Activity" wide>
-          <OrchestrationActivity telemetry={cockpit?.orchestration || null} />
-        </Widget>
-        <Widget title="Tasks" wide>
-          <TaskBoard
-            tasks={cockpit?.tasks || null}
-            agents={cockpit?.agents || []}
-            canCreate={can("task:write")}
-            onOpenTaskDialog={onOpenTaskDialog}
-            onSelectAgent={(agentId) => onSelectAgent(agentId, "tasks")}
-          />
-        </Widget>
-        <Widget title="Orchestrator Chat" wide>
-          <OrchestratorChat
-            canChat={can("chat:write")}
-            api={api}
-            inventory={models}
-            route={orchestratorModel}
-            onRouteChange={onOrchestratorModelChange}
-            setStatus={setStatus}
-          />
-        </Widget>
-        <Widget title="Token Usage / Spend">
-          <UsageSummary usage={cockpit?.usage || null} />
-        </Widget>
-        <Widget title="Teams">
-          <TeamBoard
-            teams={cockpit?.teams || []}
-            agents={cockpit?.agents || []}
-            canEdit={can("team:write")}
-            api={api}
-            onDone={onRefresh}
-            setStatus={setStatus}
-          />
-        </Widget>
-        <Widget title="Selected Agent">
-          <AgentInspector agent={selectedAgent} teams={cockpit?.teams || []} />
-          {selectedAgent && (
-            <>
-              <ModelSelect
-                label="Agent model"
-                inventory={models}
-                route={selectedAgentModel}
-                onChange={onSelectedAgentModelChange}
-              />
-              <div className="button-row">
-                <button onClick={() => onSelectAgent(selectedAgent.agent_id, "chat")}>Chat</button>
-                <button onClick={() => onSelectAgent(selectedAgent.agent_id, "tasks")}>Tasks</button>
-              </div>
-            </>
-          )}
-        </Widget>
-        <Widget title="Settings / Status" wide>
-          <SettingsStatus
-            settings={settings}
-            cockpit={cockpit}
-            auth={auth}
-            authMessage={authMessage}
-            tokenExpired={tokenExpired}
-          />
-        </Widget>
+        {layout.map((item, index) => (
+          <Widget
+            key={item.id}
+            title={COCKPIT_WIDGET_TITLES[item.id]}
+            size={item.size}
+            canMoveUp={index > 0}
+            canMoveDown={index < layout.length - 1}
+            onMoveUp={() => moveWidget(item.id, -1)}
+            onMoveDown={() => moveWidget(item.id, 1)}
+            onResize={(size) => resizeWidget(item.id, size)}
+          >
+            {widgetContent[item.id]}
+          </Widget>
+        ))}
       </div>
     </section>
   );
@@ -936,18 +1077,48 @@ function CockpitView({
 
 function Widget({
   title,
-  wide = false,
-  className = "",
+  size = "standard",
+  canMoveUp = false,
+  canMoveDown = false,
+  onMoveUp,
+  onMoveDown,
+  onResize,
   children,
 }: {
   title: string;
-  wide?: boolean;
-  className?: string;
+  size?: CockpitWidgetSize;
+  canMoveUp?: boolean;
+  canMoveDown?: boolean;
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
+  onResize?: (size: CockpitWidgetSize) => void;
   children: React.ReactNode;
 }) {
   return (
-    <article className={`widget ${wide ? "wide" : ""} ${className}`}>
-      <h2>{title}</h2>
+    <article className={`widget widget-${size}`}>
+      <div className="widget-chrome">
+        <h2>{title}</h2>
+        {onResize && (
+          <div className="widget-controls" aria-label={`${title} layout controls`}>
+            <button disabled={!canMoveUp} onClick={onMoveUp} title="Move pane earlier">
+              Up
+            </button>
+            <button disabled={!canMoveDown} onClick={onMoveDown} title="Move pane later">
+              Down
+            </button>
+            <select
+              aria-label={`${title} pane size`}
+              value={size}
+              onChange={(event) => onResize(event.target.value as CockpitWidgetSize)}
+            >
+              <option value="compact">Compact</option>
+              <option value="standard">Standard</option>
+              <option value="wide">Wide</option>
+              <option value="full">Full</option>
+            </select>
+          </div>
+        )}
+      </div>
       {children}
     </article>
   );
@@ -1659,21 +1830,14 @@ function OrchestratorChat({
       />
       <div className="chat-feed" ref={feedRef}>
         {messages.slice(-8).map((item) => (
-          <article key={item.message_id} className="message-row">
-            <span>
-              {item.sender} -&gt; {item.recipient} / {formatTime(item.created_at)}
-            </span>
-            {item.sender === "orchestrator" ? (
-              <div
-                className="message-markdown"
-                dangerouslySetInnerHTML={{
-                  __html: responseHtmlById[item.message_id] || renderMarkdownHtml(item.content),
-                }}
-              />
-            ) : (
-              <p>{item.content}</p>
-            )}
-          </article>
+          <ChatMessageRow
+            key={item.message_id}
+            message={item}
+            html={item.sender === "orchestrator"
+              ? responseHtmlById[item.message_id] || renderMarkdownHtml(item.content)
+              : undefined}
+            perspective="orchestrator"
+          />
         ))}
         {messages.length === 0 && <p className="muted">No orchestrator messages.</p>}
       </div>
@@ -1697,6 +1861,44 @@ function OrchestratorChat({
         action="orchestrator chat is disabled"
       />
     </div>
+  );
+}
+
+function ChatMessageRow({
+  message,
+  html,
+  perspective,
+}: {
+  message: Message;
+  html?: string;
+  perspective: string;
+}) {
+  const authoredHere = message.sender === perspective;
+  const fromOrchestrator = message.sender === "orchestrator";
+  const displayName = fromOrchestrator ? "Orchestrator" : message.sender;
+  return (
+    <article className={`message-row ${authoredHere ? "from-selected" : "to-selected"}`}>
+      <div className="message-avatar" aria-hidden="true">
+        {displayName.slice(0, 1).toUpperCase()}
+      </div>
+      <div className="message-bubble">
+        <div className="message-meta">
+          <strong>{displayName}</strong>
+          <span>{message.sender} -&gt; {message.recipient}</span>
+          <time dateTime={message.created_at}>{formatTime(message.created_at)}</time>
+        </div>
+        {html ? (
+          <div
+            className="message-markdown"
+            dangerouslySetInnerHTML={{
+              __html: html,
+            }}
+          />
+        ) : (
+          <p>{message.content}</p>
+        )}
+      </div>
+    </article>
   );
 }
 
@@ -2084,12 +2286,7 @@ function AgentChatPanel({
       <p className="model-route-note">Agent model: {routeLabel}</p>
       <div className="chat-feed" ref={feedRef}>
         {messages.slice(-12).map((item) => (
-          <article key={item.message_id} className="message-row">
-            <span>
-              {item.sender} -&gt; {item.recipient} / {formatTime(item.created_at)}
-            </span>
-            <p>{item.content}</p>
-          </article>
+          <ChatMessageRow key={item.message_id} message={item} perspective={selectedAgentId} />
         ))}
         {messages.length === 0 && <p className="muted">No messages for this agent.</p>}
       </div>
