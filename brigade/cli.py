@@ -37,7 +37,8 @@ from brigade.db import (
     load_migrations,
     migration_status,
 )
-from brigade.finance import build_model_routing_decision, persist_financial_report
+from brigade.export import export_training_data
+from brigade.finance import build_model_routing_decision
 from brigade.health import HealthCheck, check_configured_datastores
 from brigade.knowledge import ingest_local_document
 from brigade.logging import configure_json_logging
@@ -47,17 +48,12 @@ from brigade.memory import (
     curate_workspace_memory,
 )
 from brigade.orchestrator import (
-    CycleResult,
+    FullCycleResult,
+    OrchestrationConfig,
     ProactiveContinuationConfig,
-    build_cycle_reasoning_record,
-    derive_agent_states,
-    deterministic_cycle,
-    evaluate_mission_continuation,
-    evaluate_orchestrator_floor,
     orchestration_event,
-    run_orchestrator_escalation,
+    run_full_cycle,
 )
-from brigade.prompt_floors import build_orchestrator_floor
 from brigade.providers import (
     LiteLLMProvider,
     ModelProvider,
@@ -75,11 +71,15 @@ from brigade.runner import (
     run_managed_agents,
 )
 from brigade.schemas import (
+    PROPOSAL_KINDS,
+    PROPOSAL_STATUSES,
     Agent,
     Assignment,
+    AssignmentKind,
     AssignmentStatus,
     ChatMessage,
     Goal,
+    GoalEngagementMode,
     Mission,
     Priority,
     Role,
@@ -96,6 +96,7 @@ from brigade.secrets import (
 from brigade.services import (
     build_chat_payload,
     build_settings_payload,
+    decide_proposal,
     send_user_chat,
     set_config_value,
 )
@@ -286,6 +287,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Default model name for this agent. Default: resolved settings model.",
     )
+    agent_onboard.add_argument(
+        "--specialty",
+        dest="specialties",
+        action="append",
+        default=[],
+        help="Specialty tag for routing hints. Repeat for multiple. Empty means generalist.",
+    )
     agent_validate = agent_sub.add_parser(
         "validate",
         help="Validate one agent workspace manifest.",
@@ -408,8 +416,55 @@ def build_parser() -> argparse.ArgumentParser:
     goal_add.add_argument("--not", dest="explicitly_not", action="append", required=True)
     goal_add.add_argument("--set-by", default="human", help="Who set the goal. Default: human.")
     goal_add.add_argument("--human-confirmed", action="store_true")
+    goal_add.add_argument(
+        "--engagement-mode",
+        choices=[item.value for item in GoalEngagementMode],
+        default=GoalEngagementMode.DIRECTIVE.value,
+        help="directive teams work continuously; on_call teams activate on routed work.",
+    )
     goal_list = goal_sub.add_parser("list")
     goal_list.add_argument("--agent", default=None)
+
+    export = subcommands.add_parser(
+        "export",
+        help="Export accumulated history as training data.",
+    )
+    export_sub = export.add_subparsers(dest="export_command", required=True)
+    export_training = export_sub.add_parser(
+        "training-data",
+        help="Write cycles, assignments, transcripts, usage, episodes, and "
+        "proposals as JSONL plus a manifest.",
+    )
+    export_training.add_argument("--out", required=True, help="Output directory.")
+    export_training.add_argument(
+        "--since",
+        default=None,
+        help="Optional UTC ISO timestamp; only newer records are exported.",
+    )
+
+    proposal = subcommands.add_parser(
+        "proposal",
+        help="List and decide pending proposals (efficiency, tool requests, rest insights).",
+    )
+    proposal_sub = proposal.add_subparsers(dest="proposal_command", required=True)
+    proposal_list = proposal_sub.add_parser("list", help="List proposals.")
+    proposal_list.add_argument(
+        "--kind",
+        choices=sorted(PROPOSAL_KINDS),
+        default=None,
+        help="Optional proposal kind filter.",
+    )
+    proposal_list.add_argument(
+        "--status",
+        choices=sorted(PROPOSAL_STATUSES),
+        default=None,
+        help="Optional proposal status filter.",
+    )
+    proposal_approve = proposal_sub.add_parser("approve", help="Approve one proposal.")
+    proposal_approve.add_argument("proposal_id", help="Proposal id to approve.")
+    proposal_reject = proposal_sub.add_parser("reject", help="Reject one proposal.")
+    proposal_reject.add_argument("proposal_id", help="Proposal id to reject.")
+    proposal_reject.add_argument("--reason", default=None, help="Optional rejection reason.")
 
     task = subcommands.add_parser(
         "task",
@@ -444,6 +499,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[item.value for item in WorkMode],
         default=WorkMode.HEARTBEAT.value,
         help="Execution mode for the agent. Default: heartbeat.",
+    )
+    create.add_argument(
+        "--kind",
+        choices=[item.value for item in AssignmentKind],
+        default=AssignmentKind.MISSION.value,
+        help="Assignment kind. Default: mission.",
     )
     create.add_argument(
         "--estimated-cycles",
@@ -1290,6 +1351,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             team_id=args.team,
             model_provider=args.provider or settings.default_provider,
             model_name=args.model or settings.default_model,
+            specialties=[item.strip() for item in args.specialties if item.strip()],
         )
         store.add_agent(agent)
         ensure_agent_workspace(agent, settings.data_dir)
@@ -1520,6 +1582,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             explicitly_not=args.explicitly_not,
             set_by=args.set_by,
             human_confirmed=args.human_confirmed,
+            engagement_mode=args.engagement_mode,
         )
         store.add_goal(args.agent, goal)
         print(json.dumps(goal.to_dict(), indent=2, sort_keys=True))
@@ -1532,6 +1595,40 @@ def _main(argv: Sequence[str] | None = None) -> int:
             for key, values in store.goals(args.agent).items()
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "export" and args.export_command == "training-data":
+        _require_permission(store, settings, actor, "export:read")
+        manifest = export_training_data(
+            store,
+            out_dir=Path(args.out),
+            since=args.since,
+        )
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "proposal" and args.proposal_command == "list":
+        _require_permission(store, settings, actor, "proposal:read")
+        print(
+            json.dumps(
+                store.proposals(kind=args.kind, status=args.status),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "proposal" and args.proposal_command in {"approve", "reject"}:
+        current_user = _require_permission(store, settings, actor, "proposal:write")
+        decision = "approved" if args.proposal_command == "approve" else "rejected"
+        result = decide_proposal(
+            store,
+            proposal_id=args.proposal_id,
+            decision=decision,
+            decided_by=current_user.username if current_user else "anonymous",
+            reason=getattr(args, "reason", None),
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
         return 0
 
     if args.command == "task" and args.task_command == "create":
@@ -1550,6 +1647,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             source=args.source,
             priority=Priority(args.priority),
             work_mode=WorkMode(args.work_mode),
+            kind=AssignmentKind(args.kind),
             estimated_cycles=args.estimated_cycles,
             dependency_ids=args.depends_on,
             goal_statement=args.goal_statement,
@@ -1902,10 +2000,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "orchestrator" and args.orchestrator_command == "cycle":
         _require_permission(store, settings, actor, "orchestrator:write")
-        result = _run_cycle(
+        result = run_full_cycle(
             store,
-            stale_work_seconds=settings.stale_work_seconds,
-            proactive_config=_proactive_config_from_settings(settings),
+            config=OrchestrationConfig.from_settings(settings),
         )
         print(
             json.dumps(
@@ -1913,6 +2010,8 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     "assigned": [item.assignment_id for item in result.assigned],
                     "skipped": [item.assignment_id for item in result.skipped],
                     "alerts": result.alerts,
+                    "cycle_outcome": result.outcome.to_dict(),
+                    "sub_results": result.sub_results,
                 },
                 indent=2,
                 sort_keys=True,
@@ -1939,11 +2038,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
         provider = _provider_from_args(args, settings)
         provider_factory = _managed_agent_provider_factory(args, settings, store)
         while max_cycles is None or completed < max_cycles:
-            _run_cycle(
+            run_full_cycle(
                 store,
                 provider=provider,
-                stale_work_seconds=settings.stale_work_seconds,
-                proactive_config=_proactive_config_from_settings(settings),
+                config=OrchestrationConfig.from_settings(settings),
             )
             if not args.no_run_agents:
                 agent_results.extend(
@@ -3631,74 +3729,19 @@ def _run_cycle(
     *,
     stale_work_seconds: int = 86_400,
     proactive_config: ProactiveContinuationConfig | None = None,
-) -> CycleResult:
-    evaluate_mission_continuation(store, proactive_config or ProactiveContinuationConfig())
-    floor = build_orchestrator_floor(store, stale_seconds=stale_work_seconds)
-    floor_triggers = evaluate_orchestrator_floor(
-        store,
-        floor,
-        stale_seconds=stale_work_seconds,
-    )
-    escalation = None
-    if provider is not None and floor_triggers:
-        try:
-            escalation = run_orchestrator_escalation(
-                store,
-                provider,
-                floor=floor,
-                triggers=floor_triggers,
-                stale_seconds=stale_work_seconds,
-            )
-        except Exception as exc:
-            message = f"orchestrator escalation failed: {exc}"
-            store.add_alert(message)
-            escalation = {
-                "status": "failed",
-                "summary": message,
-                "triggers": floor_triggers,
-                "actions_applied": [],
-                "actions_rejected": [],
-            }
-
-    assignments = store.assignments()
-    original_assignments = {
-        item.assignment_id: {
-            "status": item.status.value,
-            "updated_at": item.updated_at,
-        }
-        for item in assignments
-    }
-    agents = store.agents()
-    existing_states = store.agent_states()
-    result = deterministic_cycle(
-        assignments,
-        agents=agents,
-        goals_by_agent=store.goals(),
-        workspace_root=store.data_dir,
-        assignment_history=store.assignment_history(),
-    )
-    _persist_cycle_assignments(store, assignments, result, original_assignments)
-    agent_states = derive_agent_states(agents, assignments, existing=existing_states)
-    for state in agent_states.values():
-        store.upsert_agent_state(state)
-    previous_reasoning = store.orchestrator_reasoning()
-    reasoning = build_cycle_reasoning_record(
-        mission_statement=store.mission().statement if store.mission() else None,
-        assignments=assignments,
-        result=result,
-        agent_states=agent_states,
-        previous_reasoning_id=(
-            previous_reasoning[-1]["reasoning_id"] if previous_reasoning else None
-        ),
-        floor=floor,
-        floor_triggers=floor_triggers,
-        escalation=escalation,
-    )
-    store.add_orchestrator_reasoning(reasoning)
-    for alert in result.alerts:
-        store.add_alert(alert)
-    persist_financial_report(store, store.data_dir)
-    return result
+    orchestration_config: OrchestrationConfig | None = None,
+) -> FullCycleResult:
+    config = orchestration_config
+    if config is None:
+        proactive = proactive_config or ProactiveContinuationConfig()
+        config = OrchestrationConfig(
+            stale_work_seconds=stale_work_seconds,
+            proactive_mode=proactive.mode,
+            proactive_creation_enabled=proactive.creation_enabled,
+            max_proactive_proposals_per_cycle=proactive.max_proposals_per_cycle,
+            max_proactive_creations_per_cycle=proactive.max_creations_per_cycle,
+        )
+    return run_full_cycle(store, provider=provider, config=config)
 
 
 def _proactive_config_from_settings(settings: Settings) -> ProactiveContinuationConfig:
@@ -3708,30 +3751,6 @@ def _proactive_config_from_settings(settings: Settings) -> ProactiveContinuation
         max_proposals_per_cycle=settings.max_proactive_proposals_per_cycle,
         max_creations_per_cycle=settings.max_proactive_creations_per_cycle,
     )
-
-
-def _persist_cycle_assignments(
-    store: StateStore,
-    assignments: list[Assignment],
-    result: CycleResult,
-    original_assignments: dict[str, dict[str, str]],
-) -> None:
-    mutated_ids = {item.assignment_id for item in [*result.assigned, *result.skipped]}
-    for assignment in assignments:
-        if assignment.assignment_id not in mutated_ids:
-            continue
-        current = store.find_assignment(assignment.assignment_id)
-        if current is None:
-            continue
-        original = original_assignments.get(assignment.assignment_id)
-        if original is None:
-            continue
-        if (
-            current.status.value != original["status"]
-            or current.updated_at != original["updated_at"]
-        ):
-            continue
-        store.update_assignment(assignment)
 
 
 def _workspace_for_agent(store: StateStore, data_dir: Path, agent_id: str) -> Path:

@@ -18,6 +18,7 @@ from brigade.time import add_seconds_iso, utc_now_iso
 from brigade.tools import ToolContext, default_tool_registry
 from brigade.workspace import (
     ASSIGNMENT_MARKER,
+    parse_heartbeat_assignment_block,
     read_heartbeat_assignment,
     write_heartbeat_assignment,
 )
@@ -903,7 +904,7 @@ def test_ingest_local_document_builds_chunks_episode_and_provenance(tmp_path):
     assert any(record["node_type"] == "chunk" for record in provenance)
 
 
-def test_write_heartbeat_assignment_replaces_last_parseable_block_only(tmp_path):
+def test_write_heartbeat_assignment_scrubs_malformed_blocks(tmp_path):
     agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
     first = Assignment(
         assignment="First",
@@ -929,4 +930,71 @@ def test_write_heartbeat_assignment_replaces_last_parseable_block_only(tmp_path)
 
     text = heartbeat.read_text(encoding="utf-8")
     assert "Notes above replacement." in text
+    # The malformed block must be scrubbed, not left stranded alongside the new one.
+    assert text.count(ASSIGNMENT_MARKER) == 1
+    assert "broken" not in text
     assert read_heartbeat_assignment(heartbeat).assignment == "Second"
+
+
+def test_write_heartbeat_assignment_scrubs_truncated_block(tmp_path):
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    assignment = Assignment(
+        assignment="Recovered",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+    )
+    heartbeat = write_heartbeat_assignment(agent, assignment, tmp_path)
+    # A truncated block (marker with no closing fence) has no parseable content
+    # and would survive a naive parse-and-replace repair.
+    heartbeat.write_text(
+        heartbeat.read_text(encoding="utf-8")
+        + f'\nTrailing operator note.\n\n{ASSIGNMENT_MARKER}\n{{"assignment": "truncated"\n',
+        encoding="utf-8",
+    )
+
+    write_heartbeat_assignment(agent, assignment, tmp_path)
+
+    text = heartbeat.read_text(encoding="utf-8")
+    assert "Trailing operator note." in text
+    assert text.count(ASSIGNMENT_MARKER) == 1
+    assert "truncated" not in text
+    # Exactly one well-formed block remains, so strict parsing succeeds.
+    assert parse_heartbeat_assignment_block(text).assignment.assignment == "Recovered"
+
+
+def test_stale_heartbeat_block_recovers_to_single_clean_block(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    assignment = Assignment(
+        assignment="Stored assignment",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+    )
+    stale = Assignment(
+        assignment="Stale heartbeat assignment",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+    )
+    assignment.transition_to(AssignmentStatus.ASSIGNED)
+    stale.transition_to(AssignmentStatus.ASSIGNED)
+    store.add_agent(agent)
+    store.add_assignment(assignment)
+    heartbeat = write_heartbeat_assignment(agent, stale, tmp_path)
+
+    # The stale block points at an assignment_id the store does not consider
+    # active, so the run blocks without touching the heartbeat.
+    result = run_agent_once("sage", store, CompleteProvider())
+    assert result.status == AssignmentStatus.BLOCKED.value
+    assert "does not match the active stored assignment" in result.summary
+
+    # Recovery: write the genuine active assignment back. The stale block must be
+    # replaced, not appended around, leaving one clean parseable block.
+    write_heartbeat_assignment(agent, assignment, tmp_path)
+    text = heartbeat.read_text(encoding="utf-8")
+    assert text.count(ASSIGNMENT_MARKER) == 1
+    recovered = parse_heartbeat_assignment_block(text, expected_agent_id="sage").assignment
+    assert recovered.assignment_id == assignment.assignment_id
+    assert recovered.assignment == "Stored assignment"

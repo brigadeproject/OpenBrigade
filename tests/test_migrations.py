@@ -44,3 +44,21 @@ def test_assignment_idempotency_migration_exists():
 
     assert "brigade_assignments_idempotency_key_unique_idx" in sql
     assert "where idempotency_key is not null" in sql
+
+
+def test_orchestration_contract_migration_exists():
+    sql = Path("migrations/0010_orchestration_contract.sql").read_text(encoding="utf-8")
+
+    assert "add column if not exists kind text not null default 'mission'" in sql
+    assert "brigade_assignments_kind_idx" in sql
+    assert "add column if not exists engagement_mode text not null default 'directive'" in sql
+    assert "add column if not exists specialties jsonb not null default '[]'::jsonb" in sql
+
+
+def test_proposals_and_recurrences_migration_exists():
+    sql = Path("migrations/0011_proposals_and_recurrences.sql").read_text(encoding="utf-8")
+
+    assert "create table if not exists brigade_proposals" in sql
+    assert "create table if not exists brigade_recurrences" in sql
+    assert "brigade_proposals_idempotency_key_unique_idx" in sql
+    assert "next_due_at timestamptz not null" in sql

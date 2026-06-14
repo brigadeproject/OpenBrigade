@@ -228,6 +228,7 @@ def process_live_connector_message(
                 content=incoming.text,
                 username=username,
                 provider=incoming.provider,
+                store=store,
             )
         )
     except RuntimeError as exc:
@@ -794,17 +795,30 @@ def _external_chat_prompt(
     content: str,
     username: str,
     provider: str,
+    store: StateStore | None = None,
 ) -> str:
-    return "\n".join(
-        [
-            f"You are {display_name} ({agent_id}).",
-            f"User {username} is chatting with you through {provider}.",
-            "Answer directly and concisely. If you need action, state the next concrete step.",
-            "",
-            "Message:",
-            content,
-        ]
-    )
+    from brigade.prompt_floors import build_chat_status_context
+
+    lines = [
+        f"You are {display_name} ({agent_id}).",
+        f"User {username} is chatting with you through {provider}.",
+        "Answer directly and concisely. If you need action, state the next concrete step.",
+    ]
+    if store is not None:
+        lines.extend(
+            [
+                "",
+                "Live status context (ground answers about current work, "
+                "priorities, and blockers in this, not memory):",
+                json.dumps(
+                    build_chat_status_context(store, agent_id),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ]
+        )
+    lines.extend(["", "Message:", content])
+    return "\n".join(lines)
 
 
 def _summarize(value: str) -> str:

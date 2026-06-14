@@ -369,10 +369,17 @@ browser workflow, information architecture, responsive layout, and role-aware in
   `web/public` pixel assets.
 - Start from empty volumes.
   Acceptance: clean stack starts without requiring old prototype state.
+  Status: passed 2026-06-14 via `./ops/full-wipe.sh --confirm-full-wipe` — `empty_userland: true`,
+  all userland counts zero, mission empty, all four datastores reachable.
 - Run migrations and first-user setup.
   Acceptance: first owner/operator can be created and issued a token.
+  Status: passed 2026-06-14 — 11/11 migrations applied on the blank DB; `auth issue` created the
+  first owner and issued a JWT that `auth verify` accepts.
 - Onboard a fresh agent/team structure.
   Acceptance: blank agents, teams, Crew Chiefs, goals, and route/delegate/escalate flows work.
+  Status: passed 2026-06-14 — created two agents, a team with a Crew Chief + member, a mission and
+  a human-confirmed goal, then exercised `team delegate` (chief→worker) and `team route-work`
+  (chief_only policy) on the empty stack; stack re-wiped to blank afterward.
 - Run baseline commands.
   Acceptance: tests, lint, compile, health, migration status, dashboard, TUI, web, stress, heartbeat, and recovery checks pass.
   Status: tests/lint/frontend build/Compose config/Docker build/live health/db status/web smoke/bad

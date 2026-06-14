@@ -8,7 +8,7 @@ import pytest
 from brigade.cli import _chat_tui_provider_from_args, _live_chat_tui_command, _run_cycle, main
 from brigade.config import Settings
 from brigade.orchestrator import CycleResult
-from brigade.schemas import Agent, Assignment, AssignmentStatus, Goal
+from brigade.schemas import Agent, Assignment, AssignmentStatus, Goal, Mission
 from brigade.state import JsonStateStore
 from brigade.workspace import write_heartbeat_assignment
 from tests.helpers import TestProvider
@@ -26,6 +26,10 @@ def test_cli_config_show(tmp_path, monkeypatch, capsys):
 def test_cli_task_create_and_cycle(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
 
+    # v1.0 cycle contract: a cycle without a mission records no_mission and
+    # stops, so dispatch tests must set one first.
+    assert main(["mission", "set", "--statement", "Prototype mission"]) == 0
+    capsys.readouterr()
     assert (
         main(
             [
@@ -62,6 +66,7 @@ def test_cli_task_create_and_cycle(tmp_path, monkeypatch, capsys):
     assert main(["orchestrator", "cycle"]) == 0
     cycle = json.loads(capsys.readouterr().out)
     assert cycle["assigned"] == [created["assignment_id"]]
+    assert cycle["cycle_outcome"]["mode"] == "worked"
 
     assert main(["status", "--json"]) == 0
     status = json.loads(capsys.readouterr().out)
@@ -1096,6 +1101,9 @@ def test_cli_daemon_runs_assigned_agents_by_default(tmp_path, monkeypatch, capsy
         "brigade.cli.provider_from_settings",
         lambda *args, **kwargs: TestProvider(),
     )
+    # v1.0 cycle contract: dispatch requires a mission (no_mission stops the cycle).
+    assert main(["mission", "set", "--statement", "Prototype mission"]) == 0
+    capsys.readouterr()
     assert (
         main(["agent", "add", "--id", "sage", "--name", "SAGE", "--workspace", "workspace-sage"])
         == 0
@@ -1338,6 +1346,9 @@ def test_cli_init_mvp_rejects_second_run_without_force(tmp_path, monkeypatch, ca
 
 def test_run_cycle_does_not_reinsert_assignment_completed_concurrently(tmp_path, monkeypatch):
     store = JsonStateStore(tmp_path / "state.json")
+    # v1.0 cycle contract: the cycle needs a mission to reach dispatch at all;
+    # the concurrent-completion guard under test is unchanged.
+    store.set_mission(Mission("Prototype mission", [], []))
     agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
     assignment = Assignment(
         assignment="Concurrent completion",
@@ -1357,7 +1368,7 @@ def test_run_cycle_does_not_reinsert_assignment_completed_concurrently(tmp_path,
         store.archive_assignment(current, executive_summary="finished elsewhere")
         return CycleResult(assigned=[], skipped=[], alerts=[])
 
-    monkeypatch.setattr("brigade.cli.deterministic_cycle", stub_cycle)
+    monkeypatch.setattr("brigade.orchestrator.deterministic_cycle", stub_cycle)
 
     _run_cycle(store)
 

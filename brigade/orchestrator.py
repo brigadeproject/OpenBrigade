@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from brigade.config import Settings
+from brigade.finance import persist_financial_report
 from brigade.meta import evaluate_assignment_alignment
 from brigade.prompt_floors import (
     DEFAULT_STALE_WORK_SECONDS,
@@ -21,8 +23,10 @@ from brigade.schemas import (
     Agent,
     AgentState,
     Assignment,
+    AssignmentKind,
     AssignmentStatus,
     Goal,
+    GoalEngagementMode,
     Priority,
     WorkMode,
 )
@@ -39,8 +43,32 @@ PRIORITY_RANK = {
 LOGGER = logging.getLogger(__name__)
 ORCHESTRATION_TELEMETRY_VERSION = 1
 ORCHESTRATION_EVENT_VERSION = 1
+CYCLE_REASONING_RECORD_VERSION = 2
 MISSION_CONTINUATION_SOURCE = "orchestrator_mission_continuation"
 MISSION_CONTINUATION_TRIGGER = "mission_idle_no_active_or_queued_work"
+
+# Machine-readable dispatch skip reasons recorded per assignment each cycle.
+SKIP_AGENT_BUSY = "agent_busy"
+SKIP_AGENT_BLOCKED = "agent_blocked"
+SKIP_DEPENDENCIES_UNMET = "dependencies_unmet"
+SKIP_UNKNOWN_AGENT = "unknown_agent"
+SKIP_GOAL_MISALIGNED = "goal_misaligned"
+SKIP_REST_DEFERRED = "rest_deferred"
+
+# The no-work taxonomy. A cycle that takes no action must carry exactly one of these.
+NO_WORK_REASONS = (
+    "no_mission",
+    "all_blocked_awaiting_human",
+    "dependencies_unmet",
+    "all_agents_busy",
+    "provider_unavailable",
+    "rest_window",
+    "intake_only_pending_approval",
+    "queue_empty_proposal_recorded",
+    "duplicate_suppressed",
+    "budget_gate",
+    "unclassified",
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +76,127 @@ class CycleResult:
     assigned: list[Assignment]
     skipped: list[Assignment]
     alerts: list[str]
+    skip_reasons: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CycleOutcome:
+    mode: str  # worked | work_in_flight | no_work
+    reason: str | None
+    summary: str
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    in_flight_assignment_ids: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"worked", "work_in_flight", "no_work"}:
+            raise ValueError(f"invalid cycle outcome mode: {self.mode}")
+        if self.mode == "no_work":
+            if self.reason not in NO_WORK_REASONS:
+                raise ValueError(f"invalid no_work reason: {self.reason}")
+        elif self.reason is not None:
+            raise ValueError("cycle outcome reason is only valid for no_work")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "reason": self.reason,
+            "summary": self.summary,
+            "actions": list(self.actions),
+            "in_flight_assignment_ids": list(self.in_flight_assignment_ids),
+        }
+
+
+@dataclass(frozen=True)
+class OrchestrationConfig:
+    """Frozen per-cycle view of every gate the orchestrator honors."""
+
+    cadence_seconds: int = 900
+    stale_work_seconds: int = 86_400
+    proactive_mode: str = "propose"
+    proactive_creation_enabled: bool = False
+    max_proactive_proposals_per_cycle: int = 1
+    max_proactive_creations_per_cycle: int = 1
+    intake_mode: str = "propose"
+    max_intake_assignments_per_cycle: int = 2
+    intake_route_chief: str | None = None
+    intake_default_priority: str = "normal"
+    rest_enabled: bool = True
+    rest_window_start_utc: str = "03:00"
+    rest_window_end_utc: str = "05:00"
+    rest_idle_cycles_threshold: int = 6
+    rest_min_interval_seconds: int = 86_400
+    blocker_resolution_enabled: bool = True
+    recurrence_detection_threshold: int = 3
+    recurrence_lookback_days: int = 14
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> OrchestrationConfig:
+        return cls(
+            cadence_seconds=settings.orchestrator_cadence_seconds,
+            stale_work_seconds=settings.stale_work_seconds,
+            proactive_mode=settings.proactive_mode,
+            proactive_creation_enabled=settings.proactive_creation_enabled,
+            max_proactive_proposals_per_cycle=settings.max_proactive_proposals_per_cycle,
+            max_proactive_creations_per_cycle=settings.max_proactive_creations_per_cycle,
+            intake_mode=settings.intake_mode,
+            max_intake_assignments_per_cycle=settings.max_intake_assignments_per_cycle,
+            intake_route_chief=settings.intake_route_chief,
+            intake_default_priority=settings.intake_default_priority,
+            rest_enabled=settings.rest_enabled,
+            rest_window_start_utc=settings.rest_window_start_utc,
+            rest_window_end_utc=settings.rest_window_end_utc,
+            rest_idle_cycles_threshold=settings.rest_idle_cycles_threshold,
+            rest_min_interval_seconds=settings.rest_min_interval_seconds,
+            blocker_resolution_enabled=settings.blocker_resolution_enabled,
+            recurrence_detection_threshold=settings.recurrence_detection_threshold,
+            recurrence_lookback_days=settings.recurrence_lookback_days,
+        )
+
+    def proactive(self) -> ProactiveContinuationConfig:
+        return ProactiveContinuationConfig(
+            mode=self.proactive_mode,
+            creation_enabled=self.proactive_creation_enabled,
+            max_proposals_per_cycle=self.max_proactive_proposals_per_cycle,
+            max_creations_per_cycle=self.max_proactive_creations_per_cycle,
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "cadence_seconds": self.cadence_seconds,
+            "stale_work_seconds": self.stale_work_seconds,
+            "proactive_mode": self.proactive_mode,
+            "proactive_creation_enabled": self.proactive_creation_enabled,
+            "intake_mode": self.intake_mode,
+            "max_intake_assignments_per_cycle": self.max_intake_assignments_per_cycle,
+            "intake_route_chief": self.intake_route_chief,
+            "rest_enabled": self.rest_enabled,
+            "rest_window_start_utc": self.rest_window_start_utc,
+            "rest_window_end_utc": self.rest_window_end_utc,
+            "rest_idle_cycles_threshold": self.rest_idle_cycles_threshold,
+            "blocker_resolution_enabled": self.blocker_resolution_enabled,
+            "recurrence_detection_threshold": self.recurrence_detection_threshold,
+            "recurrence_lookback_days": self.recurrence_lookback_days,
+        }
+
+
+@dataclass(frozen=True)
+class FullCycleResult:
+    outcome: CycleOutcome
+    dispatch: CycleResult
+    reasoning_record: dict[str, Any]
+    sub_results: dict[str, Any]
+
+    @property
+    def assigned(self) -> list[Assignment]:
+        return self.dispatch.assigned
+
+    @property
+    def skipped(self) -> list[Assignment]:
+        return self.dispatch.skipped
+
+    @property
+    def alerts(self) -> list[str]:
+        return self.dispatch.alerts
 
 
 @dataclass(frozen=True)
@@ -188,7 +337,14 @@ def build_orchestration_telemetry(
     proposals = [
         event
         for event in latest
-        if event.get("type") in {"proactive_proposal", "created_work"}
+        if event.get("type")
+        in {
+            "proactive_proposal",
+            "created_work",
+            "intake_proposal",
+            "proposal_created",
+            "proposal_decided",
+        }
         or event.get("status") in {"proposed", "created"}
     ]
     return {
@@ -230,6 +386,19 @@ def evaluate_mission_continuation(
             mission_statement=mission.statement,
         )
 
+    directive_chiefs = _directive_chiefs(store)
+    if not directive_chiefs:
+        return _record_mission_continuation_skip(
+            store,
+            reason="all_chiefs_on_call",
+            summary=(
+                "Every Crew Chief holds an on-call goal; continuation work is not "
+                "synthesized for on-call teams."
+            ),
+            config=config,
+            mission_statement=mission.statement,
+        )
+
     active_next_work = _active_or_queued_assignments(store.assignments())
     if active_next_work:
         return _record_mission_continuation_skip(
@@ -262,9 +431,11 @@ def evaluate_mission_continuation(
             mission_statement=mission.statement,
         )
 
-    target = crew_chiefs[0]
+    target = directive_chiefs[0]
     supported_goal = _supported_goal_for_chief(store, target.agent_id)
-    proposed_assignment = _mission_continuation_assignment_text()
+    proposed_assignment = _mission_continuation_assignment_text(
+        team_of_one=is_team_of_one(store, target.agent_id)
+    )
     idempotency_key = _mission_continuation_idempotency_key(
         mission_statement=mission.statement,
         goal_statement=supported_goal.statement if supported_goal else None,
@@ -577,6 +748,57 @@ def _crew_chief_agents(store: StateStore) -> list[Agent]:
     return [agents[agent_id] for agent_id in sorted(chief_ids)]
 
 
+def route_to_chief(
+    store: StateStore,
+    *,
+    agent_id: str | None = None,
+    prefer_chief_id: str | None = None,
+) -> Agent | None:
+    """Resolve the crew chief that should own orchestrator-created work.
+
+    Precedence: an explicitly preferred chief, the agent itself when it is a
+    chief, the chief of the agent's team, then the first registered chief.
+    Returns None when the brigade has no crew chief at all.
+    """
+    chiefs = {agent.agent_id: agent for agent in _crew_chief_agents(store)}
+    if prefer_chief_id and prefer_chief_id in chiefs:
+        return chiefs[prefer_chief_id]
+    if agent_id:
+        if agent_id in chiefs:
+            return chiefs[agent_id]
+        for team in store.teams():
+            if agent_id in team.members and team.crew_chief_id in chiefs:
+                return chiefs[team.crew_chief_id]
+    return next(iter(chiefs.values()), None) if chiefs else None
+
+
+def is_team_of_one(store: StateStore, chief_id: str) -> bool:
+    """A chief whose managed roster is only themself is their own specialist."""
+    managed = {chief_id}
+    for team in store.teams():
+        if team.crew_chief_id == chief_id:
+            managed.update(team.members)
+    return managed == {chief_id}
+
+
+def _goal_engagement_mode(goal: Goal | None) -> str:
+    if goal is None:
+        return GoalEngagementMode.DIRECTIVE.value
+    return goal.engagement_mode
+
+
+def _directive_chiefs(store: StateStore) -> list[Agent]:
+    """Chiefs eligible for continuation and idle synthesis: on-call chiefs are
+    activated by intake, the ladder, or direct human assignment instead."""
+    eligible = []
+    for chief in _crew_chief_agents(store):
+        goal = _supported_goal_for_chief(store, chief.agent_id)
+        if _goal_engagement_mode(goal) == GoalEngagementMode.ON_CALL.value:
+            continue
+        eligible.append(chief)
+    return eligible
+
+
 def _supported_goal_for_chief(store: StateStore, chief_id: str) -> Goal | None:
     goals = store.goals().get(chief_id, [])
     if not goals:
@@ -585,10 +807,17 @@ def _supported_goal_for_chief(store: StateStore, chief_id: str) -> Goal | None:
     return sorted(confirmed or goals, key=lambda goal: (goal.set_at, goal.statement))[0]
 
 
-def _mission_continuation_assignment_text() -> str:
+def _mission_continuation_assignment_text(*, team_of_one: bool = False) -> str:
+    if team_of_one:
+        return (
+            "Review the current mission and define the next concrete step toward it. "
+            "You are your own subject-matter expert: decompose the work into subtasks "
+            "assigned to yourself with create_subtasks and work them in order."
+        )
     return (
         "Review the current mission, define the next Crew Chief coordination plan, "
-        "and identify which existing team or agent should own each follow-up."
+        "and decompose it into team subtasks with create_subtasks or delegate, "
+        "routing each piece to the member whose specialties fit best."
     )
 
 
@@ -669,24 +898,49 @@ def deterministic_cycle(
         queued,
         key=lambda item: (
             0 if item.created_by == "human" else 1,
+            # Rest sorts last so it never preempts queued mission work.
+            1 if item.kind == AssignmentKind.REST else 0,
             PRIORITY_RANK[item.priority],
             item.created_at,
         ),
     )
 
-    assigned_agents: set[str] = {
+    busy_agents: set[str] = {
         item.assigned_to
         for item in assignments
         if item.status in {AssignmentStatus.ASSIGNED, AssignmentStatus.WORKING}
+    }
+    # Blocked work counts as occupancy: the agent's attention belongs to the
+    # blocker-resolution ladder, not to fresh dispatch.
+    blocked_agents: set[str] = {
+        item.assigned_to
+        for item in assignments
+        if item.status == AssignmentStatus.BLOCKED
+    }
+    queued_non_rest_agents: set[str] = {
+        item.assigned_to for item in queued if item.kind != AssignmentKind.REST
     }
     agent_map = {agent.agent_id: agent for agent in agents or []}
     completed_assignment_ids = _completed_assignment_ids(assignments, assignment_history or [])
     assigned: list[Assignment] = []
     skipped: list[Assignment] = []
     alerts: list[str] = []
+    skip_reasons: dict[str, str] = {}
+
+    def skip(item: Assignment, reason: str) -> None:
+        skip_reasons[item.assignment_id] = reason
+        skipped.append(item)
+
     for item in ordered:
-        if item.assigned_to in assigned_agents:
-            skipped.append(item)
+        if item.assigned_to in busy_agents:
+            skip(item, SKIP_AGENT_BUSY)
+            continue
+        if item.assigned_to in blocked_agents:
+            skip(item, SKIP_AGENT_BLOCKED)
+            continue
+        if item.kind == AssignmentKind.REST and item.assigned_to in queued_non_rest_agents:
+            item.progress_summary = "rest deferred until queued mission work is dispatched"
+            skip(item, SKIP_REST_DEFERRED)
             continue
         waiting_on = [
             dependency_id
@@ -702,13 +956,13 @@ def deterministic_cycle(
                     "dependencies": waiting_on,
                 },
             )
-            skipped.append(item)
+            skip(item, SKIP_DEPENDENCIES_UNMET)
             continue
         if agents is not None and item.assigned_to not in agent_map:
             alerts.append(
                 f"assignment {item.assignment_id} targets unknown agent {item.assigned_to}"
             )
-            skipped.append(item)
+            skip(item, SKIP_UNKNOWN_AGENT)
             continue
         if goals_by_agent is not None and item.assigned_to in goals_by_agent:
             decision = evaluate_assignment_alignment(item, goals_by_agent.get(item.assigned_to, []))
@@ -717,7 +971,7 @@ def deterministic_cycle(
                 item.awaiting_human = True
                 item.progress_summary = decision.rationale
                 alerts.append(f"assignment {item.assignment_id} interrupted: {decision.rationale}")
-                skipped.append(item)
+                skip(item, SKIP_GOAL_MISALIGNED)
                 continue
         item.transition_to(AssignmentStatus.ASSIGNED)
         if workspace_root is not None and item.assigned_to in agent_map:
@@ -725,7 +979,7 @@ def deterministic_cycle(
                 agent_map[item.assigned_to], item, workspace_root
             )
             item.state_row_written_to = str(heartbeat)
-        assigned_agents.add(item.assigned_to)
+        busy_agents.add(item.assigned_to)
         assigned.append(item)
 
     LOGGER.info(
@@ -736,7 +990,12 @@ def deterministic_cycle(
             "alerts": len(alerts),
         },
     )
-    return CycleResult(assigned=assigned, skipped=skipped, alerts=alerts)
+    return CycleResult(
+        assigned=assigned,
+        skipped=skipped,
+        alerts=alerts,
+        skip_reasons=skip_reasons,
+    )
 
 
 def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
@@ -756,21 +1015,54 @@ def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
         }
     }
     active_keys = {item.idempotency_key for item in assignments if item.idempotency_key}
-    crew_chiefs = {team.crew_chief_id for team in store.teams() if team.crew_chief_id}
+    crew_chiefs = {agent.agent_id for agent in _crew_chief_agents(store)}
     created: list[Assignment] = []
 
     for agent in agents:
         if agent.agent_id in occupied_agents:
             continue
-        goal = next(iter(goals_by_agent.get(agent.agent_id, [])), None)
+        goal = next(
+            (
+                item
+                for item in goals_by_agent.get(agent.agent_id, [])
+                if item.engagement_mode != GoalEngagementMode.ON_CALL.value
+            ),
+            None,
+        )
         if goal is not None:
-            key = f"orchestrator-idle-goal:{agent.agent_id}:{goal.statement}"
+            # Chief-first: a line worker's idle goal becomes high-level work for
+            # their chief to decompose; chiefs receive it directly.
+            target = route_to_chief(store, agent_id=agent.agent_id)
+            if target is None:
+                target = agent
+            key = f"orchestrator-idle-goal:{target.agent_id}:{goal.statement}"
             if key in active_keys:
                 continue
-            assignment_text = f"Advance goal: {goal.statement}"
+            if target.agent_id == agent.agent_id:
+                if is_team_of_one(store, target.agent_id):
+                    assignment_text = (
+                        f"Advance goal: {goal.statement}. You are your own subject-matter "
+                        "expert: decompose the work into subtasks assigned to yourself "
+                        "with create_subtasks."
+                    )
+                else:
+                    assignment_text = (
+                        f"Advance goal: {goal.statement}. Decompose the work into team "
+                        "subtasks with create_subtasks or delegate, routing each piece "
+                        "to the member whose specialties fit best."
+                    )
+            else:
+                assignment_text = (
+                    f"Advance goal: {goal.statement}. {agent.agent_id} is idle and owns "
+                    "this goal; decompose the next steps and route them to your team."
+                )
             rationale = "Agent was idle while a confirmed goal had no active task."
             goal_statement = goal.statement
-        elif mission is not None and (agent.agent_id in crew_chiefs or agent.role == "crew_chief"):
+        elif mission is not None and agent.agent_id in crew_chiefs:
+            chief_goal = _supported_goal_for_chief(store, agent.agent_id)
+            if _goal_engagement_mode(chief_goal) == GoalEngagementMode.ON_CALL.value:
+                continue
+            target = agent
             key = f"orchestrator-idle-mission:{agent.agent_id}:{mission.statement}"
             if key in active_keys:
                 continue
@@ -785,7 +1077,7 @@ def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
 
         assignment = Assignment(
             assignment=assignment_text,
-            assigned_to=agent.agent_id,
+            assigned_to=target.agent_id,
             created_by="orchestrator",
             source="orchestrator_idle_task_builder",
             priority=Priority.NORMAL,
@@ -799,6 +1091,7 @@ def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
         active_keys.add(key)
         if persisted.assignment_id == assignment.assignment_id:
             created.append(persisted)
+            occupied_agents.add(target.agent_id)
 
     if created:
         events = [
@@ -1026,8 +1319,13 @@ def build_orchestrator_escalation_prompt(
                 '{"type":"rebalance_queued_assignment","assignment_id":"...",'
                 '"to_agent_id":"...","rationale":"..."}'
             ),
-            '{"type":"request_human","message":"..."}',
+            '{"type":"retry_blocked_assignment","assignment_id":"..."}',
+            '{"type":"create_failure_analysis","assignment_id":"..."}',
+            '{"type":"reassign_blocked_assignment","assignment_id":"..."}',
+            '{"type":"request_human","message":"...","assignment_id":"..."}',
             "Do not move active assigned or working tasks.",
+            "Ladder actions must match the assignment's ladder state; "
+            "request_human is rejected unless the target's ladder is exhausted.",
             "",
             "Context JSON:",
             compact_json(context),
@@ -1068,7 +1366,10 @@ def apply_orchestrator_actions(
                 applied.append(_apply_create_assignment(store, action))
             elif action_type == "rebalance_queued_assignment":
                 applied.append(_apply_rebalance_queued_assignment(store, action))
+            elif action_type in LADDER_ACTION_STEPS:
+                applied.append(_apply_ladder_action(store, action, action_type))
             elif action_type == "request_human":
+                _validate_request_human(store, action)
                 message = str(action.get("message") or "orchestrator requested human review")
                 store.add_alert(message)
                 applied.append({"type": action_type, "message": message})
@@ -1109,6 +1410,18 @@ def _apply_create_assignment(store: StateStore, action: dict[str, Any]) -> dict[
         raise ValueError("create_assignment is missing assignment")
     if agent_id not in {agent.agent_id for agent in store.agents()}:
         raise ValueError(f"create_assignment targets unknown agent {agent_id}")
+    # Chief-first: orchestrator-created work goes to the crew chief managing the
+    # suggested agent; the chief decomposes. Falls back when no chief exists.
+    chief = route_to_chief(store, agent_id=agent_id)
+    if chief is not None and chief.agent_id != agent_id:
+        action = {
+            **action,
+            "rationale": (
+                f"{action.get('rationale') or 'Orchestrator escalation.'} "
+                f"(routed to crew chief; suggested agent was {agent_id})"
+            ),
+        }
+        agent_id = chief.agent_id
     priority = _priority_from_action(action)
     idempotency_key = (
         "orchestrator-escalation:"
@@ -1185,6 +1498,101 @@ def _apply_rebalance_queued_assignment(
         "from_agent_id": previous,
         "to_agent_id": to_agent_id,
     }
+
+
+# Escalation action type -> the ladder step it is allowed to perform.
+LADDER_ACTION_STEPS = {
+    "retry_blocked_assignment": "retry",
+    "create_failure_analysis": "analysis",
+    "reassign_blocked_assignment": "reassign",
+}
+
+
+def _apply_ladder_action(
+    store: StateStore,
+    action: dict[str, Any],
+    action_type: str,
+) -> dict[str, Any]:
+    """Apply an LLM-requested ladder step, validated against ladder state.
+
+    Out-of-order actions are rejected; the deterministic ladder has already
+    acted this cycle, so a duplicate request is a no-op, not an error.
+    """
+    from brigade.ladder import (
+        create_failure_analysis,
+        ladder_state,
+        reassign_blocked,
+        retry_blocked,
+    )
+
+    expected_step = LADDER_ACTION_STEPS[action_type]
+    assignment_id = str(action.get("assignment_id") or "").strip()
+    if not assignment_id:
+        raise ValueError(f"{action_type} is missing assignment_id")
+    assignment = store.find_assignment(assignment_id)
+    if assignment is None:
+        raise ValueError(f"unknown assignment {assignment_id}")
+    if assignment.status != AssignmentStatus.BLOCKED:
+        raise ValueError(f"assignment {assignment_id} is not blocked")
+    if assignment.awaiting_human:
+        raise ValueError(f"assignment {assignment_id} is already awaiting the human")
+    state = ladder_state(store, assignment)
+    if state != expected_step:
+        raise ValueError(
+            f"{action_type} is out of ladder order for {assignment_id}; "
+            f"the ladder state is {state}"
+        )
+    step_fn = {
+        "retry": retry_blocked,
+        "analysis": create_failure_analysis,
+        "reassign": reassign_blocked,
+    }[expected_step]
+    result = step_fn(store, assignment, source="orchestrator_escalation")
+    if result is None:
+        return {
+            "type": action_type,
+            "status": "skipped_existing",
+            "assignment_id": assignment_id,
+        }
+    step_action, event = result
+    return {
+        "type": action_type,
+        "status": "applied",
+        "event": event,
+        **step_action,
+    }
+
+
+def _validate_request_human(store: StateStore, action: dict[str, Any]) -> None:
+    """Human is last resort: reject unless the target's ladder is exhausted."""
+    from brigade.ladder import HUMAN_ESCALATION_FAILURES
+
+    assignment_id = str(action.get("assignment_id") or "").strip()
+    if assignment_id:
+        assignment = store.find_assignment(assignment_id)
+        if assignment is None:
+            raise ValueError(f"unknown assignment {assignment_id}")
+        if assignment.status == AssignmentStatus.BLOCKED and not (
+            assignment.awaiting_human
+            or assignment.consecutive_failures >= HUMAN_ESCALATION_FAILURES
+        ):
+            raise ValueError(
+                f"request_human rejected: the ladder for {assignment_id} "
+                "is not exhausted"
+            )
+        return
+    in_progress = [
+        item.assignment_id
+        for item in store.assignments()
+        if item.status == AssignmentStatus.BLOCKED
+        and not item.awaiting_human
+        and item.consecutive_failures < HUMAN_ESCALATION_FAILURES
+    ]
+    if in_progress:
+        raise ValueError(
+            "request_human rejected: the blocker-resolution ladder is still "
+            "in progress for " + ", ".join(sorted(in_progress))
+        )
 
 
 def _priority_from_action(action: dict[str, Any]) -> Priority:
@@ -1322,6 +1730,7 @@ def derive_agent_states(
                 agent=agent.agent_id,
                 status="idle",
                 last_completed=previous.last_completed if previous else None,
+                idle_cycles=(previous.idle_cycles if previous else 0) + 1,
             )
             continue
         if current.awaiting_human:
@@ -1343,6 +1752,184 @@ def derive_agent_states(
     return state_map
 
 
+def classify_cycle_outcome(
+    *,
+    mission_present: bool,
+    assignments: list[Assignment],
+    dispatch: CycleResult | None = None,
+    continuation: dict[str, Any] | None = None,
+    idle_synthesis: list[Assignment] | None = None,
+    ladder: dict[str, Any] | None = None,
+    intake: dict[str, Any] | None = None,
+    recurrence: dict[str, Any] | None = None,
+    rest: dict[str, Any] | None = None,
+    escalation: dict[str, Any] | None = None,
+    provider_failed: bool = False,
+) -> CycleOutcome:
+    """Enforce the work-or-reason invariant for one cycle.
+
+    Either at least one action was taken (mode ``worked``), work is currently
+    in flight (mode ``work_in_flight``), or the first matching reason from the
+    no-work taxonomy is returned. ``unclassified`` is a bug, never a feature.
+    """
+    actions: list[dict[str, Any]] = []
+    if dispatch is not None:
+        actions.extend(
+            {"type": "dispatched", "assignment_id": item.assignment_id}
+            for item in dispatch.assigned
+        )
+    for item in idle_synthesis or []:
+        actions.append({"type": "created", "assignment_id": item.assignment_id})
+    for action in (ladder or {}).get("actions", []):
+        actions.append({"type": f"ladder_{action.get('step', 'action')}", **action})
+    for item in (intake or {}).get("created", []):
+        actions.append({"type": "intake_created", "assignment_id": _record_id(item)})
+    for item in (recurrence or {}).get("materialized", []):
+        actions.append({"type": "recurrence_materialized", "assignment_id": _record_id(item)})
+    for item in (continuation or {}).get("created", []):
+        actions.append({"type": "continuation_created", "assignment_id": _record_id(item)})
+    for item in (rest or {}).get("created", []):
+        actions.append({"type": "rest_created", "assignment_id": _record_id(item)})
+    for action in (escalation or {}).get("actions_applied", []):
+        if isinstance(action, dict) and action.get("status") in {
+            "created",
+            "updated",
+            "applied",
+        }:
+            actions.append({"type": "escalation_action", **action})
+
+    if actions:
+        return CycleOutcome(
+            mode="worked",
+            reason=None,
+            summary=f"{len(actions)} action(s) taken this cycle.",
+            actions=actions,
+        )
+
+    in_flight = [
+        item.assignment_id
+        for item in assignments
+        if item.status == AssignmentStatus.WORKING
+    ]
+    if in_flight:
+        return CycleOutcome(
+            mode="work_in_flight",
+            reason=None,
+            summary=f"{len(in_flight)} assignment(s) currently working.",
+            in_flight_assignment_ids=in_flight,
+        )
+
+    reason, summary = _no_work_reason(
+        mission_present=mission_present,
+        assignments=assignments,
+        dispatch=dispatch,
+        continuation=continuation,
+        intake=intake,
+        rest=rest,
+        provider_failed=provider_failed,
+    )
+    return CycleOutcome(mode="no_work", reason=reason, summary=summary)
+
+
+def _no_work_reason(
+    *,
+    mission_present: bool,
+    assignments: list[Assignment],
+    dispatch: CycleResult | None,
+    continuation: dict[str, Any] | None,
+    intake: dict[str, Any] | None,
+    rest: dict[str, Any] | None,
+    provider_failed: bool,
+) -> tuple[str, str]:
+    if not mission_present:
+        return "no_mission", "No mission is set; nothing else runs."
+
+    active = [
+        item
+        for item in assignments
+        if item.status in {AssignmentStatus.ASSIGNED, AssignmentStatus.BLOCKED}
+    ]
+    if active and all(
+        item.status == AssignmentStatus.BLOCKED and item.awaiting_human for item in active
+    ):
+        return (
+            "all_blocked_awaiting_human",
+            "Every active assignment is blocked awaiting the human; "
+            "the ladder is exhausted everywhere.",
+        )
+
+    queued = [item for item in assignments if item.status == AssignmentStatus.QUEUED]
+    skip_reasons = dispatch.skip_reasons if dispatch is not None else {}
+    if queued:
+        queued_reasons = {
+            skip_reasons.get(item.assignment_id) for item in queued
+        }
+        if queued_reasons and queued_reasons <= {SKIP_DEPENDENCIES_UNMET}:
+            return (
+                "dependencies_unmet",
+                "Queued work exists but every item is waiting on incomplete dependencies.",
+            )
+        if queued_reasons and None not in queued_reasons:
+            return (
+                "all_agents_busy",
+                "Queued work exists but every eligible agent is occupied or blocked.",
+            )
+
+    if provider_failed:
+        return (
+            "provider_unavailable",
+            "Creation or escalation was attempted but the model provider was unavailable.",
+        )
+
+    intake_proposals = (intake or {}).get("proposals", [])
+    rest_suppressed = (rest or {}).get("already_rested", [])
+    if rest_suppressed and not queued and not intake_proposals:
+        return (
+            "rest_window",
+            "The only possible activity was rest and rest for this window already happened.",
+        )
+
+    if intake_proposals and (intake or {}).get("mode") == "propose":
+        return (
+            "intake_only_pending_approval",
+            f"{len(intake_proposals)} intake proposal(s) recorded; intake_mode is propose.",
+        )
+
+    continuation_status = (continuation or {}).get("status")
+    continuation_skips = (continuation or {}).get("skipped", [])
+    skip_reason = continuation_skips[0].get("reason") if continuation_skips else None
+    if skip_reason == "duplicate_idempotency_key":
+        return (
+            "duplicate_suppressed",
+            "Every candidate action was suppressed by an existing idempotency key.",
+        )
+    if not queued and continuation_status == "proposed":
+        return (
+            "queue_empty_proposal_recorded",
+            "The queue is empty; a continuation proposal was recorded but creation is gated off.",
+        )
+    if not queued and continuation_status == "skipped" and skip_reason:
+        # The queue is empty and continuation deliberately stood down (mode off,
+        # on-call chiefs, caps). The sub-result carries the precise reason.
+        return (
+            "queue_empty_proposal_recorded",
+            f"The queue is empty; continuation stood down: {skip_reason}.",
+        )
+
+    return (
+        "unclassified",
+        "No action was taken and no taxonomy reason matched; this is a bug.",
+    )
+
+
+def _record_id(item: Any) -> str | None:
+    if isinstance(item, Assignment):
+        return item.assignment_id
+    if isinstance(item, dict):
+        return item.get("assignment_id")
+    return None
+
+
 def build_cycle_reasoning_record(
     mission_statement: str | None,
     assignments: list[Assignment],
@@ -1352,16 +1939,38 @@ def build_cycle_reasoning_record(
     floor: dict[str, Any] | None = None,
     floor_triggers: list[dict[str, Any]] | None = None,
     escalation: dict[str, Any] | None = None,
+    *,
+    cycle_outcome: CycleOutcome,
+    sub_results: dict[str, Any] | None = None,
+    config_snapshot: dict[str, Any] | None = None,
+    extra_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
-    events = _cycle_decision_events(
-        mission_statement,
-        result,
-        escalation=escalation,
-        floor_triggers=floor_triggers or [],
+    events = list(extra_events or [])
+    events.extend(
+        _cycle_decision_events(
+            mission_statement,
+            result,
+            escalation=escalation,
+            floor_triggers=floor_triggers or [],
+        )
+    )
+    events.append(
+        orchestration_event(
+            "cycle_outcome",
+            cycle_outcome.summary,
+            source="orchestrator_cycle",
+            decision=cycle_outcome.mode,
+            status=cycle_outcome.reason or cycle_outcome.mode,
+            mission_statement=mission_statement,
+            trigger=cycle_outcome.reason,
+            assignment_ids=cycle_outcome.in_flight_assignment_ids,
+            payload=cycle_outcome.to_dict(),
+        )
     )
     return {
         "reasoning_id": str(uuid4()),
         "cycle_id": str(uuid4()),
+        "record_version": CYCLE_REASONING_RECORD_VERSION,
         "started_at": utc_now_iso(),
         "ended_at": utc_now_iso(),
         "source": "orchestrator_cycle",
@@ -1372,11 +1981,15 @@ def build_cycle_reasoning_record(
         ],
         "assigned": [item.assignment_id for item in result.assigned],
         "skipped": [item.assignment_id for item in result.skipped],
+        "skip_reasons": dict(result.skip_reasons),
         "alerts": result.alerts,
         "agent_states": {agent: state.to_dict() for agent, state in agent_states.items()},
         "floor": floor,
         "floor_triggers": floor_triggers or [],
         "escalation": escalation,
+        "cycle_outcome": cycle_outcome.to_dict(),
+        "sub_results": sub_results or {},
+        "config_snapshot": config_snapshot or {},
         "events": events,
         "decision_summary": (
             "assigned="
@@ -1384,7 +1997,9 @@ def build_cycle_reasoning_record(
             "skipped="
             f"{len(result.skipped)} "
             "alerts="
-            f"{len(result.alerts)}"
+            f"{len(result.alerts)} "
+            "outcome="
+            f"{cycle_outcome.reason or cycle_outcome.mode}"
         ),
     }
 
@@ -1464,6 +2079,260 @@ def _cycle_decision_events(
     return events
 
 
+def run_full_cycle(
+    store: StateStore,
+    provider: ModelProvider | None = None,
+    config: OrchestrationConfig | None = None,
+) -> FullCycleResult:
+    """One full orchestrator cycle: blockers, intake, recurrences, continuation,
+    rest, dispatch, escalation, then a reasoning record that cannot be persisted
+    without a CycleOutcome."""
+    config = config or OrchestrationConfig()
+    empty_dispatch = CycleResult(assigned=[], skipped=[], alerts=[])
+    sub_results: dict[str, Any] = {}
+
+    # Step 1: mission and previous reasoning. No mission stops the cycle.
+    mission = store.mission()
+    previous_reasoning = store.orchestrator_reasoning()
+    previous_reasoning_id = (
+        previous_reasoning[-1].get("reasoning_id") if previous_reasoning else None
+    )
+    if mission is None:
+        outcome = classify_cycle_outcome(mission_present=False, assignments=[])
+        record = build_cycle_reasoning_record(
+            None,
+            [],
+            empty_dispatch,
+            {},
+            previous_reasoning_id=previous_reasoning_id,
+            cycle_outcome=outcome,
+            sub_results=sub_results,
+            config_snapshot=config.snapshot(),
+        )
+        store.add_orchestrator_reasoning(record)
+        return FullCycleResult(
+            outcome=outcome,
+            dispatch=empty_dispatch,
+            reasoning_record=record,
+            sub_results=sub_results,
+        )
+
+    # Step 3: blocker-resolution ladder runs before any fresh dispatch.
+    ladder_result: dict[str, Any] = {
+        "enabled": config.blocker_resolution_enabled,
+        "actions": [],
+    }
+    if config.blocker_resolution_enabled:
+        ladder_result = _run_ladder_step(store, config)
+    step_events: list[dict[str, Any]] = []
+
+    def collect(name: str, result: dict[str, Any]) -> None:
+        # Events land in the record's events list once, not inside sub_results.
+        step_events.extend(result.get("events") or [])
+        sub_results[name] = {
+            key: value for key, value in result.items() if key != "events"
+        }
+
+    collect("ladder", ladder_result)
+
+    # Step 4: intake drain.
+    intake_result = _run_intake_step(store, config)
+    collect("intake", intake_result)
+
+    # Step 5: recurrence materialization.
+    recurrence_result = _run_recurrence_step(store, config)
+    collect("recurrence", recurrence_result)
+
+    # Step 6: mission continuation and idle synthesis (chief-first, on-call aware).
+    continuation_result = evaluate_mission_continuation(store, config.proactive())
+    sub_results["continuation"] = {
+        "status": continuation_result.get("status"),
+        "created": [
+            _record_id(item) for item in continuation_result.get("created", [])
+        ],
+        "skipped": continuation_result.get("skipped", []),
+    }
+    idle_created: list[Assignment] = []
+    if config.proactive_mode == "create" and config.proactive_creation_enabled:
+        idle_created = build_idle_agent_assignments(store)
+    sub_results["idle_synthesis"] = [item.assignment_id for item in idle_created]
+
+    # Step 7: rest scheduling.
+    rest_result = _run_rest_step(store, config)
+    collect("rest", rest_result)
+
+    # Step 9 prep: floor triggers and bounded LLM escalation.
+    floor = build_orchestrator_floor(store, stale_seconds=config.stale_work_seconds)
+    floor_triggers = evaluate_orchestrator_floor(
+        store,
+        floor,
+        stale_seconds=config.stale_work_seconds,
+    )
+    escalation = None
+    provider_failed = False
+    if provider is not None and floor_triggers:
+        try:
+            escalation = run_orchestrator_escalation(
+                store,
+                provider,
+                floor=floor,
+                triggers=floor_triggers,
+                stale_seconds=config.stale_work_seconds,
+            )
+        except Exception as exc:
+            message = f"orchestrator escalation failed: {exc}"
+            store.add_alert(message)
+            provider_failed = True
+            escalation = {
+                "status": "failed",
+                "summary": message,
+                "triggers": floor_triggers,
+                "actions_applied": [],
+                "actions_rejected": [],
+            }
+
+    # Step 8: deterministic dispatch over the post-creation queue.
+    assignments = store.assignments()
+    original_assignments = {
+        item.assignment_id: {
+            "status": item.status.value,
+            "updated_at": item.updated_at,
+        }
+        for item in assignments
+    }
+    agents = store.agents()
+    existing_states = store.agent_states()
+    dispatch = deterministic_cycle(
+        assignments,
+        agents=agents,
+        goals_by_agent=store.goals(),
+        workspace_root=store.data_dir,
+        assignment_history=store.assignment_history(),
+    )
+    _persist_dispatch_mutations(store, assignments, dispatch, original_assignments)
+
+    # Step 2/11: agent states with idle-cycle tracking.
+    agent_states = derive_agent_states(agents, assignments, existing=existing_states)
+    for state in agent_states.values():
+        store.upsert_agent_state(state)
+
+    # Step 10: cycle outcome classification. There is no third state.
+    outcome = classify_cycle_outcome(
+        mission_present=True,
+        assignments=assignments,
+        dispatch=dispatch,
+        continuation=continuation_result,
+        idle_synthesis=idle_created,
+        ladder=ladder_result,
+        intake=intake_result,
+        recurrence=recurrence_result,
+        rest=rest_result,
+        escalation=escalation,
+        provider_failed=provider_failed,
+    )
+
+    # Step 11: persist the reasoning record, alerts, and the financial report.
+    record = build_cycle_reasoning_record(
+        mission.statement,
+        assignments,
+        dispatch,
+        agent_states,
+        previous_reasoning_id=previous_reasoning_id,
+        floor=floor,
+        floor_triggers=floor_triggers,
+        escalation=escalation,
+        cycle_outcome=outcome,
+        sub_results=sub_results,
+        config_snapshot=config.snapshot(),
+        extra_events=step_events,
+    )
+    store.add_orchestrator_reasoning(record)
+    for alert in dispatch.alerts:
+        store.add_alert(alert)
+    if outcome.reason == "unclassified":
+        store.add_alert(
+            "orchestrator cycle outcome was unclassified; "
+            "the work-or-reason invariant has a gap"
+        )
+    persist_financial_report(store, store.data_dir)
+    return FullCycleResult(
+        outcome=outcome,
+        dispatch=dispatch,
+        reasoning_record=record,
+        sub_results=sub_results,
+    )
+
+
+def _run_ladder_step(store: StateStore, config: OrchestrationConfig) -> dict[str, Any]:
+    # Imported here: brigade.ladder imports orchestrator helpers at module level.
+    from brigade.ladder import resolve_blockers
+
+    del config
+    return resolve_blockers(store)
+
+
+def _run_intake_step(store: StateStore, config: OrchestrationConfig) -> dict[str, Any]:
+    # Imported here: brigade.intake imports orchestrator helpers at module level.
+    from brigade.intake import evaluate_intake_queue
+
+    return evaluate_intake_queue(
+        store,
+        mode=config.intake_mode,
+        max_per_cycle=config.max_intake_assignments_per_cycle,
+        route_chief=config.intake_route_chief,
+        default_priority=config.intake_default_priority,
+    )
+
+
+def _run_recurrence_step(store: StateStore, config: OrchestrationConfig) -> dict[str, Any]:
+    # Imported here: brigade.efficiency imports orchestrator helpers at module level.
+    from brigade.efficiency import run_recurrence_step
+
+    return run_recurrence_step(
+        store,
+        threshold=config.recurrence_detection_threshold,
+        lookback_days=config.recurrence_lookback_days,
+    )
+
+
+def _run_rest_step(store: StateStore, config: OrchestrationConfig) -> dict[str, Any]:
+    # Imported here: brigade.rest imports orchestrator helpers at module level.
+    from brigade.rest import evaluate_rest_schedule
+
+    return evaluate_rest_schedule(
+        store,
+        enabled=config.rest_enabled,
+        window_start_utc=config.rest_window_start_utc,
+        window_end_utc=config.rest_window_end_utc,
+        idle_cycles_threshold=config.rest_idle_cycles_threshold,
+        min_interval_seconds=config.rest_min_interval_seconds,
+    )
+
+
+def _persist_dispatch_mutations(
+    store: StateStore,
+    assignments: list[Assignment],
+    result: CycleResult,
+    original_assignments: dict[str, dict[str, str]],
+) -> None:
+    mutated_ids = {item.assignment_id for item in [*result.assigned, *result.skipped]}
+    for assignment in assignments:
+        if assignment.assignment_id not in mutated_ids:
+            continue
+        current = store.find_assignment(assignment.assignment_id)
+        if current is None:
+            continue
+        original = original_assignments.get(assignment.assignment_id)
+        if original is None:
+            continue
+        if (
+            current.status.value != original["status"]
+            or current.updated_at != original["updated_at"]
+        ):
+            continue
+        store.update_assignment(assignment)
+
+
 def _escalation_events(
     mission_statement: str | None,
     escalation: dict[str, Any],
@@ -1496,6 +2365,10 @@ def _escalation_events(
                     payload=action,
                 )
             )
+        elif action_type in LADDER_ACTION_STEPS:
+            event = action.get("event")
+            if isinstance(event, dict):
+                events.append(event)
         elif action_type == "request_human":
             events.append(
                 orchestration_event(

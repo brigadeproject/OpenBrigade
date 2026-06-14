@@ -14,6 +14,13 @@ ASSIGNMENT_BLOCK_RE = re.compile(
     r"```json brigade-assignment\s*\n(.*?)\n```",
     re.DOTALL,
 )
+# Matches any assignment block region from its marker through the next closing
+# fence, or to end-of-text when the block is truncated (no closing fence). Used
+# to scrub stale, malformed, or duplicate blocks before writing a fresh one.
+ASSIGNMENT_BLOCK_SCRUB_RE = re.compile(
+    r"```json brigade-assignment\b.*?(?:\n```|\Z)",
+    re.DOTALL,
+)
 REQUIRED_ASSIGNMENT_FIELDS = frozenset(
     {
         "assignment",
@@ -89,6 +96,18 @@ def ensure_agent_workspace(agent: Agent, root: Path) -> Path:
         path = workspace / filename
         if not path.exists():
             path.write_text(_default_file(agent, filename), encoding="utf-8")
+    # Seeded for rest/dream cycles but deliberately not required files, so
+    # heartbeat validation of existing workspaces is untouched.
+    for filename, content in (
+        ("reflections.md", "# Reflections\n\n"),
+        (
+            "PONDER.md",
+            "# Ponder\n\nOpen questions; any agent may append during normal work.\n",
+        ),
+    ):
+        path = workspace / filename
+        if not path.exists():
+            path.write_text(content, encoding="utf-8")
     heartbeat = workspace / "HEARTBEAT.md"
     if not heartbeat.exists():
         heartbeat.write_text(_heartbeat_header(agent), encoding="utf-8")
@@ -275,13 +294,21 @@ def write_heartbeat_assignment(agent: Agent, assignment: Assignment, root: Path)
     heartbeat = workspace / "HEARTBEAT.md"
     existing = heartbeat.read_text(encoding="utf-8")
     block = render_assignment_block(assignment)
-    try:
-        parsed = extract_latest_assignment_block(existing)
-        updated = existing[: parsed.start].rstrip() + "\n\n" + block + existing[parsed.end :]
-    except ValueError:
-        updated = existing.rstrip() + "\n\n" + block + "\n"
+    # Scrub every existing assignment block -- valid, malformed, or truncated --
+    # so the heartbeat is left with exactly one parseable block. Surrounding
+    # notes are preserved above the block, matching the heartbeat header's
+    # "Preserve any notes above the block" contract. Appending around a broken
+    # block would otherwise strand malformed content and poison later recovery.
+    cleaned = _strip_assignment_blocks(existing)
+    updated = f"{cleaned}\n\n{block}\n" if cleaned else f"{block}\n"
     heartbeat.write_text(updated.rstrip() + "\n", encoding="utf-8")
     return heartbeat
+
+
+def _strip_assignment_blocks(text: str) -> str:
+    without_blocks = ASSIGNMENT_BLOCK_SCRUB_RE.sub("", text)
+    collapsed = re.sub(r"\n{3,}", "\n\n", without_blocks)
+    return collapsed.rstrip()
 
 
 def render_assignment_block(assignment: Assignment) -> str:

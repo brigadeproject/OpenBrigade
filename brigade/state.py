@@ -39,6 +39,8 @@ EMPTY_STATE: dict[str, Any] = {
     "knowledge_chunks": [],
     "messages": [],
     "orchestrator_reasoning": [],
+    "proposals": [],
+    "recurrences": [],
     "usage_records": [],
     "cloud_jobs": [],
     "financial_reports": [],
@@ -310,6 +312,80 @@ class JsonStateStore:
 
     def orchestrator_reasoning(self) -> list[dict[str, Any]]:
         return list(self.load().get("orchestrator_reasoning", []))
+
+    def add_proposal(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        state = self.load()
+        idempotency_key = proposal.get("idempotency_key")
+        if idempotency_key:
+            existing = next(
+                (
+                    item
+                    for item in state.get("proposals", [])
+                    if item.get("idempotency_key") == idempotency_key
+                ),
+                None,
+            )
+            if existing is not None:
+                return dict(existing)
+        state.setdefault("proposals", []).append(dict(proposal))
+        self.save(state)
+        return proposal
+
+    def proposals(
+        self,
+        kind: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        records = [dict(item) for item in self.load().get("proposals", [])]
+        if kind is not None:
+            records = [item for item in records if item.get("kind") == kind]
+        if status is not None:
+            records = [item for item in records if item.get("status") == status]
+        return records
+
+    def find_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                dict(item)
+                for item in self.load().get("proposals", [])
+                if item.get("proposal_id") == proposal_id
+            ),
+            None,
+        )
+
+    def update_proposal(self, proposal: dict[str, Any]) -> None:
+        state = self.load()
+        records = state.setdefault("proposals", [])
+        for index, item in enumerate(records):
+            if item.get("proposal_id") == proposal.get("proposal_id"):
+                records[index] = dict(proposal)
+                break
+        else:
+            records.append(dict(proposal))
+        self.save(state)
+
+    def add_recurrence(self, recurrence: dict[str, Any]) -> dict[str, Any]:
+        state = self.load()
+        state.setdefault("recurrences", []).append(dict(recurrence))
+        self.save(state)
+        return recurrence
+
+    def recurrences(self, enabled: bool | None = None) -> list[dict[str, Any]]:
+        records = [dict(item) for item in self.load().get("recurrences", [])]
+        if enabled is not None:
+            records = [item for item in records if bool(item.get("enabled", True)) == enabled]
+        return sorted(records, key=lambda item: str(item.get("next_due_at") or ""))
+
+    def update_recurrence(self, recurrence: dict[str, Any]) -> None:
+        state = self.load()
+        records = state.setdefault("recurrences", [])
+        for index, item in enumerate(records):
+            if item.get("recurrence_id") == recurrence.get("recurrence_id"):
+                records[index] = dict(recurrence)
+                break
+        else:
+            records.append(dict(recurrence))
+        self.save(state)
 
     def add_usage_record(self, record: dict[str, Any]) -> None:
         state = self.load()

@@ -12,7 +12,7 @@ from brigade.finance import persist_financial_report
 from brigade.orchestrator import orchestration_event, record_orchestration_events
 from brigade.prompt_floors import build_agent_floor, compact_json
 from brigade.providers import ModelProvider, ModelResponse, ModelUnavailableError
-from brigade.schemas import AgentState, Assignment, AssignmentStatus
+from brigade.schemas import AgentState, Assignment, AssignmentKind, AssignmentStatus
 from brigade.store import StateStore
 from brigade.time import add_seconds_iso, parse_utc_iso, utc_now, utc_now_iso
 from brigade.tools import (
@@ -627,6 +627,12 @@ def _apply_agent_response(
     if parsed.status == "complete":
         assignment.mark_complete(parsed.summary)
         write_heartbeat_assignment(agent, assignment, store.data_dir)
+        if assignment.kind == AssignmentKind.REST:
+            # Deterministic dream finalizer: durable output regardless of
+            # model quality.
+            from brigade.rest import finalize_rest_assignment
+
+            finalize_rest_assignment(store, agent, assignment)
         _record_parent_synthesis_if_needed(store, assignment, parsed.summary)
         store.archive_assignment(assignment, executive_summary=parsed.summary)
         store.upsert_agent_state(

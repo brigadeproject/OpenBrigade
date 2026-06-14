@@ -54,6 +54,10 @@ then:
 The orchestrator must not silently mutate agent identity, memory, or tools. Any future
 self-improvement cycle should produce explicit decisions, proposed tasks, or human-review items.
 
+The full v1.0 orchestration design — the cycle contract, work-or-reason outcome taxonomy,
+chief-first dispatch, blocker-resolution ladder, intake triggers, rest cycles, and training-data
+export — is specified in `ORCHESTRATION.md`.
+
 ## Agent Runner
 
 The runner executes one active assignment for one agent. It validates the `HEARTBEAT.md` assignment

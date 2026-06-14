@@ -1306,10 +1306,31 @@ function OrchestrationActivity({ telemetry }: { telemetry: OrchestrationPayload 
 }
 
 function orchestrationEventKind(event: OrchestrationEvent) {
-  if (event.status === "proposed" || event.type === "proactive_proposal") {
+  if (event.type === "cycle_outcome") {
+    return (event.decision || "cycle outcome").replace(/_/g, " ");
+  }
+  if (event.type.startsWith("ladder_")) {
+    return event.type.replace(/_/g, " ");
+  }
+  if (event.type === "rest_scheduled" || event.type === "rest_completed") {
+    return event.type.replace(/_/g, " ");
+  }
+  if (event.type === "recurrence_materialized") {
+    return "recurrence";
+  }
+  if (
+    event.status === "proposed" ||
+    event.type === "proactive_proposal" ||
+    event.type === "intake_proposal" ||
+    event.type === "proposal_created"
+  ) {
     return "proposal";
   }
-  if (event.status === "created" || event.decision === "created") {
+  if (
+    event.status === "created" ||
+    event.decision === "created" ||
+    event.type === "intake_created"
+  ) {
     return "created";
   }
   if (event.type === "delegated_task") {
@@ -1326,7 +1347,17 @@ function orchestrationEventClass(event: OrchestrationEvent) {
   if (kind === "proposal") {
     return "proposed";
   }
-  if (["created", "assigned", "delegated", "synthesis"].includes(kind)) {
+  if (kind === "ladder escalated human" || kind === "no work") {
+    return "blocked";
+  }
+  if (kind.startsWith("ladder") || kind.startsWith("rest")) {
+    return "active";
+  }
+  if (
+    ["created", "assigned", "delegated", "synthesis", "recurrence", "worked"].includes(
+      kind,
+    )
+  ) {
     return "active";
   }
   if (["blocked", "skipped"].includes(kind)) {

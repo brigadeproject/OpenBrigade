@@ -15,8 +15,13 @@ The core is real and runs: a sound tool-use loop, a genuinely proactive orchestr
 idle/stale detection and bounded LLM escalation, working Telegram, multi-provider model
 access (Claude/OpenAI/Gemini API + Ollama), and **both** a web GUI and a TUI wired to the
 same backend. You are *ahead* of the proactive reference set on orchestration and at parity
-with Hermes on GUI/TUI. **Per the scope decisions below, there are no hard RC blockers
-left.** Several former latent-feature gaps have since landed: per-agent model selection
+with Hermes on GUI/TUI. **Per the scope decisions below, no hard code blockers remain, and the
+live hardening checks pass as of 2026-06-14: the bad-heartbeat gate
+(`./ops/test-bad-heartbeats.sh`) passes after the heartbeat-repair fix and is now re-runnable,
+and the destructive blank-userland new-user pass (`./ops/full-wipe.sh --confirm-full-wipe` +
+fresh owner/agent/team/goal/delegation onboarding) passes with `empty_userland: true`. The
+README truth-pass is the only remaining gate.** Several former
+latent-feature gaps have since landed: per-agent model selection
 during managed runs, structured subtask creation, delegation guards, malformed
 orchestrator-output degradation, default-provider fallback for managed agent runs, connector
 rate/size limits, and packaged web build serving all exist in code and tests. The remaining
@@ -153,8 +158,13 @@ each becomes a documentation change now + a roadmap item later.
 
 ## Minimum path to a defensible RC
 
-With the scope decisions in Section A, **no hard blockers remain.** The RC ships once the
-README matches reality and the cheap "latent feature" fixes land:
+With the scope decisions in Section A, **no hard code blockers remain, and the live hardening
+checks pass as of 2026-06-14:** the bad-heartbeat gate passes after the heartbeat-repair fix,
+and the destructive blank-userland new-user pass passes (clean wipe → rebuild → migrate →
+`empty_userland: true`, then a fresh owner + token, agent/team/Crew Chief, goal, and
+delegate/route-work all succeed on the empty stack). The README truth-pass is the only
+remaining gate. The RC ships once the README matches reality and the cheap
+"latent feature" fixes land:
 
 **1. README truth-pass (≈ half a day, all small):**
 - Claude = API key (not OAuth). — item 2
@@ -167,7 +177,10 @@ README matches reality and the cheap "latent feature" fixes land:
 - **Item 7** — malformed orchestrator model output degrades to `no_action`.
 - **Item 8** — managed runs retry per-agent provider failures with the default provider.
 - **Item 11** — the built web GUI is packaged and served.
-- **Item 12** — rerun the documented proactivity demo during final RC validation.
+- **Item 12** — the documented proactivity demo was reproduced on 2026-06-14: propose-only
+  mission continuation (`proposed=1 created=0`, `trigger=mission_idle_no_active_or_queued_work`)
+  with `orchestrator-proactive:v1:<sha256>` provenance and idempotent `duplicate_idempotency_key`
+  dedupe on the following cycle.
 
 **3. MCP Client:**
 - MCP client **(Item 1)** — unlocks Google tools and broad third-party tooling in one stroke.

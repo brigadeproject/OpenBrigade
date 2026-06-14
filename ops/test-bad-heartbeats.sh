@@ -53,7 +53,40 @@ ensure_test_agent() {
     >/dev/null
 }
 
+reset_test_agent() {
+  # Scoped strictly to the dedicated test agent: archive any active assignments
+  # it still owns (only this gate ever creates them) and force it back to idle,
+  # so a prior aborted run cannot strand the agent and block every future run.
+  local agent_id="$1"
+  docker exec -i "$CONTAINER" python - "$agent_id" <<'PY'
+import json
+import sys
+
+from brigade.config import load_settings
+from brigade.schemas import AgentState
+from brigade.store import open_state_store
+
+agent_id = sys.argv[1]
+store = open_state_store(load_settings())
+archived = []
+for item in store.assignments():
+    if item.assigned_to == agent_id:
+        store.archive_assignment(item, executive_summary="bad-heartbeat gate pre-run reset")
+        archived.append(item.assignment_id)
+previous = store.agent_states().get(agent_id)
+store.upsert_agent_state(
+    AgentState(
+        agent=agent_id,
+        status="idle",
+        last_completed=previous.last_completed if previous else None,
+    )
+)
+print(json.dumps({"reset_archived": archived}))
+PY
+}
+
 ensure_test_agent "$AGENT"
+reset_test_agent "$AGENT" >"$WORK_DIR/reset-before.json"
 ./ops/brigade-live.sh status --json >"$WORK_DIR/status-before.json"
 
 python3 - "$WORK_DIR/status-before.json" "$AGENT" <<'PY'

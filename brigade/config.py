@@ -18,6 +18,18 @@ class Settings:
     proactive_creation_enabled: bool = False
     max_proactive_proposals_per_cycle: int = 1
     max_proactive_creations_per_cycle: int = 1
+    intake_mode: str = "propose"
+    max_intake_assignments_per_cycle: int = 2
+    intake_route_chief: str | None = None
+    intake_default_priority: str = "normal"
+    rest_enabled: bool = True
+    rest_window_start_utc: str = "03:00"
+    rest_window_end_utc: str = "05:00"
+    rest_idle_cycles_threshold: int = 6
+    rest_min_interval_seconds: int = 86_400
+    blocker_resolution_enabled: bool = True
+    recurrence_detection_threshold: int = 3
+    recurrence_lookback_days: int = 14
     postgres_dsn: str | None = None
     redis_url: str | None = None
     qdrant_url: str | None = None
@@ -228,6 +240,74 @@ def load_settings(
             "BRIGADE_MAX_PROACTIVE_CREATIONS_PER_CYCLE",
             dotenv,
             config.get("max_proactive_creations_per_cycle", 1),
+        ),
+        intake_mode=(
+            _env("BRIGADE_INTAKE_MODE", dotenv, config.get("intake_mode", "propose"))
+            or "propose"
+        ),
+        max_intake_assignments_per_cycle=_env_int(
+            "BRIGADE_MAX_INTAKE_ASSIGNMENTS_PER_CYCLE",
+            dotenv,
+            config.get("max_intake_assignments_per_cycle", 2),
+        ),
+        intake_route_chief=_env(
+            "BRIGADE_INTAKE_ROUTE_CHIEF",
+            dotenv,
+            config.get("intake_route_chief"),
+        ),
+        intake_default_priority=(
+            _env(
+                "BRIGADE_INTAKE_DEFAULT_PRIORITY",
+                dotenv,
+                config.get("intake_default_priority", "normal"),
+            )
+            or "normal"
+        ),
+        rest_enabled=_env_bool(
+            "BRIGADE_REST_ENABLED",
+            dotenv,
+            config.get("rest_enabled", True),
+        ),
+        rest_window_start_utc=(
+            _env(
+                "BRIGADE_REST_WINDOW_START_UTC",
+                dotenv,
+                config.get("rest_window_start_utc", "03:00"),
+            )
+            or "03:00"
+        ),
+        rest_window_end_utc=(
+            _env(
+                "BRIGADE_REST_WINDOW_END_UTC",
+                dotenv,
+                config.get("rest_window_end_utc", "05:00"),
+            )
+            or "05:00"
+        ),
+        rest_idle_cycles_threshold=_env_int(
+            "BRIGADE_REST_IDLE_CYCLES_THRESHOLD",
+            dotenv,
+            config.get("rest_idle_cycles_threshold", 6),
+        ),
+        rest_min_interval_seconds=_env_int(
+            "BRIGADE_REST_MIN_INTERVAL_SECONDS",
+            dotenv,
+            config.get("rest_min_interval_seconds", 86_400),
+        ),
+        blocker_resolution_enabled=_env_bool(
+            "BRIGADE_BLOCKER_RESOLUTION_ENABLED",
+            dotenv,
+            config.get("blocker_resolution_enabled", True),
+        ),
+        recurrence_detection_threshold=_env_int(
+            "BRIGADE_RECURRENCE_DETECTION_THRESHOLD",
+            dotenv,
+            config.get("recurrence_detection_threshold", 3),
+        ),
+        recurrence_lookback_days=_env_int(
+            "BRIGADE_RECURRENCE_LOOKBACK_DAYS",
+            dotenv,
+            config.get("recurrence_lookback_days", 14),
         ),
         postgres_dsn=postgres_dsn,
         redis_url=redis_url,

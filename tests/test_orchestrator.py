@@ -7,6 +7,7 @@ from brigade.orchestrator import (
     apply_orchestrator_actions,
     build_cycle_reasoning_record,
     build_orchestration_telemetry,
+    classify_cycle_outcome,
     derive_agent_states,
     deterministic_cycle,
     evaluate_mission_continuation,
@@ -486,13 +487,25 @@ def test_orchestration_telemetry_normalizes_cycle_decisions():
         [assignment],
         result,
         states,
+        cycle_outcome=classify_cycle_outcome(
+            mission_present=True,
+            assignments=[assignment],
+            dispatch=result,
+        ),
     )
 
     telemetry = build_orchestration_telemetry([record])
 
-    assert telemetry["latest_event"]["decision"] == "assigned"
-    assert telemetry["latest_event"]["assignment_id"] == assignment.assignment_id
+    # v1.0 appends a cycle_outcome event after the per-assignment decisions.
+    assert telemetry["latest_event"]["type"] == "cycle_outcome"
+    assert telemetry["latest_event"]["decision"] == "worked"
+    decision_events = [
+        event for event in telemetry["events"] if event["type"] == "cycle_decision"
+    ]
+    assert decision_events[0]["decision"] == "assigned"
+    assert decision_events[0]["assignment_id"] == assignment.assignment_id
     assert telemetry["counts"]["cycle_decision"] == 1
+    assert telemetry["counts"]["cycle_outcome"] == 1
 
 
 def test_orchestration_telemetry_renders_legacy_reasoning_record():

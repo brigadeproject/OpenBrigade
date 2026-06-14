@@ -7,7 +7,7 @@ from typing import Any
 from brigade.schemas import Agent, Assignment, AssignmentStatus, Team
 from brigade.store import StateStore
 from brigade.time import parse_utc_iso, utc_now
-from brigade.tools import ToolRegistry, tool_manifest
+from brigade.tools import ToolRegistry, tool_manifest, workspace_tool_manifest
 
 DEFAULT_STALE_WORK_SECONDS = 86_400
 IMBALANCED_QUEUE_DEPTH = 2
@@ -29,6 +29,8 @@ CREW_CHIEF_SYSTEM_PROMPT = "\n".join(
         "You are an OpenBrigade Crew Chief.",
         "Keep your team's goals moving before the Orchestrator has to intervene.",
         "Reassign or delegate team work when a goal is stale or an agent is overloaded.",
+        "Route each task to the member whose specialties match it first; "
+        "give generalists the remainder.",
     ]
 )
 
@@ -106,7 +108,10 @@ def build_agent_floor(
         "dependency_state": dependency_state(store, assignment),
         "recent_agent_state": agent_state_context(store, agent.agent_id),
         "tool_observations": observations or [],
-        "available_tools": tool_manifest(registry),
+        "available_tools": [
+            *tool_manifest(registry),
+            *workspace_tool_manifest(store.data_dir / agent.workspace_path),
+        ],
     }
     if _is_crew_chief(agent, store.teams()):
         payload["crew_chief_floor"] = build_crew_chief_floor(
@@ -141,19 +146,24 @@ def build_goal_snapshots(
         activity_values.extend(str(item.get("archived_at") or "") for item in linked_done)
         last_activity = _latest_iso(activity_values)
         suppressed_until = _future_checkpoint(linked_open, now)
+        on_call = goal.engagement_mode == "on_call"
         stale = (
-            last_activity is not None
+            not on_call
+            and last_activity is not None
             and _age_seconds(last_activity, now) > stale_seconds
             and suppressed_until is None
             and not (not linked_open and linked_done)
         )
         status = _goal_status(stale, linked_open, linked_done)
+        if on_call and status == "unworked":
+            status = "on_call"
         snapshots.append(
             {
                 "id": str(record["goal_id"]),
                 "agent_id": agent_id,
                 "title": goal.statement,
                 "status": status,
+                "engagement_mode": goal.engagement_mode,
                 "last_activity": last_activity,
                 "tasks_open": len(linked_open),
                 "tasks_done": len(linked_done),
@@ -181,9 +191,124 @@ def build_crew_chief_load(store: StateStore) -> list[dict[str, Any]]:
     ]
 
 
+def build_chat_status_context(store: StateStore, agent_id: str) -> dict[str, Any]:
+    """Live status context for chat, so a chief answers about current work,
+    priorities, and blockers from state, not memory.
+
+    Chiefs see goals with engagement modes, member load and specialties,
+    queue depth, active work with progress, blockers, awaiting-human items,
+    and recent team alerts. Line workers see their own state and active
+    assignment.
+    """
+    agent = next(
+        (item for item in store.agents() if item.agent_id == agent_id), None
+    )
+    teams = store.teams()
+    assignments = store.assignments()
+    own_active = [
+        item.to_dict()
+        for item in assignments
+        if item.assigned_to == agent_id
+        and item.status
+        in {
+            AssignmentStatus.ASSIGNED,
+            AssignmentStatus.WORKING,
+            AssignmentStatus.BLOCKED,
+        }
+    ]
+    context: dict[str, Any] = {
+        "agent_id": agent_id,
+        "role": "crew_chief"
+        if agent is not None and _is_crew_chief(agent, teams)
+        else "line_worker",
+        "state": agent_state_context(store, agent_id),
+        "active_assignments": own_active,
+    }
+    if context["role"] != "crew_chief":
+        return context
+
+    managed = sorted(_managed_agent_ids(teams, agent_id))
+    goals = [
+        {
+            "agent_id": goal_agent_id,
+            "statement": goal.statement,
+            "engagement_mode": getattr(goal, "engagement_mode", "directive"),
+        }
+        for goal_agent_id, agent_goals in store.goals().items()
+        if goal_agent_id in managed
+        for goal in agent_goals
+    ]
+    team_assignments = [item for item in assignments if item.assigned_to in managed]
+    queued = [
+        item for item in team_assignments if item.status == AssignmentStatus.QUEUED
+    ]
+    active = [
+        item
+        for item in team_assignments
+        if item.status
+        in {
+            AssignmentStatus.ASSIGNED,
+            AssignmentStatus.WORKING,
+            AssignmentStatus.BLOCKED,
+        }
+    ]
+    blocked = [item for item in active if item.status == AssignmentStatus.BLOCKED]
+    managed_terms = set(managed) | {
+        item.assignment_id for item in team_assignments
+    }
+    team_alerts = [
+        alert
+        for alert in store.alerts()
+        if any(term in alert for term in managed_terms)
+    ][-5:]
+    context.update(
+        {
+            "goals": goals,
+            "member_load": build_agent_load(store, managed),
+            "queue_depth": len(queued),
+            "queued": [
+                {
+                    "assignment_id": item.assignment_id,
+                    "assigned_to": item.assigned_to,
+                    "priority": item.priority.value,
+                    "assignment": item.assignment[:160],
+                }
+                for item in queued
+            ],
+            "active_work": [
+                {
+                    "assignment_id": item.assignment_id,
+                    "assigned_to": item.assigned_to,
+                    "status": item.status.value,
+                    "priority": item.priority.value,
+                    "assignment": item.assignment[:160],
+                    "progress_summary": item.progress_summary,
+                }
+                for item in active
+            ],
+            "blockers": [
+                {
+                    "assignment_id": item.assignment_id,
+                    "assigned_to": item.assigned_to,
+                    "blockers": item.blockers,
+                    "last_error": item.last_error,
+                    "consecutive_failures": item.consecutive_failures,
+                }
+                for item in blocked
+            ],
+            "awaiting_human": [
+                item.assignment_id for item in blocked if item.awaiting_human
+            ],
+            "team_alerts": team_alerts,
+        }
+    )
+    return context
+
+
 def build_agent_load(store: StateStore, agent_ids: list[str]) -> list[dict[str, Any]]:
     assignments = store.assignments()
     states = store.agent_states()
+    specialties_by_agent = {agent.agent_id: agent.specialties for agent in store.agents()}
     rows = []
     for agent_id in agent_ids:
         queued = [
@@ -209,6 +334,7 @@ def build_agent_load(store: StateStore, agent_ids: list[str]) -> list[dict[str, 
                 "state": state.status if state else ("busy" if open_items else "idle"),
                 "queue_depth": len(queued),
                 "open_tasks": len(open_items),
+                "specialties": specialties_by_agent.get(agent_id, []),
             }
         )
     return rows

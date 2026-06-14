@@ -153,6 +153,46 @@ def default_tool_registry() -> ToolRegistry:
         ),
         _create_subtasks,
     )
+    registry.register(
+        ToolSpec(
+            name="request_tool",
+            description=(
+                "Request a new workspace tool: records a tool_request proposal "
+                "for approval. Never builds anything directly."
+            ),
+            argument_schema={
+                "name": "tool name (becomes tools/<name> after approval)",
+                "purpose": "what problem the tool solves",
+                "spec": "expected arguments and behavior",
+            },
+        ),
+        _request_tool,
+    )
+    registry.register(
+        ToolSpec(
+            name="approve_proposal",
+            description=(
+                "Crew chiefs only: approve a pending proposal raised by your "
+                "own team."
+            ),
+            argument_schema={"proposal_id": "the proposal to approve"},
+        ),
+        _approve_proposal,
+    )
+    registry.register(
+        ToolSpec(
+            name="run_workspace_tool",
+            description=(
+                "Run an approved executable from the workspace tools/ "
+                "directory through the sandboxed subprocess guard."
+            ),
+            argument_schema={
+                "name": "tool name under tools/",
+                "args": "optional array of string arguments",
+            },
+        ),
+        _run_workspace_tool,
+    )
     return registry
 
 
@@ -165,6 +205,33 @@ def tool_manifest(registry: ToolRegistry) -> list[dict[str, Any]]:
         }
         for spec in registry.specs()
     ]
+
+
+def workspace_tool_manifest(workspace: Path) -> list[dict[str, Any]]:
+    """Descriptors for agent-built tools (``tools/*.json``), merged into the
+    agent floor so a new tool is usable on the very next heartbeat."""
+    tools_dir = workspace / "tools"
+    if not tools_dir.exists():
+        return []
+    manifest: list[dict[str, Any]] = []
+    for path in sorted(tools_dir.glob("*.json")):
+        try:
+            descriptor = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(descriptor, dict):
+            continue
+        name = str(descriptor.get("name") or path.stem)
+        manifest.append(
+            {
+                "name": name,
+                "description": str(descriptor.get("description") or ""),
+                "argument_schema": descriptor.get("argument_schema") or {},
+                "workspace_tool": True,
+                "invoke_with": "run_workspace_tool",
+            }
+        )
+    return manifest
 
 
 def _safe_workspace_path(workspace: Path, raw_path: str | None) -> Path:
@@ -429,6 +496,127 @@ def _create_subtasks(context: ToolContext, arguments: dict[str, Any]) -> ToolRes
         True,
         f"created {len(created)} queued subtasks",
         {"created": created},
+    )
+
+
+def _request_tool(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    from brigade.orchestrator import orchestration_event, record_orchestration_events
+    from brigade.schemas import build_proposal
+
+    name = _required_text(arguments, "name").strip()
+    purpose = _required_text(arguments, "purpose")
+    spec = _required_text(arguments, "spec")
+    proposal = build_proposal(
+        kind="tool_request",
+        title=f"Tool request: {name}",
+        agent_id=context.agent.agent_id,
+        team_id=context.agent.team_id,
+        details={
+            "name": name,
+            "purpose": purpose,
+            "spec": spec,
+            "requested_in_assignment": context.assignment.assignment_id,
+        },
+        idempotency_key=f"tool-request:v1:{context.agent.agent_id}:{name}",
+    )
+    persisted = context.store.add_proposal(proposal)
+    if persisted.get("proposal_id") != proposal["proposal_id"]:
+        return ToolResult(
+            True,
+            f"tool request for '{name}' already pending "
+            f"as proposal {persisted.get('proposal_id')}",
+            {"proposal_id": persisted.get("proposal_id"), "status": "existing"},
+        )
+    context.store.add_alert(
+        f"tool request from {context.agent.agent_id}: '{name}' "
+        f"(proposal {proposal['proposal_id']}) awaits approval"
+    )
+    record_orchestration_events(
+        context.store,
+        source="tool_request",
+        decision_summary=f"tool request '{name}' proposed by {context.agent.agent_id}",
+        events=[
+            orchestration_event(
+                "proposal_created",
+                f"Agent {context.agent.agent_id} requested tool '{name}'.",
+                source="tool_request",
+                decision="proposed",
+                status="proposed",
+                assignment_id=context.assignment.assignment_id,
+                agent_id=context.agent.agent_id,
+                idempotency_key=proposal["idempotency_key"],
+                payload=proposal,
+            )
+        ],
+    )
+    return ToolResult(
+        True,
+        f"tool request '{name}' recorded as proposal {proposal['proposal_id']}; "
+        "it will be built after approval",
+        {"proposal_id": proposal["proposal_id"], "status": "proposed"},
+    )
+
+
+def _approve_proposal(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    from brigade.services import decide_proposal
+
+    proposal_id = _required_text(arguments, "proposal_id")
+    proposal = context.store.find_proposal(proposal_id)
+    if proposal is None:
+        return ToolResult(False, f"unknown proposal: {proposal_id}")
+    own_teams = {
+        team.team_id
+        for team in context.store.teams()
+        if team.crew_chief_id == context.agent.agent_id
+    }
+    if not own_teams:
+        return ToolResult(False, "approve_proposal is limited to crew chiefs")
+    if proposal.get("team_id") not in own_teams:
+        return ToolResult(
+            False,
+            "approve_proposal is limited to proposals raised by your own team",
+        )
+    decided = decide_proposal(
+        context.store,
+        proposal_id=proposal_id,
+        decision="approved",
+        decided_by=context.agent.agent_id,
+    )
+    effects = (decided.get("details") or {}).get("approval_effects") or {}
+    return ToolResult(
+        True,
+        f"proposal {proposal_id} approved",
+        {"proposal_id": proposal_id, "approval_effects": effects},
+    )
+
+
+def _run_workspace_tool(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    name = _required_text(arguments, "name")
+    args = arguments.get("args") or []
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        return ToolResult(False, "args must be an array of strings")
+    tools_dir = _safe_workspace_path(context.workspace, "tools")
+    tool_path = _safe_workspace_path(context.workspace, f"tools/{name}")
+    if tool_path.parent != tools_dir:
+        return ToolResult(False, "tool name must resolve directly under tools/")
+    if not tool_path.exists() or not tool_path.is_file():
+        return ToolResult(False, f"workspace tool does not exist: tools/{name}")
+    # Same subprocess guard as shell: 30s cap, no shell interpreter.
+    completed = subprocess.run(
+        [str(tool_path), *args],
+        cwd=context.workspace,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    output = "\n".join(
+        part for part in (completed.stdout.strip(), completed.stderr.strip()) if part
+    )
+    return ToolResult(
+        completed.returncode == 0,
+        output[:12_000] or f"exit code {completed.returncode}",
+        {"exit_code": completed.returncode, "tool": name},
     )
 
 

@@ -136,6 +136,24 @@ class StateStore(Protocol):
 
     def orchestrator_reasoning(self) -> list[dict[str, Any]]: ...
 
+    def add_proposal(self, proposal: dict[str, Any]) -> dict[str, Any]: ...
+
+    def proposals(
+        self,
+        kind: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def find_proposal(self, proposal_id: str) -> dict[str, Any] | None: ...
+
+    def update_proposal(self, proposal: dict[str, Any]) -> None: ...
+
+    def add_recurrence(self, recurrence: dict[str, Any]) -> dict[str, Any]: ...
+
+    def recurrences(self, enabled: bool | None = None) -> list[dict[str, Any]]: ...
+
+    def update_recurrence(self, recurrence: dict[str, Any]) -> None: ...
+
     def add_usage_record(self, record: dict[str, Any]) -> None: ...
 
     def usage_records(self) -> list[dict[str, Any]]: ...
@@ -786,13 +804,14 @@ class PostgresStateStore:
         self._execute(
             """
             insert into brigade_agents (
-              id, display_name, workspace_path, role, status, created_at, record
+              id, display_name, workspace_path, role, status, specialties, created_at, record
             )
-            values (%s, %s, %s, %s, %s, %s, %s::jsonb)
+            values (%s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb)
             on conflict (id) do update set
               display_name = excluded.display_name,
               workspace_path = excluded.workspace_path,
               role = excluded.role,
+              specialties = excluded.specialties,
               record = excluded.record
             """,
             (
@@ -801,6 +820,7 @@ class PostgresStateStore:
                 agent.workspace_path,
                 agent.role,
                 "idle",
+                json.dumps(agent.specialties),
                 agent.created_at,
                 json.dumps(record, sort_keys=True),
             ),
@@ -1142,6 +1162,123 @@ class PostgresStateStore:
             self._records(
                 "select reasoning from brigade_orchestrator_reasoning order by cycle_at, id"
             )
+        )
+
+    def add_proposal(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        idempotency_key = proposal.get("idempotency_key")
+        if idempotency_key:
+            existing = self._record_or_none(
+                """
+                select record
+                from brigade_proposals
+                where idempotency_key = %s
+                order by created_at desc, id desc
+                limit 1
+                """,
+                (idempotency_key,),
+            )
+            if existing is not None:
+                return existing
+        self._upsert_proposal(proposal)
+        return proposal
+
+    def proposals(
+        self,
+        kind: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "select record from brigade_proposals"
+        clauses: list[str] = []
+        params: list[object] = []
+        if kind is not None:
+            clauses.append("kind = %s")
+            params.append(kind)
+        if status is not None:
+            clauses.append("status = %s")
+            params.append(status)
+        if clauses:
+            sql += " where " + " and ".join(clauses)
+        sql += " order by created_at, id"
+        return list(self._records(sql, tuple(params)))
+
+    def find_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        return self._record_or_none(
+            "select record from brigade_proposals where id = %s",
+            (proposal_id,),
+        )
+
+    def update_proposal(self, proposal: dict[str, Any]) -> None:
+        self._upsert_proposal(proposal)
+
+    def _upsert_proposal(self, proposal: dict[str, Any]) -> None:
+        self._execute(
+            """
+            insert into brigade_proposals (
+              id, kind, status, agent_id, team_id, created_at, updated_at,
+              idempotency_key, record
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            on conflict (id) do update set
+              kind = excluded.kind,
+              status = excluded.status,
+              agent_id = excluded.agent_id,
+              team_id = excluded.team_id,
+              updated_at = excluded.updated_at,
+              idempotency_key = excluded.idempotency_key,
+              record = excluded.record
+            """,
+            (
+                proposal["proposal_id"],
+                proposal["kind"],
+                proposal["status"],
+                proposal.get("agent_id"),
+                proposal.get("team_id"),
+                proposal["created_at"],
+                proposal.get("updated_at") or proposal["created_at"],
+                proposal.get("idempotency_key"),
+                json.dumps(proposal, sort_keys=True),
+            ),
+        )
+
+    def add_recurrence(self, recurrence: dict[str, Any]) -> dict[str, Any]:
+        self._upsert_recurrence(recurrence)
+        return recurrence
+
+    def recurrences(self, enabled: bool | None = None) -> list[dict[str, Any]]:
+        sql = "select record from brigade_recurrences"
+        params: tuple[object, ...] = ()
+        if enabled is not None:
+            sql += " where enabled = %s"
+            params = (enabled,)
+        sql += " order by next_due_at, id"
+        return list(self._records(sql, params))
+
+    def update_recurrence(self, recurrence: dict[str, Any]) -> None:
+        self._upsert_recurrence(recurrence)
+
+    def _upsert_recurrence(self, recurrence: dict[str, Any]) -> None:
+        self._execute(
+            """
+            insert into brigade_recurrences (
+              id, enabled, interval_seconds, next_due_at, created_at, updated_at, record
+            )
+            values (%s, %s, %s, %s, %s, %s, %s::jsonb)
+            on conflict (id) do update set
+              enabled = excluded.enabled,
+              interval_seconds = excluded.interval_seconds,
+              next_due_at = excluded.next_due_at,
+              updated_at = excluded.updated_at,
+              record = excluded.record
+            """,
+            (
+                recurrence["recurrence_id"],
+                bool(recurrence.get("enabled", True)),
+                int(recurrence["interval_seconds"]),
+                recurrence["next_due_at"],
+                recurrence["created_at"],
+                recurrence.get("updated_at") or recurrence["created_at"],
+                json.dumps(recurrence, sort_keys=True),
+            ),
         )
 
     def add_usage_record(self, record: dict[str, Any]) -> None:
@@ -1647,9 +1784,9 @@ class PostgresStateStore:
             """
             insert into brigade_goals (
               id, agent_id, statement, success_criteria, explicitly_not,
-              set_by, human_confirmed, set_at, record
+              set_by, human_confirmed, set_at, engagement_mode, record
             )
-            values (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb)
+            values (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s::jsonb)
             """,
             (
                 str(uuid4()),
@@ -1660,6 +1797,7 @@ class PostgresStateStore:
                 goal.set_by,
                 goal.human_confirmed,
                 goal.set_at,
+                goal.engagement_mode,
                 json.dumps(record, sort_keys=True),
             ),
         )
@@ -1677,6 +1815,7 @@ class PostgresStateStore:
             assignment.work_mode.value,
             assignment.status.value,
             assignment.priority.value,
+            assignment.kind.value,
             assignment.estimated_cycles,
             assignment.cycle_count,
             assignment.checkpoint_at,
@@ -1703,14 +1842,14 @@ class PostgresStateStore:
         sql = """
             insert into brigade_assignments (
               id, created_at, updated_at, created_by, assigned_to, source, assignment,
-              work_mode, status, priority, estimated_cycles, cycle_count, checkpoint_at,
+              work_mode, status, priority, kind, estimated_cycles, cycle_count, checkpoint_at,
               parent_assignment_id, result_artifact_ids, transcript_path, state_row_written_to,
               progress_summary, blockers, consecutive_failures, last_error, awaiting_human,
               last_run_provider, last_run_model, last_run_at, dependency_ids, goal_statement,
               assignment_rationale, created_by_user_id, created_by_role, idempotency_key, record
             )
             values (
-              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
+              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
               %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb
             )
             on conflict (id) do update set
@@ -1723,6 +1862,7 @@ class PostgresStateStore:
               work_mode = excluded.work_mode,
               status = excluded.status,
               priority = excluded.priority,
+              kind = excluded.kind,
               estimated_cycles = excluded.estimated_cycles,
               cycle_count = excluded.cycle_count,
               checkpoint_at = excluded.checkpoint_at,

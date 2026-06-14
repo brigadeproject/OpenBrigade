@@ -26,6 +26,19 @@ class Priority(str, Enum):
     URGENT = "urgent"
 
 
+class AssignmentKind(str, Enum):
+    MISSION = "mission"
+    REST = "rest"
+    MAINTENANCE = "maintenance"
+    FAILURE_ANALYSIS = "failure_analysis"
+    TOOL_BUILD = "tool_build"
+
+
+class GoalEngagementMode(str, Enum):
+    DIRECTIVE = "directive"
+    ON_CALL = "on_call"
+
+
 class WorkMode(str, Enum):
     HEARTBEAT = "heartbeat"
     STANDARD = "standard"
@@ -37,6 +50,9 @@ class Role(str, Enum):
     OPERATOR = "operator"
     OBSERVER = "observer"
 
+
+PROPOSAL_KINDS = frozenset({"efficiency", "tool_request", "rest_insight"})
+PROPOSAL_STATUSES = frozenset({"proposed", "approved", "rejected", "implemented", "expired"})
 
 TERMINAL_STATUSES = {
     AssignmentStatus.COMPLETE,
@@ -97,11 +113,14 @@ class Goal:
     set_by: str
     human_confirmed: bool = False
     set_at: str = field(default_factory=utc_now_iso)
+    engagement_mode: str = GoalEngagementMode.DIRECTIVE.value
 
     def __post_init__(self) -> None:
         _require_text(self.statement, "goal statement")
         if self.explicitly_not is None:
             raise ValueError("goal explicitly_not is required")
+        if self.engagement_mode not in {mode.value for mode in GoalEngagementMode}:
+            raise ValueError(f"invalid goal engagement_mode: {self.engagement_mode}")
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -119,6 +138,7 @@ class Assignment:
     work_mode: WorkMode = WorkMode.HEARTBEAT
     status: AssignmentStatus = AssignmentStatus.QUEUED
     priority: Priority = Priority.NORMAL
+    kind: AssignmentKind = AssignmentKind.MISSION
     estimated_cycles: int = 1
     cycle_count: int = 0
     checkpoint_at: str | None = None
@@ -208,6 +228,7 @@ class Assignment:
         payload["work_mode"] = self.work_mode.value
         payload["status"] = self.status.value
         payload["priority"] = self.priority.value
+        payload["kind"] = self.kind.value
         return payload
 
 
@@ -221,6 +242,7 @@ class AgentState:
     blockers: list[str] = field(default_factory=list)
     last_completed: str | None = None
     next_available: str = "now"
+    idle_cycles: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -235,6 +257,7 @@ class Agent:
     team_id: str | None = None
     model_provider: str = "ollama"
     model_name: str = "gpt-oss:20b"
+    specialties: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now_iso)
 
     def __post_init__(self) -> None:
@@ -320,6 +343,7 @@ def goal_from_dict(item: dict[str, Any]) -> Goal:
         set_by=item["set_by"],
         human_confirmed=item.get("human_confirmed", False),
         set_at=item["set_at"],
+        engagement_mode=item.get("engagement_mode", GoalEngagementMode.DIRECTIVE.value),
     )
 
 
@@ -335,6 +359,7 @@ def assignment_from_dict(item: dict[str, Any]) -> Assignment:
         work_mode=WorkMode(item.get("work_mode", WorkMode.HEARTBEAT.value)),
         status=AssignmentStatus(item["status"]),
         priority=Priority(item.get("priority", Priority.NORMAL.value)),
+        kind=AssignmentKind(item.get("kind", AssignmentKind.MISSION.value)),
         estimated_cycles=item.get("estimated_cycles", 1),
         cycle_count=item.get("cycle_count", 0),
         checkpoint_at=item.get("checkpoint_at"),
@@ -370,6 +395,7 @@ def agent_state_from_dict(item: dict[str, Any]) -> AgentState:
         blockers=item.get("blockers", []),
         last_completed=item.get("last_completed"),
         next_available=item.get("next_available", "now"),
+        idle_cycles=item.get("idle_cycles", 0),
     )
 
 
@@ -382,6 +408,7 @@ def agent_from_dict(item: dict[str, Any]) -> Agent:
         team_id=item.get("team_id"),
         model_provider=item.get("model_provider", "ollama"),
         model_name=item.get("model_name", "gpt-oss:20b"),
+        specialties=item.get("specialties", []),
         created_at=item["created_at"],
     )
 
@@ -419,6 +446,65 @@ def chat_message_from_dict(item: dict[str, Any]) -> ChatMessage:
         message_id=item["message_id"],
         created_at=item["created_at"],
     )
+
+
+def build_proposal(
+    *,
+    kind: str,
+    title: str,
+    agent_id: str | None = None,
+    team_id: str | None = None,
+    details: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
+    status: str = "proposed",
+) -> dict[str, Any]:
+    _require_text(title, "proposal title")
+    if kind not in PROPOSAL_KINDS:
+        raise ValueError(f"invalid proposal kind: {kind}")
+    if status not in PROPOSAL_STATUSES:
+        raise ValueError(f"invalid proposal status: {status}")
+    now = utc_now_iso()
+    return {
+        "proposal_id": str(uuid4()),
+        "kind": kind,
+        "status": status,
+        "title": title,
+        "agent_id": agent_id,
+        "team_id": team_id,
+        "details": details or {},
+        "idempotency_key": idempotency_key,
+        "created_at": now,
+        "updated_at": now,
+        "decided_by": None,
+        "decided_at": None,
+    }
+
+
+def build_recurrence(
+    *,
+    template: dict[str, Any],
+    interval_seconds: int,
+    next_due_at: str,
+    proposal_id: str | None = None,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(template, dict) or not str(template.get("assignment") or "").strip():
+        raise ValueError("recurrence template requires assignment text")
+    if interval_seconds <= 0:
+        raise ValueError("recurrence interval_seconds must be positive")
+    _require_text(next_due_at, "recurrence next_due_at")
+    now = utc_now_iso()
+    return {
+        "recurrence_id": str(uuid4()),
+        "enabled": enabled,
+        "interval_seconds": int(interval_seconds),
+        "next_due_at": next_due_at,
+        "template": dict(template),
+        "proposal_id": proposal_id,
+        "created_at": now,
+        "updated_at": now,
+        "last_materialized_at": None,
+    }
 
 
 def _require_text(value: str, name: str) -> None:

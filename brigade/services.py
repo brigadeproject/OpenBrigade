@@ -9,10 +9,20 @@ from uuid import uuid4
 from brigade.auth import AuthResult, build_user_identity_context
 from brigade.config import Settings
 from brigade.health import HealthCheck
-from brigade.orchestrator import build_orchestration_telemetry
+from brigade.orchestrator import (
+    build_orchestration_telemetry,
+    orchestration_event,
+    record_orchestration_events,
+)
 from brigade.providers import ModelProvider
 from brigade.runner import _acquire_local_inference_lock
-from brigade.schemas import Assignment, AssignmentStatus, ChatMessage, User
+from brigade.schemas import (
+    Assignment,
+    AssignmentKind,
+    AssignmentStatus,
+    ChatMessage,
+    User,
+)
 from brigade.store import StateStore
 from brigade.time import utc_now_iso
 
@@ -180,6 +190,18 @@ SAFE_CONFIG_KEYS = {
     "ollama_base_url": str,
     "web_host": str,
     "web_port": int,
+    "intake_mode": str,
+    "max_intake_assignments_per_cycle": int,
+    "intake_route_chief": str,
+    "intake_default_priority": str,
+    "rest_enabled": bool,
+    "rest_window_start_utc": str,
+    "rest_window_end_utc": str,
+    "rest_idle_cycles_threshold": int,
+    "rest_min_interval_seconds": int,
+    "blocker_resolution_enabled": bool,
+    "recurrence_detection_threshold": int,
+    "recurrence_lookback_days": int,
 }
 
 
@@ -254,7 +276,7 @@ def send_user_chat(
             _acquire_chat_local_inference_lock(store, agent_id)
             lock_acquired = True
         response = provider.complete(
-            _user_chat_prompt(agent.display_name, agent.agent_id, content, user)
+            _user_chat_prompt(agent.display_name, agent.agent_id, content, user, store)
         )
     except RuntimeError as exc:
         summary = str(exc)
@@ -453,6 +475,150 @@ def send_orchestrator_chat(
         "model": response.model,
         "route_type": response.route_type,
     }
+
+
+def decide_proposal(
+    store: StateStore,
+    *,
+    proposal_id: str,
+    decision: str,
+    decided_by: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    if decision not in {"approved", "rejected"}:
+        raise ValueError(f"unsupported proposal decision: {decision}")
+    proposal = store.find_proposal(proposal_id)
+    if proposal is None:
+        raise ValueError(f"unknown proposal: {proposal_id}")
+    if proposal.get("status") != "proposed":
+        raise ValueError(f"proposal {proposal_id} is already {proposal.get('status')}")
+    proposal["status"] = decision
+    proposal["decided_by"] = decided_by
+    proposal["decided_at"] = utc_now_iso()
+    proposal["updated_at"] = proposal["decided_at"]
+    if reason:
+        proposal.setdefault("details", {})["decision_reason"] = reason
+    if decision == "approved":
+        effects = _apply_proposal_approval(store, proposal)
+        if effects:
+            proposal.setdefault("details", {})["approval_effects"] = effects
+    store.update_proposal(proposal)
+    mission = store.mission()
+    record_orchestration_events(
+        store,
+        source="proposal_decision",
+        decision_summary=f"proposal {proposal_id} {decision} by {decided_by}",
+        mission_statement=mission.statement if mission else None,
+        events=[
+            orchestration_event(
+                "proposal_decided",
+                (
+                    f"Proposal '{proposal.get('title')}' ({proposal.get('kind')}) "
+                    f"was {decision} by {decided_by}."
+                ),
+                source="proposal_decision",
+                decision=decision,
+                status=decision,
+                mission_statement=mission.statement if mission else None,
+                agent_id=proposal.get("agent_id"),
+                idempotency_key=proposal.get("idempotency_key"),
+                payload=proposal,
+            )
+        ],
+    )
+    return proposal
+
+
+def _apply_proposal_approval(
+    store: StateStore,
+    proposal: dict[str, Any],
+) -> dict[str, Any]:
+    """Materialize what an approved proposal promises.
+
+    A ``tool_request`` becomes a ``kind=tool_build`` assignment for the
+    requesting team's chief; an ``efficiency`` proposal becomes a recurrence
+    record. ``rest_insight`` carries no side effect.
+    """
+    kind = proposal.get("kind")
+    if kind == "tool_request":
+        return _create_tool_build_assignment(store, proposal)
+    if kind == "efficiency":
+        return _create_recurrence_from_proposal(store, proposal)
+    return {}
+
+
+def _create_tool_build_assignment(
+    store: StateStore,
+    proposal: dict[str, Any],
+) -> dict[str, Any]:
+    from brigade.orchestrator import route_to_chief
+    from brigade.schemas import AssignmentKind, Priority
+
+    details = proposal.get("details") or {}
+    tool_name = str(details.get("name") or proposal.get("title") or "tool")
+    requesting_agent = proposal.get("agent_id")
+    chief = route_to_chief(store, agent_id=requesting_agent)
+    target = chief.agent_id if chief is not None else requesting_agent
+    if not target:
+        raise ValueError(
+            f"tool request {proposal.get('proposal_id')} has no routable owner"
+        )
+    idempotency_key = f"tool-build:v1:{proposal.get('proposal_id')}"
+    existing = store.find_assignment_by_idempotency_key(idempotency_key)
+    if existing is not None:
+        return {"assignment_id": existing.assignment_id}
+    assignment = Assignment(
+        assignment=(
+            f"Build the workspace tool '{tool_name}'. "
+            f"Purpose: {details.get('purpose') or 'not stated'}. "
+            f"Spec: {details.get('spec') or 'not stated'}. "
+            f"Produce an executable script at tools/{tool_name}, a descriptor "
+            f"tools/{tool_name}.json with name, description, and argument "
+            "schema, a usage note in TOOLS.md, and run the tool once as a "
+            "smoke test."
+        ),
+        assigned_to=target,
+        created_by="orchestrator",
+        source="proposal_approval",
+        kind=AssignmentKind.TOOL_BUILD,
+        priority=Priority.NORMAL,
+        assignment_rationale=(
+            f"Approved tool request proposal {proposal.get('proposal_id')} "
+            f"from {requesting_agent or 'unknown'}."
+        ),
+        created_by_role="orchestrator",
+        idempotency_key=idempotency_key,
+    )
+    persisted = store.add_assignment(assignment)
+    return {"assignment_id": persisted.assignment_id}
+
+
+def _create_recurrence_from_proposal(
+    store: StateStore,
+    proposal: dict[str, Any],
+) -> dict[str, Any]:
+    from brigade.schemas import build_recurrence
+    from brigade.time import add_seconds_iso
+
+    details = proposal.get("details") or {}
+    template = details.get("template")
+    interval_seconds = int(details.get("interval_seconds") or 0)
+    if not isinstance(template, dict) or interval_seconds <= 0:
+        raise ValueError(
+            f"efficiency proposal {proposal.get('proposal_id')} is missing "
+            "a recurrence template or interval"
+        )
+    next_due_at = str(
+        details.get("next_due_at") or add_seconds_iso(utc_now_iso(), interval_seconds)
+    )
+    recurrence = build_recurrence(
+        template=template,
+        interval_seconds=interval_seconds,
+        next_due_at=next_due_at,
+        proposal_id=str(proposal.get("proposal_id")),
+    )
+    persisted = store.add_recurrence(recurrence)
+    return {"recurrence_id": persisted.get("recurrence_id")}
 
 
 def build_hierarchy_payload(store: StateStore) -> dict[str, Any]:
@@ -808,6 +974,15 @@ def _agent_room(
                 reason="task room",
                 domain=explicit_room,
             )
+        if assignment.kind == AssignmentKind.REST:
+            # Dreaming agents rest in the Barracks; the dream-protocol text
+            # must never keyword-route into a work room.
+            return _room_projection(
+                "barracks",
+                source="assignment",
+                reason="rest cycle",
+                domain="dreaming",
+            )
         room_id, domain = _task_room_id(assignment, agent)
         return _room_projection(
             room_id,
@@ -956,18 +1131,31 @@ def _user_chat_prompt(
     agent_id: str,
     content: str,
     user: User | None,
+    store: StateStore | None = None,
 ) -> str:
+    from brigade.prompt_floors import build_chat_status_context
+
     username = user.username if user else "operator"
-    return "\n".join(
-        [
-            f"You are {display_name} ({agent_id}).",
-            f"User {username} is chatting with you through OpenBrigade.",
-            "Answer directly and concisely. If you need action, state the next concrete step.",
-            "",
-            "Message:",
-            content,
-        ]
-    )
+    lines = [
+        f"You are {display_name} ({agent_id}).",
+        f"User {username} is chatting with you through OpenBrigade.",
+        "Answer directly and concisely. If you need action, state the next concrete step.",
+    ]
+    if store is not None:
+        lines.extend(
+            [
+                "",
+                "Live status context (ground answers about current work, "
+                "priorities, and blockers in this, not memory):",
+                json.dumps(
+                    build_chat_status_context(store, agent_id),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ]
+        )
+    lines.extend(["", "Message:", content])
+    return "\n".join(lines)
 
 
 def _orchestrator_chat_prompt(store: StateStore, content: str, user: User | None) -> str:
