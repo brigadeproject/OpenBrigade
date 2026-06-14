@@ -9,6 +9,42 @@ Effort: **S** ≈ hours · **M** ≈ 1–3 days · **L** ≈ 1–2 weeks
 
 ---
 
+## Next Branch: v1.0.1 Web GUI Cleanup
+
+This branch starts the first post-RC UI pass on the web interface. The goal is not to widen
+backend scope; it is to make the existing operator surfaces feel intentional, flexible, and
+comfortable to use for long sessions while keeping runtime/provider/auth state truthful.
+
+### Primary themes
+
+1. **Cockpit panes should be movable and resizable.** — **L**
+   - *Why:* the current Cockpit is still a fixed `.widget-grid` in [`web/src/main.tsx`](../web/src/main.tsx)
+     and [`web/src/styles.css`](../web/src/styles.css), which makes the view functional but rigid.
+   - *Target:* support drag/reorder and resize behavior for major Cockpit widgets, with a stable
+     default layout and persisted operator preferences.
+   - *Guardrails:* preserve fast load, keep a sane non-JS/default layout, and avoid hiding critical
+     state such as alerts, mission status, auth warnings, provider/model routing, and orchestration telemetry.
+
+2. **Chat panes should feel like contemporary AI chat surfaces.** — **M**
+   - *Why:* the current orchestrator and agent chat panes are still simple feed-plus-textarea layouts.
+   - *Target:* improve message hierarchy, spacing, typography, timestamps, sticky compose behavior,
+     markdown rendering, and affordances so chat is comfortable across Cockpit and Ops Room.
+   - *Guardrails:* keep sender/recipient/model/runtime details explicit; do not simplify the UI in ways
+     that make provider, route, or permission state less truthful.
+
+3. **Capture operator pain points during live RC use.** — **M**
+   - *Why:* this branch should absorb real friction found while using the 1.0 RC rather than guessing.
+   - *Target:* treat this section as the running intake list for additional web GUI cleanup items as they surface.
+
+### Initial implementation order
+
+1. Define the pane-layout model and persistence approach for Cockpit.
+2. Refactor the Cockpit widget shell so widgets can participate in a movable/resizable layout.
+3. Refresh shared chat presentation primitives before polishing individual orchestrator/agent panes.
+4. Fold in user-tested pain points as they are discovered during RC use.
+
+---
+
 ## Where OpenBrigade stands (one paragraph)
 
 The core is real and runs: a sound tool-use loop, a genuinely proactive orchestrator with
