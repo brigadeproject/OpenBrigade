@@ -588,6 +588,20 @@ function App() {
 
   const statusTone = tokenExpired || authMessage ? "bad" : streamStatus === "live" ? "good" : "warn";
 
+  const authWarnings: string[] = [];
+  if (cockpit?.auth.unsafe_bind_without_auth) {
+    authWarnings.push(`Auth disabled on ${cockpit.auth.web_host}`);
+  }
+  if (tokenExpired) {
+    authWarnings.push("Token expired");
+  }
+  if (tokenMalformed) {
+    authWarnings.push("Token format unreadable");
+  }
+  if (authMessage) {
+    authWarnings.push(authMessage);
+  }
+
   return (
     <div className="ob-desktop">
       <main className="ob-window">
@@ -607,18 +621,13 @@ function App() {
           token={token}
           onTokenChange={setToken}
           onRefresh={() => refreshAll().catch((error) => setStatus(errorMessage(error)))}
+          warnings={authWarnings}
         />
 
         <section className="status-strip">
           <span className={`health-dot ${statusTone}`}>{auth?.user?.role || auth?.method || "auth"}</span>
           <span className={`health-dot ${streamStatus === "live" ? "good" : "warn"}`}>{streamStatus}</span>
           <span>{status}</span>
-          {cockpit?.auth.unsafe_bind_without_auth && (
-            <strong className="inline-warning">Auth disabled on {cockpit.auth.web_host}</strong>
-          )}
-          {tokenExpired && <strong className="inline-warning">Token expired</strong>}
-          {tokenMalformed && <strong className="inline-warning">Token format unreadable</strong>}
-          {authMessage && <strong className="inline-warning">{authMessage}</strong>}
         </section>
 
         {view === "cockpit" ? (
@@ -784,12 +793,14 @@ function TabStrip({
   token,
   onTokenChange,
   onRefresh,
+  warnings,
 }: {
   view: "cockpit" | "brigade";
   onSelect: (view: "cockpit" | "brigade") => void;
   token: string;
   onTokenChange: (token: string) => void;
   onRefresh: () => void;
+  warnings: string[];
 }) {
   return (
     <div className="ob-tabstrip">
@@ -810,14 +821,23 @@ function TabStrip({
       <span className="ob-tab disabled" aria-disabled="true">Telemetry</span>
       <span className="ob-tab disabled" aria-disabled="true">Knowledge Base</span>
       <span className="ob-tab-add" aria-hidden="true">+</span>
-      <div className="ob-tab-token token-control">
-        <input
-          aria-label="JWT token"
-          placeholder="JWT token"
-          value={token}
-          onChange={(event) => onTokenChange(event.target.value)}
-        />
-        <button onClick={onRefresh}>Refresh</button>
+      <div className="ob-tab-right">
+        {warnings.length > 0 && (
+          <div className="ob-tab-warnings">
+            {warnings.map((warning) => (
+              <strong key={warning} className="inline-warning">{warning}</strong>
+            ))}
+          </div>
+        )}
+        <div className="ob-tab-token token-control">
+          <input
+            aria-label="JWT token"
+            placeholder="JWT token"
+            value={token}
+            onChange={(event) => onTokenChange(event.target.value)}
+          />
+          <button onClick={onRefresh}>Refresh</button>
+        </div>
       </div>
     </div>
   );

@@ -1894,11 +1894,26 @@ button.danger:disabled {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
 }
 
-.ob-tab-token {
+.ob-tab-right {
   margin-left: auto;
   align-self: center;
   margin-bottom: 4px;
-  width: clamp(220px, 30vw, 360px);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.ob-tab-warnings {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.ob-tab-token {
+  flex: none;
+  width: clamp(200px, 26vw, 340px);
 }
 
 .ob-tab-token input,
@@ -2780,8 +2795,13 @@ button.danger:disabled {
     flex-wrap: wrap;
   }
 
-  .ob-tab-token {
+  .ob-tab-right {
     width: 100%;
     margin-left: 0;
+    flex-wrap: wrap;
+  }
+
+  .ob-tab-token {
+    width: 100%;
   }
 }
