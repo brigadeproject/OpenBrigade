@@ -1654,6 +1654,7 @@ button.danger:disabled {
 }
 
 .ob-window > .cockpit,
+.ob-window > .telemetry,
 .ob-window > .ops-layout {
   flex: 1;
   min-height: 0;
@@ -2799,6 +2800,157 @@ button.danger:disabled {
   display: grid;
   gap: 10px;
   padding: 11px;
+}
+
+/* ===== Telemetry ===== */
+.ob-telemetry-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 11px;
+  overflow: auto;
+}
+
+.ob-tele-banner {
+  flex: none;
+  padding: 8px 11px;
+  border-radius: 6px;
+  background: rgba(217, 106, 90, 0.12);
+  border: 1px solid rgba(217, 106, 90, 0.42);
+  box-shadow: var(--bevel-in);
+  color: var(--c-warn);
+  font: 11px var(--font);
+}
+
+.ob-tele-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px 0;
+}
+
+.ob-tele-head .ob-panel-title {
+  font-size: 11px;
+}
+
+.ob-telemetry-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(176px, 1fr));
+  gap: 9px;
+}
+
+.ob-metric-card {
+  padding: 10px 12px 11px;
+  gap: 5px;
+}
+
+.ob-metric-label {
+  font: 700 9px var(--font);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+}
+
+.ob-metric-value {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  font: 600 23px var(--font-mono);
+  color: var(--c-text);
+}
+
+.ob-metric-unit {
+  font: 12px var(--font-mono);
+  color: var(--c-text-faint);
+}
+
+.ob-metric-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 13px;
+  font: 10px var(--font);
+  color: var(--c-text-faint);
+}
+
+.ob-metric-card.pending {
+  border: 1px dashed var(--c-divider);
+}
+
+.ob-metric-card.pending .ob-metric-value {
+  color: var(--c-text-faint);
+  opacity: 0.5;
+}
+
+.ob-metric-card.pending .ob-metric-sub {
+  font-style: italic;
+}
+
+.ob-telemetry-panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(322px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.ob-tele-panel {
+  min-height: 0;
+}
+
+.ob-tele-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.ob-tele-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 11px;
+  border-bottom: 1px dotted rgba(255, 255, 255, 0.07);
+}
+
+.ob-tele-row:last-child {
+  border-bottom: none;
+}
+
+.ob-tele-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.ob-tele-row-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: 600 11px var(--font);
+  color: var(--c-text);
+}
+
+.ob-tele-row-detail {
+  font: 9.5px var(--font-mono);
+  color: var(--c-text-faint);
+  overflow-wrap: anywhere;
+}
+
+.ob-tele-row-tag {
+  flex: none;
+  font: 700 8.5px var(--font-mono);
+  letter-spacing: 0.06em;
+  color: var(--c-text-faint);
+}
+
+@media (max-width: 1180px) {
+  .ob-telemetry-cards {
+    grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+  }
+
+  .ob-telemetry-panels {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ===== Cockpit responsive ===== */

@@ -314,16 +314,25 @@ class ApiError extends Error {
   }
 }
 
-function initialView(): "cockpit" | "brigade" {
+function initialView(): "cockpit" | "brigade" | "telemetry" {
   const requested = new URLSearchParams(window.location.search).get("view");
   if (requested === "brigade" || requested === "ops") {
     return "brigade";
+  }
+  if (requested === "telemetry") {
+    return "telemetry";
   }
   if (requested === "cockpit") {
     return "cockpit";
   }
   const saved = localStorage.getItem("brigade_view");
-  return saved === "brigade" || saved === "ops" ? "brigade" : "cockpit";
+  if (saved === "brigade" || saved === "ops") {
+    return "brigade";
+  }
+  if (saved === "telemetry") {
+    return "telemetry";
+  }
+  return "cockpit";
 }
 
 function App() {
@@ -341,7 +350,7 @@ function App() {
   const [streamStatus, setStreamStatus] = useState("connecting");
   const [authClock, setAuthClock] = useState(Date.now());
   const [activePanel, setActivePanel] = useState<"tasks" | "chat" | "goals">("tasks");
-  const [view, setView] = useState<"cockpit" | "brigade">(() => initialView());
+  const [view, setView] = useState<"cockpit" | "brigade" | "telemetry">(() => initialView());
   const [taskDialogOpen, setTaskDialogOpen] = useState(false);
   const [taskDialogDraft, setTaskDialogDraft] = useState<TaskDialogDraft | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -653,6 +662,8 @@ function App() {
             setStatus={setStatus}
             onOpenTaskDialog={openTaskDialog}
           />
+        ) : view === "telemetry" ? (
+          <TelemetryView cockpit={cockpit} settings={settings} models={models} />
         ) : (
           <OpsRoomView
             snapshot={snapshot}
@@ -795,8 +806,8 @@ function TabStrip({
   onRefresh,
   warnings,
 }: {
-  view: "cockpit" | "brigade";
-  onSelect: (view: "cockpit" | "brigade") => void;
+  view: "cockpit" | "brigade" | "telemetry";
+  onSelect: (view: "cockpit" | "brigade" | "telemetry") => void;
   token: string;
   onTokenChange: (token: string) => void;
   onRefresh: () => void;
@@ -818,7 +829,13 @@ function TabStrip({
       >
         Brigade
       </button>
-      <span className="ob-tab disabled" aria-disabled="true">Telemetry</span>
+      <button
+        type="button"
+        className={`ob-tab ${view === "telemetry" ? "active" : ""}`}
+        onClick={() => onSelect("telemetry")}
+      >
+        Telemetry
+      </button>
       <span className="ob-tab disabled" aria-disabled="true">Knowledge Base</span>
       <span className="ob-tab-add" aria-hidden="true">+</span>
       <div className="ob-tab-right">
@@ -870,6 +887,308 @@ function AboutDialog({ cockpit, onClose }: { cockpit: CockpitPayload | null; onC
 
 function formatClock(date: Date) {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+const HOST_METRIC_CARDS: { label: string; unit?: string }[] = [
+  { label: "CPU Usage", unit: "%" },
+  { label: "CPU Temp", unit: "°C" },
+  { label: "GPU Usage", unit: "%" },
+  { label: "GPU Temp", unit: "°C" },
+  { label: "Memory", unit: "%" },
+  { label: "Disk", unit: "%" },
+  { label: "Load Avg" },
+  { label: "Host Uptime" },
+];
+
+function MetricCard({
+  label,
+  value,
+  sublabel,
+  unit,
+  tone,
+  pending,
+}: {
+  label: string;
+  value?: React.ReactNode;
+  sublabel?: string;
+  unit?: string;
+  tone?: "ok" | "warn" | "bad";
+  pending?: boolean;
+}) {
+  return (
+    <div className={`ob-panel ob-metric-card${pending ? " pending" : ""}`}>
+      <div className="ob-metric-label">{label}</div>
+      <div className="ob-metric-value">
+        {pending ? "—" : value}
+        {unit && !pending && <span className="ob-metric-unit">{unit}</span>}
+      </div>
+      <div className="ob-metric-sub">
+        {tone && !pending && <span className={`status-light ${tone === "ok" ? "ok" : tone === "bad" ? "bad" : ""}`} />}
+        <span>{pending ? "pending host collector" : sublabel || ""}</span>
+      </div>
+    </div>
+  );
+}
+
+function TelemetryRow({
+  tone,
+  name,
+  badge,
+  detail,
+  tag,
+}: {
+  tone: "ok" | "warn" | "bad";
+  name: React.ReactNode;
+  badge?: React.ReactNode;
+  detail?: React.ReactNode;
+  tag?: React.ReactNode;
+}) {
+  return (
+    <div className="ob-tele-row">
+      <span className={`status-light ${tone === "ok" ? "ok" : tone === "bad" ? "bad" : ""}`} />
+      <span className="ob-tele-row-main">
+        <span className="ob-tele-row-name">
+          {name}
+          {badge}
+        </span>
+        {detail && <span className="ob-tele-row-detail">{detail}</span>}
+      </span>
+      {tag && <span className="ob-tele-row-tag">{tag}</span>}
+    </div>
+  );
+}
+
+function TelemetryView({
+  cockpit,
+  settings,
+  models,
+}: {
+  cockpit: CockpitPayload | null;
+  settings: SettingsPayload | null;
+  models: ModelInventory | null;
+}) {
+  const usage = cockpit?.usage || null;
+  const datastores = cockpit?.datastores || [];
+  const options = models?.options || [];
+  const availableModels = options.filter((opt) => opt.available).length;
+  const okStores = datastores.filter((store) => store.ok).length;
+  const allStoresOk = datastores.length > 0 && okStores === datastores.length;
+  const unsafeBind = cockpit?.auth?.unsafe_bind_without_auth ?? false;
+  const localInference = (cockpit?.local_inference || null) as {
+    status?: string;
+    holder?: string | null;
+    next_available?: string | null;
+  } | null;
+  const cloudJobs = (cockpit?.cloud_jobs || []) as {
+    job_id?: string;
+    agent_id?: string;
+    provider?: string;
+    model?: string;
+    status?: string;
+  }[];
+  const infBusy = localInference?.status === "busy";
+
+  const settingValue = (key: string): string => {
+    const raw = settings ? settings[key] : null;
+    return raw === null || raw === undefined || raw === "" ? "—" : String(raw);
+  };
+
+  const settingsRows: { key: string; value: React.ReactNode }[] = [
+    {
+      key: "Authentication",
+      value: settings ? (
+        <span className={`ob-badge ${settings.require_auth ? "ok" : "warn"}`}>
+          {settings.require_auth ? "REQUIRED" : "OPEN"}
+        </span>
+      ) : (
+        "—"
+      ),
+    },
+    {
+      key: "Bind address",
+      value: settings ? (
+        <span className={unsafeBind ? "ob-bad" : undefined}>
+          {settings.web_host}:{settings.web_port}
+          {unsafeBind ? " ⚠ unsafe" : ""}
+        </span>
+      ) : (
+        "—"
+      ),
+    },
+    { key: "Default provider", value: settingValue("default_provider") },
+    { key: "Default model", value: settingValue("default_model") },
+    { key: "Log level", value: settingValue("log_level") },
+    {
+      key: "Orchestrator cadence",
+      value: settings?.orchestrator_cadence_seconds != null
+        ? `${settingValue("orchestrator_cadence_seconds")}s`
+        : "—",
+    },
+    { key: "Store backend", value: settingValue("store_backend") },
+    { key: "Config hash", value: settingValue("config_hash") },
+    { key: "API version", value: settingValue("api_version") },
+  ];
+
+  const storageRows: { key: string; value: React.ReactNode }[] = [
+    { key: "Data directory", value: settingValue("data_dir") },
+    { key: "Secret store", value: settingValue("secret_store_path") },
+    { key: "Ollama base URL", value: settingValue("ollama_base_url") },
+    { key: "Config path", value: settingValue("config_path") },
+  ];
+
+  return (
+    <section className="telemetry ob-telemetry-view">
+      {unsafeBind && (
+        <div className="ob-tele-banner">
+          ⚠ Gateway is bound to a non-loopback host without authentication
+          (unsafe_bind_without_auth). Treat this deployment as development-only.
+        </div>
+      )}
+
+      <div className="ob-tele-head">
+        <span className="ob-panel-title">Server &amp; Host</span>
+        <span className="ob-badge warn">PENDING HOST COLLECTOR</span>
+      </div>
+      <div className="ob-telemetry-cards">
+        {HOST_METRIC_CARDS.map((card) => (
+          <MetricCard key={card.label} label={card.label} unit={card.unit} pending />
+        ))}
+      </div>
+
+      <div className="ob-tele-head">
+        <span className="ob-panel-title">Gateway</span>
+        <span className="ob-badge subtle">live snapshot</span>
+      </div>
+      <div className="ob-telemetry-cards">
+        <MetricCard
+          label="Gateway Uptime"
+          value={cockpit ? formatDuration(cockpit.uptime_seconds) : "—"}
+          sublabel="web process"
+        />
+        <MetricCard
+          label="Models Available"
+          value={models ? `${availableModels}/${options.length}` : "—"}
+          sublabel="providers reachable"
+          tone={availableModels ? "ok" : "warn"}
+        />
+        <MetricCard
+          label="Total Tokens"
+          value={usage ? usage.total_tokens.toLocaleString() : "—"}
+          sublabel={usage?.last_recorded_at ? `last ${formatLogTime(usage.last_recorded_at)}` : "no usage yet"}
+        />
+        <MetricCard
+          label="Est. Cost"
+          value={usage ? `$${usage.estimated_cost_usd.toFixed(2)}` : "—"}
+          sublabel="cumulative"
+        />
+      </div>
+
+      <div className="ob-telemetry-panels">
+        <div className="ob-panel ob-tele-panel">
+          <div className="ob-panel-head">
+            <span className="ob-panel-title">Model Availability</span>
+            <span className={`ob-badge ${availableModels ? "ok" : "warn"}`}>
+              {models ? `${availableModels}/${options.length}` : "—"}
+            </span>
+          </div>
+          <div className="ob-tele-list">
+            {options.length === 0 && <p className="muted">No models reported.</p>}
+            {options.map((opt) => (
+              <TelemetryRow
+                key={`${opt.provider}:${opt.model}`}
+                tone={opt.available ? "ok" : opt.configured ? "warn" : "bad"}
+                name={opt.label}
+                badge={opt.is_default ? <span className="ob-badge subtle">DEFAULT</span> : null}
+                detail={`${opt.provider} · ${opt.route_type}${opt.detail ? ` · ${opt.detail}` : ""}`}
+                tag={opt.available ? "AVAILABLE" : opt.configured ? "CONFIGURED" : "OFFLINE"}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div className="ob-panel ob-tele-panel">
+          <div className="ob-panel-head">
+            <span className="ob-panel-title">Infrastructure</span>
+            <span className={`ob-badge ${allStoresOk ? "ok" : "warn"}`}>
+              {datastores.length ? `${okStores}/${datastores.length} OK` : "—"}
+            </span>
+          </div>
+          <div className="ob-tele-list">
+            {datastores.length === 0 && <p className="muted">No datastores configured.</p>}
+            {datastores.map((store) => (
+              <TelemetryRow
+                key={store.name}
+                tone={store.ok ? "ok" : "bad"}
+                name={store.name}
+                detail={store.detail}
+                tag={store.ok ? "UP" : "DOWN"}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div className="ob-panel ob-tele-panel">
+          <div className="ob-panel-head">
+            <span className="ob-panel-title">Local Inference</span>
+            <span className={`ob-badge ${infBusy ? "warn" : "ok"}`}>
+              {localInference?.status ? localInference.status.toUpperCase() : "—"}
+            </span>
+          </div>
+          <div className="ob-sys-rows">
+            <div className="ob-sys-row">
+              <span>Status</span>
+              <span className="ob-sys-val">{localInference?.status || "—"}</span>
+            </div>
+            <div className="ob-sys-row">
+              <span>Holder</span>
+              <span className="ob-sys-val">{localInference?.holder || "idle"}</span>
+            </div>
+            <div className="ob-sys-row">
+              <span>Cloud jobs</span>
+              <span className="ob-sys-val">{cloudJobs.length}</span>
+            </div>
+            {cloudJobs.slice(0, 4).map((job, idx) => (
+              <div key={job.job_id || idx} className="ob-sys-row">
+                <span>{job.agent_id || job.job_id || `job ${idx + 1}`}</span>
+                <span className="ob-sys-val">
+                  {[job.provider, job.model, job.status].filter(Boolean).join(" · ") || "—"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="ob-panel ob-tele-panel">
+          <div className="ob-panel-head">
+            <span className="ob-panel-title">Storage &amp; Config</span>
+          </div>
+          <div className="ob-sys-rows">
+            {storageRows.map((row) => (
+              <div key={row.key} className="ob-sys-row">
+                <span>{row.key}</span>
+                <span className="ob-sys-val">{row.value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="ob-panel ob-tele-panel">
+          <div className="ob-panel-head">
+            <span className="ob-panel-title">OpenBrigade Settings</span>
+            {unsafeBind && <span className="ob-badge warn">UNSAFE BIND</span>}
+          </div>
+          <div className="ob-sys-rows">
+            {settingsRows.map((row) => (
+              <div key={row.key} className="ob-sys-row">
+                <span>{row.key}</span>
+                <span className="ob-sys-val">{row.value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
 }
 
 function CockpitView({
