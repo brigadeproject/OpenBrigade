@@ -2425,6 +2425,19 @@ function TeamBoard({
   );
 }
 
+// Shared chat composer behavior: Ctrl/Cmd+Enter submits; plain Enter inserts a
+// newline. Keep both chat composers wired through this so the chord stays
+// consistent and documented in one place.
+function handleChatSubmitKey(
+  event: React.KeyboardEvent<HTMLTextAreaElement>,
+  submit: () => void,
+) {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    submit();
+  }
+}
+
 function OrchestratorChat({
   canChat,
   api,
@@ -2511,11 +2524,17 @@ function OrchestratorChat({
           value={message}
           disabled={!canChat || pending}
           onChange={(event) => setMessage(event.target.value)}
-          placeholder="Message the orchestrator channel"
+          onKeyDown={(event) =>
+            handleChatSubmitKey(event, () =>
+              send().catch((error) => setStatus(errorMessage(error))),
+            )
+          }
+          placeholder="Message the Orchestrator — Ctrl+Enter to send, Enter for newline"
         />
         <button
           disabled={!canChat || pending || !message.trim()}
           onClick={() => send().catch((error) => setStatus(errorMessage(error)))}
+          title="Send message (Ctrl+Enter)"
         >
           {pending ? "Sending" : "Send"}
         </button>
@@ -2960,28 +2979,27 @@ function AgentChatPanel({
           value={message}
           disabled={!canChat || pending}
           onChange={(event) => setMessage(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-              event.preventDefault();
-              send().catch((error) => setStatus(errorMessage(error)));
-            }
-          }}
+          onKeyDown={(event) =>
+            handleChatSubmitKey(event, () =>
+              send().catch((error) => setStatus(errorMessage(error))),
+            )
+          }
           placeholder="Message the selected agent — Ctrl+Enter to send, Enter for newline"
         />
         <div className="chat-actions">
-          <button
-            disabled={!canCreateTask || pending || !message.trim() || !selectedAgentId}
-            onClick={createTaskFromDraft}
-            title="Create an assignment for the selected agent from this text"
-          >
-            Create Task
-          </button>
           <button
             disabled={!canChat || pending || !message.trim() || !selectedAgentId}
             onClick={() => send().catch((error) => setStatus(errorMessage(error)))}
             title="Send message (Ctrl+Enter)"
           >
             {pending ? "Sending" : "Send"}
+          </button>
+          <button
+            disabled={!canCreateTask || pending || !message.trim() || !selectedAgentId}
+            onClick={createTaskFromDraft}
+            title="Create an assignment for the selected agent from this text"
+          >
+            Create Task
           </button>
         </div>
       </div>

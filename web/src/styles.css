@@ -2647,6 +2647,19 @@ button.danger:disabled {
 
 .ob-agent-chat .chat-compose {
   position: static;
+  align-items: stretch;
+}
+
+/* Stack Send over Create Task in a narrow column so the textarea widens. */
+.ob-agent-chat .chat-actions {
+  flex-direction: column;
+  gap: 7px;
+}
+
+.ob-agent-chat .chat-actions button {
+  width: 100%;
+  flex: 1;
+  white-space: nowrap;
 }
 
 /* ===== Right — System + Activity ===== */
