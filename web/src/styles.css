@@ -2026,6 +2026,9 @@ button.danger:disabled {
 
 .ob-alert-banner {
   flex: none;
+  max-height: 124px;
+  overflow: auto;
+  border-radius: 6px;
 }
 
 .ob-cockpit-grid {
