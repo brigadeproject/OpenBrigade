@@ -601,7 +601,13 @@ function App() {
           onAbout={() => setAboutOpen(true)}
         />
 
-        <TabStrip view={view} onSelect={setView} />
+        <TabStrip
+          view={view}
+          onSelect={setView}
+          token={token}
+          onTokenChange={setToken}
+          onRefresh={() => refreshAll().catch((error) => setStatus(errorMessage(error)))}
+        />
 
         <section className="status-strip">
           <span className={`health-dot ${statusTone}`}>{auth?.user?.role || auth?.method || "auth"}</span>
@@ -613,17 +619,6 @@ function App() {
           {tokenExpired && <strong className="inline-warning">Token expired</strong>}
           {tokenMalformed && <strong className="inline-warning">Token format unreadable</strong>}
           {authMessage && <strong className="inline-warning">{authMessage}</strong>}
-          <div className="token-control">
-            <input
-              aria-label="JWT token"
-              placeholder="JWT token"
-              value={token}
-              onChange={(event) => setToken(event.target.value)}
-            />
-            <button onClick={() => refreshAll().catch((error) => setStatus(errorMessage(error)))}>
-              Refresh
-            </button>
-          </div>
         </section>
 
         {view === "cockpit" ? (
@@ -786,9 +781,15 @@ function TitleBar({
 function TabStrip({
   view,
   onSelect,
+  token,
+  onTokenChange,
+  onRefresh,
 }: {
   view: "cockpit" | "brigade";
   onSelect: (view: "cockpit" | "brigade") => void;
+  token: string;
+  onTokenChange: (token: string) => void;
+  onRefresh: () => void;
 }) {
   return (
     <div className="ob-tabstrip">
@@ -809,6 +810,15 @@ function TabStrip({
       <span className="ob-tab disabled" aria-disabled="true">Telemetry</span>
       <span className="ob-tab disabled" aria-disabled="true">Knowledge Base</span>
       <span className="ob-tab-add" aria-hidden="true">+</span>
+      <div className="ob-tab-token token-control">
+        <input
+          aria-label="JWT token"
+          placeholder="JWT token"
+          value={token}
+          onChange={(event) => onTokenChange(event.target.value)}
+        />
+        <button onClick={onRefresh}>Refresh</button>
+      </div>
     </div>
   );
 }

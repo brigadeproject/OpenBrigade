@@ -331,11 +331,11 @@ a {
 
 /* ===== STATUS STRIP ===== */
 .status-strip {
-  display: grid;
-  grid-template-columns: auto auto minmax(160px, 1fr) auto auto minmax(260px, 440px);
-  gap: 9px;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  min-height: 44px;
+  gap: 9px;
+  min-height: 38px;
   padding: 6px 14px;
   border-bottom: 1px solid var(--c-divider);
   background: linear-gradient(180deg, #2f2f35, #2a2a2f);
@@ -1886,11 +1886,25 @@ button.danger:disabled {
   flex: none;
   display: flex;
   align-items: flex-end;
+  flex-wrap: wrap;
   gap: 3px;
   padding: 6px 9px 0;
   background: linear-gradient(180deg, #2f2f35, #2a2a2f);
   border-bottom: 1px solid var(--c-divider);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+.ob-tab-token {
+  margin-left: auto;
+  align-self: center;
+  margin-bottom: 4px;
+  width: clamp(220px, 30vw, 360px);
+}
+
+.ob-tab-token input,
+.ob-tab-token button {
+  min-height: 28px;
+  font-size: 11px;
 }
 
 .ob-tab {
@@ -2764,5 +2778,10 @@ button.danger:disabled {
 
   .ob-slots {
     flex-wrap: wrap;
+  }
+
+  .ob-tab-token {
+    width: 100%;
+    margin-left: 0;
   }
 }
