@@ -2621,6 +2621,34 @@ button.danger:disabled {
   max-height: none;
 }
 
+/* ===== Brigade agent chat — messaging-app layout ===== */
+.ob-agent-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ob-agent-chat .model-route-note,
+.ob-agent-chat .chat-compose,
+.ob-agent-chat .permission-note {
+  flex: none;
+}
+
+/* Feed fills the panel; few messages hug the bottom (align-content:end),
+   many messages scroll with newest at the bottom. */
+.ob-agent-chat .chat-feed {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  align-content: end;
+}
+
+.ob-agent-chat .chat-compose {
+  position: static;
+}
+
 /* ===== Right — System + Activity ===== */
 .ob-system {
   flex: none;

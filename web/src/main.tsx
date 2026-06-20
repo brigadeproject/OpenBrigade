@@ -2947,20 +2947,26 @@ function AgentChatPanel({
   }
 
   return (
-    <section className="panel-body chat-panel">
+    <section className="panel-body chat-panel ob-agent-chat">
       <p className="model-route-note">Agent model: {routeLabel}</p>
       <div className="chat-feed" ref={feedRef}>
+        {messages.length === 0 && <p className="muted">No messages for this agent.</p>}
         {messages.slice(-12).map((item) => (
           <ChatMessageRow key={item.message_id} message={item} perspective={selectedAgentId} />
         ))}
-        {messages.length === 0 && <p className="muted">No messages for this agent.</p>}
       </div>
       <div className="chat-compose">
         <textarea
           value={message}
           disabled={!canChat || pending}
           onChange={(event) => setMessage(event.target.value)}
-          placeholder="Message the selected agent"
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault();
+              send().catch((error) => setStatus(errorMessage(error)));
+            }
+          }}
+          placeholder="Message the selected agent — Ctrl+Enter to send, Enter for newline"
         />
         <div className="chat-actions">
           <button
@@ -2973,6 +2979,7 @@ function AgentChatPanel({
           <button
             disabled={!canChat || pending || !message.trim() || !selectedAgentId}
             onClick={() => send().catch((error) => setStatus(errorMessage(error)))}
+            title="Send message (Ctrl+Enter)"
           >
             {pending ? "Sending" : "Send"}
           </button>
