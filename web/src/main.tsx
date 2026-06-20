@@ -304,53 +304,6 @@ type TaskDialogDraft = {
   agentId?: string;
   assignment?: string;
 };
-type CockpitWidgetId =
-  | "alerts"
-  | "health"
-  | "models"
-  | "mission"
-  | "orchestration"
-  | "tasks"
-  | "orchestrator-chat"
-  | "usage"
-  | "teams"
-  | "selected-agent"
-  | "settings";
-type CockpitWidgetSize = "compact" | "standard" | "wide" | "full";
-type CockpitLayoutItem = {
-  id: CockpitWidgetId;
-  size: CockpitWidgetSize;
-};
-
-const COCKPIT_LAYOUT_KEY = "brigade_cockpit_layout_v1";
-const COCKPIT_WIDGET_TITLES: Record<CockpitWidgetId, string> = {
-  alerts: "Current Alerts",
-  health: "Uptime / Service Health",
-  models: "Models Available",
-  mission: "Current Mission",
-  orchestration: "Orchestration Activity",
-  tasks: "Tasks",
-  "orchestrator-chat": "Orchestrator Chat",
-  usage: "Token Usage / Spend",
-  teams: "Teams",
-  "selected-agent": "Selected Agent",
-  settings: "Settings / Status",
-};
-const DEFAULT_COCKPIT_LAYOUT: CockpitLayoutItem[] = [
-  { id: "alerts", size: "standard" },
-  { id: "health", size: "wide" },
-  { id: "models", size: "standard" },
-  { id: "mission", size: "wide" },
-  { id: "orchestration", size: "wide" },
-  { id: "tasks", size: "wide" },
-  { id: "orchestrator-chat", size: "wide" },
-  { id: "usage", size: "standard" },
-  { id: "teams", size: "standard" },
-  { id: "selected-agent", size: "standard" },
-  { id: "settings", size: "wide" },
-];
-const COCKPIT_WIDGET_IDS = new Set(DEFAULT_COCKPIT_LAYOUT.map((item) => item.id));
-const COCKPIT_WIDGET_SIZES = new Set<CockpitWidgetSize>(["compact", "standard", "wide", "full"]);
 
 class ApiError extends Error {
   status: number;
@@ -361,60 +314,16 @@ class ApiError extends Error {
   }
 }
 
-function initialView(): "cockpit" | "ops" {
+function initialView(): "cockpit" | "brigade" {
   const requested = new URLSearchParams(window.location.search).get("view");
-  if (requested === "ops" || requested === "cockpit") {
-    return requested;
+  if (requested === "brigade" || requested === "ops") {
+    return "brigade";
+  }
+  if (requested === "cockpit") {
+    return "cockpit";
   }
   const saved = localStorage.getItem("brigade_view");
-  return saved === "ops" ? "ops" : "cockpit";
-}
-
-function initialCockpitLayout(): CockpitLayoutItem[] {
-  const saved = localStorage.getItem(COCKPIT_LAYOUT_KEY);
-  if (!saved) {
-    return DEFAULT_COCKPIT_LAYOUT;
-  }
-  try {
-    return normalizeCockpitLayout(JSON.parse(saved));
-  } catch {
-    return DEFAULT_COCKPIT_LAYOUT;
-  }
-}
-
-function normalizeCockpitLayout(value: unknown): CockpitLayoutItem[] {
-  if (!Array.isArray(value)) {
-    return DEFAULT_COCKPIT_LAYOUT;
-  }
-  const seen = new Set<CockpitWidgetId>();
-  const layout: CockpitLayoutItem[] = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-    const id = (item as { id?: unknown }).id;
-    const size = (item as { size?: unknown }).size;
-    if (
-      typeof id === "string" &&
-      COCKPIT_WIDGET_IDS.has(id as CockpitWidgetId) &&
-      !seen.has(id as CockpitWidgetId)
-    ) {
-      const fallback = DEFAULT_COCKPIT_LAYOUT.find((defaultItem) => defaultItem.id === id);
-      layout.push({
-        id: id as CockpitWidgetId,
-        size: typeof size === "string" && COCKPIT_WIDGET_SIZES.has(size as CockpitWidgetSize)
-          ? (size as CockpitWidgetSize)
-          : fallback?.size || "standard",
-      });
-      seen.add(id as CockpitWidgetId);
-    }
-  }
-  for (const defaultItem of DEFAULT_COCKPIT_LAYOUT) {
-    if (!seen.has(defaultItem.id)) {
-      layout.push(defaultItem);
-    }
-  }
-  return layout;
+  return saved === "brigade" || saved === "ops" ? "brigade" : "cockpit";
 }
 
 function App() {
@@ -432,9 +341,11 @@ function App() {
   const [streamStatus, setStreamStatus] = useState("connecting");
   const [authClock, setAuthClock] = useState(Date.now());
   const [activePanel, setActivePanel] = useState<"tasks" | "chat" | "goals">("tasks");
-  const [view, setView] = useState<"cockpit" | "ops">(() => initialView());
+  const [view, setView] = useState<"cockpit" | "brigade">(() => initialView());
   const [taskDialogOpen, setTaskDialogOpen] = useState(false);
   const [taskDialogDraft, setTaskDialogDraft] = useState<TaskDialogDraft | null>(null);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [heartbeatPaused, setHeartbeatPaused] = useState(false);
 
   const headers = useMemo(() => {
     const next: Record<string, string> = { "Content-Type": "application/json" };
@@ -641,30 +552,10 @@ function App() {
   );
 
   const agents = useMemo(() => allAgents(cockpit, snapshot), [cockpit, snapshot]);
-  const tasks = useMemo(() => allTasks(cockpit, snapshot), [cockpit, snapshot]);
   const recommendedModel = modelRouteFromOption(models?.recommended || null);
   const selectedAgentModel = selectedAgentId
     ? agentModelSelections[selectedAgentId] || recommendedModel
     : recommendedModel;
-  const blockedAgents = useMemo(
-    () =>
-      agents
-        .filter((agent) => agent.status === "blocked" || agent.status === "awaiting_human")
-        .sort((a, b) => Number(b.status === "awaiting_human") - Number(a.status === "awaiting_human")),
-    [agents],
-  );
-  const idleAgents = useMemo(
-    () => agents.filter((agent) => agent.status === "idle"),
-    [agents],
-  );
-  const headerTasks = useMemo(
-    () =>
-      tasks
-        .filter((task) => !isBlockedTask(task))
-        .filter((task) => ["assigned", "working", "queued"].includes(task.status))
-        .sort((a, b) => taskSortKey(a).localeCompare(taskSortKey(b))),
-    [tasks],
-  );
 
   const selectAgent = useCallback((agentId: string, panel: "tasks" | "chat" | "goals" = "tasks") => {
     if (!agentId) {
@@ -672,7 +563,7 @@ function App() {
     }
     setSelectedAgentId(agentId);
     setActivePanel(panel);
-    setView("ops");
+    setView("brigade");
   }, []);
 
   const openTaskDialog = useCallback((draft?: TaskDialogDraft) => {
@@ -698,183 +589,257 @@ function App() {
   const statusTone = tokenExpired || authMessage ? "bad" : streamStatus === "live" ? "good" : "warn";
 
   return (
-    <main className="app-shell">
-      <header className="command-bar">
-        <div className="brand-block">
-          <strong>OpenBrigade</strong>
-          <span>{cockpit?.mission?.statement || "Mission not set"}</span>
-        </div>
-
-        <HeaderSelect
-          label="Agents"
-          value=""
-          placeholder={`${agents.length} agents`}
-          options={agents.map((agent) => ({
-            value: agent.agent_id,
-            label: `${agent.display_name} / ${agent.status}`,
-          }))}
-          onSelect={(agentId) => selectAgent(agentId)}
-        />
-        <HeaderSelect
-          label="Idle"
-          value=""
-          placeholder={`${idleAgents.length} idle`}
-          options={idleAgents.map((agent) => ({
-            value: agent.agent_id,
-            label: agent.display_name,
-          }))}
-          onSelect={(agentId) => selectAgent(agentId)}
-        />
-        <HeaderSelect
-          label="Blocked"
-          value=""
-          placeholder={`${blockedAgents.length} blocked`}
-          alert={blockedAgents.some((agent) => agent.status === "awaiting_human")}
-          options={blockedAgents.map((agent) => ({
-            value: agent.agent_id,
-            label: `${agent.display_name} / ${blockerSummary(agent)}`,
-          }))}
-          onSelect={(agentId) => selectAgent(agentId, "tasks")}
-        />
-        <HeaderSelect
-          label="Tasks"
-          value=""
-          placeholder={`${headerTasks.length} tasks`}
-          options={headerTasks.map((task) => ({
-            value: task.assignment_id,
-            label: `${task.status} / ${task.assigned_to} / ${shortText(task.assignment, 46)}`,
-          }))}
-          onSelect={(assignmentId) => {
-            const task = tasks.find((item) => item.assignment_id === assignmentId);
-            if (task) {
-              selectAgent(task.assigned_to, "tasks");
-            }
-          }}
+    <div className="ob-desktop">
+      <main className="ob-window">
+        <TitleBar
+          online={streamStatus === "live"}
+          statusTone={statusTone}
+          authLabel={auth?.user?.role || auth?.method || "auth"}
+          paused={heartbeatPaused}
+          onTogglePause={() => setHeartbeatPaused((value) => !value)}
+          onReconnect={() => refreshAll().catch((error) => setStatus(errorMessage(error)))}
+          onAbout={() => setAboutOpen(true)}
         />
 
-        <div className="mode-toggle" aria-label="View selector">
-          <button className={view === "cockpit" ? "active" : ""} onClick={() => setView("cockpit")}>
-            Cockpit
-          </button>
-          <button className={view === "ops" ? "active" : ""} onClick={() => setView("ops")}>
-            Ops Room
-          </button>
-        </div>
-      </header>
+        <TabStrip view={view} onSelect={setView} />
 
-      <section className="status-strip">
-        <span className={`health-dot ${statusTone}`}>{auth?.user?.role || auth?.method || "auth"}</span>
-        <span className={`health-dot ${streamStatus === "live" ? "good" : "warn"}`}>{streamStatus}</span>
-        <span>{status}</span>
-        {cockpit?.auth.unsafe_bind_without_auth && (
-          <strong className="inline-warning">Auth disabled on {cockpit.auth.web_host}</strong>
-        )}
-        {tokenExpired && <strong className="inline-warning">Token expired</strong>}
-        {tokenMalformed && <strong className="inline-warning">Token format unreadable</strong>}
-        {authMessage && <strong className="inline-warning">{authMessage}</strong>}
-        <div className="token-control">
-          <input
-            aria-label="JWT token"
-            placeholder="JWT token"
-            value={token}
-            onChange={(event) => setToken(event.target.value)}
+        <section className="status-strip">
+          <span className={`health-dot ${statusTone}`}>{auth?.user?.role || auth?.method || "auth"}</span>
+          <span className={`health-dot ${streamStatus === "live" ? "good" : "warn"}`}>{streamStatus}</span>
+          <span>{status}</span>
+          {cockpit?.auth.unsafe_bind_without_auth && (
+            <strong className="inline-warning">Auth disabled on {cockpit.auth.web_host}</strong>
+          )}
+          {tokenExpired && <strong className="inline-warning">Token expired</strong>}
+          {tokenMalformed && <strong className="inline-warning">Token format unreadable</strong>}
+          {authMessage && <strong className="inline-warning">{authMessage}</strong>}
+          <div className="token-control">
+            <input
+              aria-label="JWT token"
+              placeholder="JWT token"
+              value={token}
+              onChange={(event) => setToken(event.target.value)}
+            />
+            <button onClick={() => refreshAll().catch((error) => setStatus(errorMessage(error)))}>
+              Refresh
+            </button>
+          </div>
+        </section>
+
+        {view === "cockpit" ? (
+          <CockpitView
+            cockpit={cockpit}
+            settings={settings}
+            auth={auth}
+            authMessage={authMessage}
+            tokenExpired={tokenExpired}
+            models={models}
+            selectedAgentId={selectedAgentId}
+            selectedAgentModel={selectedAgentModel}
+            orchestratorModel={orchestratorModel || recommendedModel}
+            heartbeatPaused={heartbeatPaused}
+            can={can}
+            api={api}
+            onSelectAgent={selectAgent}
+            onSelectedAgentModelChange={setSelectedAgentModel}
+            onOrchestratorModelChange={setOrchestratorModel}
+            onModelsChange={setModels}
+            onSettingsChange={setSettings}
+            onRefresh={refreshAll}
+            setStatus={setStatus}
+            onOpenTaskDialog={openTaskDialog}
           />
-          <button onClick={() => refreshAll().catch((error) => setStatus(errorMessage(error)))}>
-            Refresh
-          </button>
-        </div>
-      </section>
+        ) : (
+          <OpsRoomView
+            snapshot={snapshot}
+            selectedAgent={selectedAgent}
+            selectedAgentId={selectedAgentId}
+            selectedAgentModel={selectedAgentModel}
+            teams={snapshot?.teams || cockpit?.teams || []}
+            activePanel={activePanel}
+            setActivePanel={setActivePanel}
+            can={can}
+            api={api}
+            onSelectAgent={setSelectedAgentId}
+            onRefresh={refreshAll}
+            setStatus={setStatus}
+            onOpenTaskDialog={openTaskDialog}
+          />
+        )}
 
-      {view === "cockpit" ? (
-        <CockpitView
-          cockpit={cockpit}
-          settings={settings}
-          auth={auth}
-          authMessage={authMessage}
-          tokenExpired={tokenExpired}
-          models={models}
-          selectedAgentId={selectedAgentId}
-          selectedAgentModel={selectedAgentModel}
-          orchestratorModel={orchestratorModel || recommendedModel}
-          can={can}
-          api={api}
-          onSelectAgent={selectAgent}
-          onSelectedAgentModelChange={setSelectedAgentModel}
-          onOrchestratorModelChange={setOrchestratorModel}
-          onModelsChange={setModels}
-          onSettingsChange={setSettings}
-          onRefresh={refreshAll}
-          setStatus={setStatus}
-          onOpenTaskDialog={openTaskDialog}
-        />
-      ) : (
-        <OpsRoomView
-          snapshot={snapshot}
-          selectedAgent={selectedAgent}
-          selectedAgentId={selectedAgentId}
-          selectedAgentModel={selectedAgentModel}
-          teams={snapshot?.teams || cockpit?.teams || []}
-          activePanel={activePanel}
-          setActivePanel={setActivePanel}
-          can={can}
-          api={api}
-          onSelectAgent={setSelectedAgentId}
-          onRefresh={refreshAll}
-          setStatus={setStatus}
-          onOpenTaskDialog={openTaskDialog}
-        />
-      )}
+        {aboutOpen && <AboutDialog cockpit={cockpit} onClose={() => setAboutOpen(false)} />}
 
-      {taskDialogOpen && (
-        <TaskDialog
-          agents={agents}
-          selectedAgentId={selectedAgentId}
-          draft={taskDialogDraft}
-          canCreate={can("task:write")}
-          api={api}
-          onClose={closeTaskDialog}
-          onDone={refreshAll}
-          setStatus={setStatus}
-        />
-      )}
-    </main>
+        {taskDialogOpen && (
+          <TaskDialog
+            agents={agents}
+            selectedAgentId={selectedAgentId}
+            draft={taskDialogDraft}
+            canCreate={can("task:write")}
+            api={api}
+            onClose={closeTaskDialog}
+            onDone={refreshAll}
+            setStatus={setStatus}
+          />
+        )}
+      </main>
+    </div>
   );
 }
 
-function HeaderSelect({
-  label,
-  value,
-  placeholder,
-  options,
-  alert = false,
+function TitleBar({
+  online,
+  statusTone,
+  authLabel,
+  paused,
+  onTogglePause,
+  onReconnect,
+  onAbout,
+}: {
+  online: boolean;
+  statusTone: "good" | "warn" | "bad";
+  authLabel: string;
+  paused: boolean;
+  onTogglePause: () => void;
+  onReconnect: () => void;
+  onAbout: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [clock, setClock] = useState(() => formatClock(new Date()));
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(formatClock(new Date())), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const close = () => setMenuOpen(false);
+
+  return (
+    <div className="ob-titlebar">
+      <div className="ob-sysmenu">
+        <button
+          type="button"
+          className="ob-sysmenu-btn"
+          title="System menu"
+          aria-haspopup="true"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((value) => !value)}
+        >
+          <span />
+        </button>
+        {menuOpen && (
+          <>
+            <div className="ob-menu-scrim" onClick={close} />
+            <div className="ob-menu" role="menu">
+              <button type="button" className="ob-menu-item" role="menuitem" onClick={() => { onAbout(); close(); }}>
+                <span className="ob-menu-glyph ob-menu-logo" />
+                <span>About OpenBrigade</span>
+              </button>
+              <div className="ob-menu-divider" />
+              <div className="ob-menu-status">
+                <span className={`ob-online-dot ${online ? "online" : "offline"}`} />
+                <span>Daemon&nbsp;·&nbsp;
+                  <strong className={online ? "ob-ok" : "ob-bad"}>{online ? "Online" : "Offline"}</strong>
+                </span>
+              </div>
+              <button type="button" className="ob-menu-item" role="menuitem" onClick={() => { onTogglePause(); close(); }}>
+                <span className="ob-menu-glyph">{paused ? "▶" : "⏸"}</span>
+                <span>{paused ? "Resume Heartbeat" : "Pause Heartbeat"}</span>
+              </button>
+              <button type="button" className="ob-menu-item" role="menuitem" onClick={() => { onReconnect(); close(); }}>
+                <span className="ob-menu-glyph">↻</span>
+                <span>Reconnect / Refresh</span>
+                <span className="ob-menu-key">⌘R</span>
+              </button>
+              <div className="ob-menu-divider" />
+              <a
+                className="ob-menu-item"
+                role="menuitem"
+                href="https://github.com/"
+                target="_blank"
+                rel="noreferrer"
+                onClick={close}
+              >
+                <span className="ob-menu-glyph">?</span>
+                <span>Documentation</span>
+              </a>
+            </div>
+          </>
+        )}
+      </div>
+      <span className="ob-title">OpenBrigade</span>
+      <span className="ob-subtitle">— Orchestrator daemon</span>
+      <span className="ob-spacer" />
+      <span className="ob-online-pill">
+        <span className={`ob-online-dot ${statusTone === "good" ? "online" : statusTone === "bad" ? "offline" : "warn"}`} />
+        {online ? "ONLINE" : "OFFLINE"}
+        <span className="ob-online-sep">|</span>
+        <span className="ob-clock">{clock}</span>
+      </span>
+      <span className="ob-winbtn" aria-hidden="true">
+        <span />
+      </span>
+      <span className="ob-auth-chip" title="Auth context">{authLabel}</span>
+    </div>
+  );
+}
+
+function TabStrip({
+  view,
   onSelect,
 }: {
-  label: string;
-  value: string;
-  placeholder: string;
-  options: { value: string; label: string }[];
-  alert?: boolean;
-  onSelect: (value: string) => void;
+  view: "cockpit" | "brigade";
+  onSelect: (view: "cockpit" | "brigade") => void;
 }) {
   return (
-    <label className={`header-select ${alert ? "alert" : ""}`}>
-      <span>{label}</span>
-      <select
-        value={value}
-        onChange={(event) => {
-          onSelect(event.target.value);
-          event.currentTarget.value = "";
-        }}
+    <div className="ob-tabstrip">
+      <button
+        type="button"
+        className={`ob-tab ${view === "cockpit" ? "active" : ""}`}
+        onClick={() => onSelect("cockpit")}
       >
-        <option value="">{placeholder}</option>
-        {options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </label>
+        Cockpit
+      </button>
+      <button
+        type="button"
+        className={`ob-tab ${view === "brigade" ? "active" : ""}`}
+        onClick={() => onSelect("brigade")}
+      >
+        Brigade
+      </button>
+      <span className="ob-tab disabled" aria-disabled="true">Telemetry</span>
+      <span className="ob-tab disabled" aria-disabled="true">Knowledge Base</span>
+      <span className="ob-tab-add" aria-hidden="true">+</span>
+    </div>
   );
+}
+
+function AboutDialog({ cockpit, onClose }: { cockpit: CockpitPayload | null; onClose: () => void }) {
+  return (
+    <div className="modal-backdrop ob-about-backdrop" onClick={onClose}>
+      <div className="ob-about" onClick={(event) => event.stopPropagation()}>
+        <div className="ob-about-titlebar">About</div>
+        <div className="ob-about-body">
+          <div className="ob-about-logo">
+            <span />
+          </div>
+          <div className="ob-about-name">OpenBrigade</div>
+          <div className="ob-about-version">
+            Orchestrator daemon{cockpit ? ` · up ${formatDuration(cockpit.uptime_seconds)}` : ""}
+          </div>
+          <p className="ob-about-blurb">
+            An always-on control panel for a brigade of AI agents, coordinated by a
+            heartbeat-driven Orchestrator.
+          </p>
+          <button type="button" className="active" onClick={onClose}>OK</button>
+          <div className="ob-about-copy">© 2025-2026 The Brigade Project</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatClock(date: Date) {
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
 function CockpitView({
@@ -887,6 +852,7 @@ function CockpitView({
   selectedAgentId,
   selectedAgentModel,
   orchestratorModel,
+  heartbeatPaused,
   can,
   api,
   onSelectAgent,
@@ -907,6 +873,7 @@ function CockpitView({
   selectedAgentId: string;
   selectedAgentModel: ModelRoute | null;
   orchestratorModel: ModelRoute | null;
+  heartbeatPaused: boolean;
   can: (permission: string) => boolean;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
   onSelectAgent: (agentId: string, panel?: "tasks" | "chat" | "goals") => void;
@@ -919,224 +886,537 @@ function CockpitView({
   onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
 }) {
   const selectedAgent = cockpit?.agents.find((agent) => agent.agent_id === selectedAgentId) || null;
-  const [layout, setLayout] = useState<CockpitLayoutItem[]>(() => initialCockpitLayout());
-
-  useEffect(() => {
-    localStorage.setItem(COCKPIT_LAYOUT_KEY, JSON.stringify(layout));
-  }, [layout]);
-
-  function moveWidget(id: CockpitWidgetId, direction: -1 | 1) {
-    setLayout((current) => {
-      const index = current.findIndex((item) => item.id === id);
-      const nextIndex = index + direction;
-      if (index < 0 || nextIndex < 0 || nextIndex >= current.length) {
-        return current;
-      }
-      const next = [...current];
-      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
-      return next;
-    });
-  }
-
-  function resizeWidget(id: CockpitWidgetId, size: CockpitWidgetSize) {
-    setLayout((current) => current.map((item) => (item.id === id ? { ...item, size } : item)));
-  }
-
-  const widgetContent: Record<CockpitWidgetId, React.ReactNode> = {
-    alerts: (
-      <AlertList
-        alerts={cockpit?.alerts || []}
-        canClear={can("orchestrator:write")}
-        api={api}
-        onDone={onRefresh}
-        setStatus={setStatus}
-      />
-    ),
-    health: (
-      <div className="two-column-widget">
-        <div>
-          <div className="stat-large">{formatDuration(cockpit?.uptime_seconds || 0)}</div>
-          <p className="muted">Started {formatTime(cockpit?.started_at)}</p>
-        </div>
-        <HealthList checks={cockpit?.datastores || []} />
-      </div>
-    ),
-    models: (
-      <ModelSummary
-        cockpit={cockpit}
-        models={models}
-        canEdit={can("admin")}
-        api={api}
-        onModelsChange={onModelsChange}
-        onSettingsChange={onSettingsChange}
-        onDone={onRefresh}
-        setStatus={setStatus}
-      />
-    ),
-    mission: (
-      <MissionWidget
-        mission={cockpit?.mission || null}
-        latestReasoning={cockpit?.latest_reasoning || null}
-        canEdit={can("mission:write")}
-        api={api}
-        onDone={onRefresh}
-        setStatus={setStatus}
-      />
-    ),
-    orchestration: <OrchestrationActivity telemetry={cockpit?.orchestration || null} />,
-    tasks: (
-      <TaskBoard
-        tasks={cockpit?.tasks || null}
-        agents={cockpit?.agents || []}
-        canCreate={can("task:write")}
-        onOpenTaskDialog={onOpenTaskDialog}
-        onSelectAgent={(agentId) => onSelectAgent(agentId, "tasks")}
-      />
-    ),
-    "orchestrator-chat": (
-      <OrchestratorChat
-        canChat={can("chat:write")}
-        api={api}
-        inventory={models}
-        route={orchestratorModel}
-        onRouteChange={onOrchestratorModelChange}
-        setStatus={setStatus}
-      />
-    ),
-    usage: <UsageSummary usage={cockpit?.usage || null} />,
-    teams: (
-      <TeamBoard
-        teams={cockpit?.teams || []}
-        agents={cockpit?.agents || []}
-        canEdit={can("team:write")}
-        api={api}
-        onDone={onRefresh}
-        setStatus={setStatus}
-      />
-    ),
-    "selected-agent": (
-      <>
-        <AgentInspector agent={selectedAgent} teams={cockpit?.teams || []} />
-        {selectedAgent && (
-          <>
-            <ModelSelect
-              label="Agent model"
-              inventory={models}
-              route={selectedAgentModel}
-              onChange={onSelectedAgentModelChange}
-            />
-            <div className="button-row">
-              <button onClick={() => onSelectAgent(selectedAgent.agent_id, "chat")}>Chat</button>
-              <button onClick={() => onSelectAgent(selectedAgent.agent_id, "tasks")}>Tasks</button>
-            </div>
-          </>
-        )}
-      </>
-    ),
-    settings: (
-      <SettingsStatus
-        settings={settings}
-        cockpit={cockpit}
-        auth={auth}
-        authMessage={authMessage}
-        tokenExpired={tokenExpired}
-      />
-    ),
-  };
+  const agents = cockpit?.agents || [];
+  const datastores = cockpit?.datastores || [];
+  const alerts = cockpit?.alerts || [];
+  const telemetry = cockpit?.orchestration || null;
+  const workingAgents = agents.filter(
+    (agent) => agent.status === "working" || agent.status === "assigned",
+  );
 
   return (
-    <section className="cockpit">
-      <div className="cockpit-toolbar">
-        <div>
-          <strong>Cockpit Layout</strong>
-          <span>Pane order and size are saved in this browser.</span>
+    <section className="cockpit ob-cockpit">
+      {alerts.length > 0 && (
+        <div className="ob-alert-banner">
+          <AlertList
+            alerts={alerts}
+            canClear={can("orchestrator:write")}
+            api={api}
+            onDone={onRefresh}
+            setStatus={setStatus}
+          />
         </div>
-        <button onClick={() => setLayout(DEFAULT_COCKPIT_LAYOUT.map((item) => ({ ...item })))}>
-          Reset layout
-        </button>
+      )}
+
+      <div className="ob-cockpit-grid">
+        {/* ============ LEFT COLUMN ============ */}
+        <div className="ob-col ob-col-left">
+          <AgentRosterPanel agents={agents} onSelect={(id) => onSelectAgent(id, "tasks")} />
+          <ConcurrencyPanel working={workingAgents} />
+          <DatastorePanel datastores={datastores} />
+        </div>
+
+        {/* ============ CENTER — ORCHESTRATOR ============ */}
+        <div className="ob-orchestrator">
+          <OrchestratorHeader telemetry={telemetry} paused={heartbeatPaused} />
+          <MissionStrip
+            mission={cockpit?.mission || null}
+            latestReasoning={cockpit?.latest_reasoning || null}
+            canEdit={can("mission:write")}
+            api={api}
+            onDone={onRefresh}
+            setStatus={setStatus}
+          />
+          <TaskQueuePanel
+            tasks={cockpit?.tasks || null}
+            counts={cockpit?.counts || null}
+            agents={agents}
+            canCreate={can("task:write")}
+            onOpenTaskDialog={onOpenTaskDialog}
+            onSelectAgent={(id) => onSelectAgent(id, "tasks")}
+          />
+          <div className="ob-panel ob-chat-section">
+            <div className="ob-panel-head">
+              <span className="ob-panel-title">Talk to Orchestrator</span>
+            </div>
+            <div className="ob-chat-host">
+              <OrchestratorChat
+                canChat={can("chat:write")}
+                api={api}
+                inventory={models}
+                route={orchestratorModel}
+                onRouteChange={onOrchestratorModelChange}
+                setStatus={setStatus}
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* ============ RIGHT COLUMN ============ */}
+        <div className="ob-col ob-col-right">
+          <SystemPanel cockpit={cockpit} telemetry={telemetry} />
+          <ActivityLogPanel telemetry={telemetry} />
+        </div>
       </div>
-      <div className="widget-grid">
-        {layout.map((item, index) => (
-          <Widget
-            key={item.id}
-            title={COCKPIT_WIDGET_TITLES[item.id]}
-            size={item.size}
-            canMoveUp={index > 0}
-            canMoveDown={index < layout.length - 1}
-            onMoveUp={() => moveWidget(item.id, -1)}
-            onMoveDown={() => moveWidget(item.id, 1)}
-            onResize={(size) => resizeWidget(item.id, size)}
-          >
-            {widgetContent[item.id]}
-          </Widget>
-        ))}
-      </div>
+
+      <details className="ob-manage">
+        <summary>Management &amp; configuration</summary>
+        <div className="ob-manage-grid">
+          <div className="ob-panel ob-manage-panel">
+            <div className="ob-panel-head"><span className="ob-panel-title">Selected Agent</span></div>
+            <div className="ob-panel-pad">
+              <AgentInspector agent={selectedAgent} teams={cockpit?.teams || []} />
+              {selectedAgent && (
+                <>
+                  <ModelSelect
+                    label="Agent model"
+                    inventory={models}
+                    route={selectedAgentModel}
+                    onChange={onSelectedAgentModelChange}
+                  />
+                  <div className="button-row">
+                    <button onClick={() => onSelectAgent(selectedAgent.agent_id, "chat")}>Chat</button>
+                    <button onClick={() => onSelectAgent(selectedAgent.agent_id, "tasks")}>Tasks</button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+          <div className="ob-panel ob-manage-panel">
+            <div className="ob-panel-head"><span className="ob-panel-title">Models</span></div>
+            <div className="ob-panel-pad">
+              <ModelSummary
+                cockpit={cockpit}
+                models={models}
+                canEdit={can("admin")}
+                api={api}
+                onModelsChange={onModelsChange}
+                onSettingsChange={onSettingsChange}
+                onDone={onRefresh}
+                setStatus={setStatus}
+              />
+            </div>
+          </div>
+          <div className="ob-panel ob-manage-panel">
+            <div className="ob-panel-head"><span className="ob-panel-title">Teams</span></div>
+            <div className="ob-panel-pad">
+              <TeamBoard
+                teams={cockpit?.teams || []}
+                agents={agents}
+                canEdit={can("team:write")}
+                canManageAgents={can("agent:write")}
+                models={models}
+                api={api}
+                onDone={onRefresh}
+                setStatus={setStatus}
+              />
+            </div>
+          </div>
+          <div className="ob-panel ob-manage-panel">
+            <div className="ob-panel-head"><span className="ob-panel-title">Usage</span></div>
+            <div className="ob-panel-pad">
+              <UsageSummary usage={cockpit?.usage || null} />
+            </div>
+          </div>
+          <div className="ob-panel ob-manage-panel">
+            <div className="ob-panel-head"><span className="ob-panel-title">Settings &amp; Auth</span></div>
+            <div className="ob-panel-pad">
+              <SettingsStatus
+                settings={settings}
+                cockpit={cockpit}
+                auth={auth}
+                authMessage={authMessage}
+                tokenExpired={tokenExpired}
+              />
+            </div>
+          </div>
+        </div>
+      </details>
     </section>
   );
 }
 
-function Widget({
-  title,
-  size = "standard",
-  canMoveUp = false,
-  canMoveDown = false,
-  onMoveUp,
-  onMoveDown,
-  onResize,
-  children,
-}: {
-  title: string;
-  size?: CockpitWidgetSize;
-  canMoveUp?: boolean;
-  canMoveDown?: boolean;
-  onMoveUp?: () => void;
-  onMoveDown?: () => void;
-  onResize?: (size: CockpitWidgetSize) => void;
-  children: React.ReactNode;
-}) {
+const AGENT_SIG_COLORS = [
+  "var(--c-sage)",
+  "var(--c-garde)",
+  "var(--c-abacus)",
+  "var(--c-accent)",
+  "#b07cd6",
+  "#d6708f",
+  "#4ec9c4",
+];
+
+function agentSignature(id: string) {
+  let hash = 0;
+  for (let index = 0; index < id.length; index += 1) {
+    hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
+  }
+  return AGENT_SIG_COLORS[hash % AGENT_SIG_COLORS.length];
+}
+
+function sigStyle(id: string): React.CSSProperties {
+  return { "--sig": agentSignature(id) } as React.CSSProperties;
+}
+
+function agentInitials(name: string) {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+  return (name.trim() || "?").slice(0, 2).toUpperCase();
+}
+
+function agentActivityText(agent: VisualAgent) {
   return (
-    <article className={`widget widget-${size}`}>
-      <div className="widget-chrome">
-        <h2>{title}</h2>
-        {onResize && (
-          <div className="widget-controls" aria-label={`${title} layout controls`}>
-            <button disabled={!canMoveUp} onClick={onMoveUp} title="Move pane earlier">
-              Up
-            </button>
-            <button disabled={!canMoveDown} onClick={onMoveDown} title="Move pane later">
-              Down
-            </button>
-            <select
-              aria-label={`${title} pane size`}
-              value={size}
-              onChange={(event) => onResize(event.target.value as CockpitWidgetSize)}
-            >
-              <option value="compact">Compact</option>
-              <option value="standard">Standard</option>
-              <option value="wide">Wide</option>
-              <option value="full">Full</option>
-            </select>
-          </div>
-        )}
-      </div>
-      {children}
-    </article>
+    agent.current_assignment?.assignment ||
+    agent.activity ||
+    agent.state?.current_assignment_summary ||
+    (agent.status === "idle" ? "Idle" : agent.status)
   );
 }
 
-function HealthList({ checks }: { checks: { name: string; ok: boolean; detail: string }[] }) {
-  if (!checks.length) {
-    return <p className="muted">No health checks reported.</p>;
+function agentStatusBadge(status: string): { label: string; tone: string } {
+  switch (status) {
+    case "working":
+    case "assigned":
+      return { label: "WORKING", tone: "ok" };
+    case "reflecting":
+    case "ruminating":
+    case "dreaming":
+      return { label: status.toUpperCase(), tone: "warn" };
+    case "queued":
+      return { label: "QUEUED", tone: "warn" };
+    case "blocked":
+      return { label: "BLOCKED", tone: "bad" };
+    case "awaiting_human":
+      return { label: "NEEDS YOU", tone: "bad" };
+    case "idle":
+      return { label: "IDLE", tone: "idle" };
+    default:
+      return { label: status.replace(/_/g, " ").toUpperCase(), tone: "idle" };
   }
+}
+
+function formatLogTime(value?: string | null) {
+  if (!value) {
+    return "--:--:--";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "--:--:--";
+  }
+  return date.toLocaleTimeString([], { hour12: false });
+}
+
+function AgentRosterPanel({
+  agents,
+  onSelect,
+}: {
+  agents: VisualAgent[];
+  onSelect: (agentId: string) => void;
+}) {
   return (
-    <div className="health-list">
-      {checks.map((check) => (
-        <div key={check.name} className="health-row">
-          <span className={`status-light ${check.ok ? "ok" : "bad"}`} />
-          <strong>{check.name}</strong>
-          <span>{check.detail}</span>
+    <div className="ob-panel ob-roster">
+      <div className="ob-panel-head">
+        <span className="ob-panel-title">Agents</span>
+        <span className="ob-badge">{agents.length}</span>
+      </div>
+      <div className="ob-roster-list">
+        {agents.length === 0 && <p className="muted">No agents.</p>}
+        {agents.map((agent) => {
+          const badge = agentStatusBadge(agent.status);
+          return (
+            <button
+              key={agent.agent_id}
+              type="button"
+              className="ob-agent-row"
+              style={sigStyle(agent.agent_id)}
+              onClick={() => onSelect(agent.agent_id)}
+            >
+              <span className="ob-agent-avatar">{agentInitials(agent.display_name)}</span>
+              <span className="ob-agent-meta">
+                <span className="ob-agent-name">{agent.display_name}</span>
+                <span className="ob-agent-task">{agentActivityText(agent)}</span>
+              </span>
+              <span className={`ob-agent-badge ${badge.tone}`}>{badge.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ConcurrencyPanel({ working }: { working: VisualAgent[] }) {
+  const slots = working.slice(0, 4);
+  return (
+    <div className="ob-panel ob-concurrency">
+      <div className="ob-panel-head">
+        <span className="ob-panel-title">Concurrency</span>
+        <span className="ob-badge">{working.length} active</span>
+      </div>
+      <div className="ob-slots">
+        {slots.map((agent, index) => (
+          <div key={agent.agent_id} className="ob-slot" style={sigStyle(agent.agent_id)}>
+            <span className="ob-slot-avatar">{agentInitials(agent.display_name)}</span>
+            <span className="ob-slot-name">{agent.display_name}</span>
+            <span className="ob-slot-idx">slot {index + 1}</span>
+          </div>
+        ))}
+        <div className="ob-slot ob-slot-free">
+          <span className="ob-slot-plus">+</span>
+          <span className="ob-slot-name">FREE</span>
+          <span className="ob-slot-idx">slot {slots.length + 1}</span>
         </div>
-      ))}
+      </div>
+    </div>
+  );
+}
+
+function DatastorePanel({
+  datastores,
+}: {
+  datastores: { name: string; ok: boolean; detail: string }[];
+}) {
+  const okCount = datastores.filter((item) => item.ok).length;
+  const allOk = datastores.length > 0 && okCount === datastores.length;
+  return (
+    <div className="ob-panel ob-datastores">
+      <div className="ob-panel-head">
+        <span className="ob-panel-title">Datastores</span>
+        <span className={`ob-badge ${allOk ? "ok" : "warn"}`}>
+          {datastores.length ? `${okCount} OK` : "—"}
+        </span>
+      </div>
+      <div className="ob-ds-grid">
+        {datastores.length === 0 && <p className="muted">No datastores reported.</p>}
+        {datastores.map((store) => (
+          <div key={store.name} className="ob-ds">
+            <span className={`status-light ${store.ok ? "ok" : "bad"}`} />
+            <span className="ob-ds-meta">
+              <span className="ob-ds-name">{store.name}</span>
+              <span className="ob-ds-detail">{store.detail}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function OrchestratorHeader({
+  telemetry,
+  paused,
+}: {
+  telemetry: OrchestrationPayload | null;
+  paused: boolean;
+}) {
+  const latest = telemetry?.latest_event || telemetry?.events?.[0] || null;
+  const beatState = latest ? orchestrationEventKind(latest).toUpperCase() : "IDLE";
+  const beatCount = telemetry?.events?.length ?? 0;
+  return (
+    <div className="ob-orc-header">
+      <div className={`ob-hb ${paused ? "paused" : ""}`} aria-hidden="true">
+        <span className="ob-hb-ring" />
+        <span className="ob-hb-core" />
+      </div>
+      <div className="ob-orc-title">
+        <span className="ob-orc-name">ORCHESTRATOR</span>
+        <span className="ob-orc-sub">always-on daemon · heartbeat-driven</span>
+      </div>
+      <span className="ob-spacer" />
+      <div className="ob-beat">
+        <div className="ob-beat-state">{paused ? "PAUSED" : beatState}</div>
+        <div className="ob-beat-sub">
+          {latest ? `last beat ${formatLogTime(latest.recorded_at)}` : "no beats yet"} · {beatCount} events
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MissionStrip({
+  mission,
+  latestReasoning,
+  canEdit,
+  api,
+  onDone,
+  setStatus,
+}: {
+  mission: Mission | null;
+  latestReasoning: { decision_summary?: string; cycle_id?: string } | null;
+  canEdit: boolean;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  onDone: () => Promise<void>;
+  setStatus: (status: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="ob-mission">
+      <div className="ob-mission-label">
+        <span>Current Mission</span>
+        {canEdit && (
+          <button type="button" className="ob-mini-btn" onClick={() => setOpen((value) => !value)}>
+            {open ? "Close" : "Edit"}
+          </button>
+        )}
+      </div>
+      {open ? (
+        <MissionWidget
+          mission={mission}
+          latestReasoning={latestReasoning}
+          canEdit={canEdit}
+          api={api}
+          onDone={onDone}
+          setStatus={setStatus}
+        />
+      ) : (
+        <div className="ob-mission-text">{mission?.statement || "Mission not set."}</div>
+      )}
+    </div>
+  );
+}
+
+function TaskQueuePanel({
+  tasks,
+  counts,
+  agents,
+  canCreate,
+  onOpenTaskDialog,
+  onSelectAgent,
+}: {
+  tasks: CockpitPayload["tasks"] | null;
+  counts: CockpitPayload["counts"] | null;
+  agents: VisualAgent[];
+  canCreate: boolean;
+  onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
+  onSelectAgent: (agentId: string) => void;
+}) {
+  const [filter, setFilter] = useState<"active" | "queued" | "blocked" | "all">("active");
+  const source = tasks ? tasks[filter] : [];
+  const nameOf = new Map(agents.map((agent) => [agent.agent_id, agent.display_name]));
+  const active = counts?.active_tasks ?? tasks?.active.length ?? 0;
+  const queued = counts?.queued_tasks ?? tasks?.queued.length ?? 0;
+  return (
+    <div className="ob-panel ob-queue">
+      <div className="ob-panel-head">
+        <span className="ob-panel-title">Task Queue</span>
+        <span className="ob-queue-counts">{active} active · {queued} pending</span>
+      </div>
+      <div className="ob-queue-toolbar">
+        <div className="segmented">
+          {(["active", "queued", "blocked", "all"] as const).map((item) => (
+            <button
+              key={item}
+              className={filter === item ? "active" : ""}
+              onClick={() => setFilter(item)}
+            >
+              {item}
+            </button>
+          ))}
+        </div>
+        <button disabled={!canCreate} onClick={() => onOpenTaskDialog()}>
+          Add Task
+        </button>
+      </div>
+      <div className="ob-queue-list">
+        {source.length === 0 && <p className="muted">No {filter} tasks.</p>}
+        {source.map((task) => {
+          const working = task.status === "working" || task.status === "assigned";
+          return (
+            <div
+              key={task.assignment_id}
+              className="ob-task"
+              onClick={() => onSelectAgent(task.assigned_to)}
+            >
+              <span className={`ob-task-mark ${working ? "spinning" : statusClass(task.status)}`} />
+              <span className="ob-task-meta">
+                <span className="ob-task-text">{task.assignment}</span>
+                <span className="ob-task-sub">
+                  {task.status}
+                  {task.progress_summary ? ` · ${shortText(task.progress_summary, 44)}` : ""}
+                  {task.blockers.length > 0 ? ` · ${shortText(task.blockers[0], 44)}` : ""}
+                </span>
+              </span>
+              <span className="ob-task-agent" style={sigStyle(task.assigned_to)}>
+                {nameOf.get(task.assigned_to) || task.assigned_to}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function SystemPanel({
+  cockpit,
+  telemetry,
+}: {
+  cockpit: CockpitPayload | null;
+  telemetry: OrchestrationPayload | null;
+}) {
+  const counts = cockpit?.counts;
+  const usage = cockpit?.usage;
+  const latest = telemetry?.latest_event || telemetry?.events?.[0] || null;
+  const nominal = counts ? counts.blocked_tasks === 0 && counts.alerts === 0 : true;
+  const rows: { key: string; value: React.ReactNode }[] = [
+    { key: "Uptime", value: cockpit ? formatDuration(cockpit.uptime_seconds) : "—" },
+    { key: "Agents", value: counts ? String(counts.agents) : "—" },
+    { key: "Active tasks", value: counts ? String(counts.active_tasks) : "—" },
+    { key: "Queue depth", value: counts ? String(counts.queued_tasks) : "—" },
+    {
+      key: "Blocked",
+      value: counts ? (
+        <span className={counts.blocked_tasks ? "ob-bad" : undefined}>{counts.blocked_tasks}</span>
+      ) : (
+        "—"
+      ),
+    },
+    { key: "Last beat", value: latest ? formatLogTime(latest.recorded_at) : "—" },
+    { key: "Tokens", value: usage ? usage.total_tokens.toLocaleString() : "—" },
+    { key: "Cost", value: usage ? `$${usage.estimated_cost_usd.toFixed(2)}` : "—" },
+    { key: "Default model", value: cockpit?.models.default_model || "—" },
+  ];
+  return (
+    <div className="ob-panel ob-system">
+      <div className="ob-panel-head">
+        <span className="ob-panel-title">System</span>
+        <span className={`ob-badge ${nominal ? "ok" : "warn"}`}>{nominal ? "NOMINAL" : "ATTENTION"}</span>
+      </div>
+      <div className="ob-sys-rows">
+        {rows.map((row) => (
+          <div key={row.key} className="ob-sys-row">
+            <span>{row.key}</span>
+            <span className="ob-sys-val">{row.value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ActivityLogPanel({ telemetry }: { telemetry: OrchestrationPayload | null }) {
+  const events = telemetry?.events?.slice(0, 40) || [];
+  return (
+    <div className="ob-panel ob-activity">
+      <div className="ob-panel-head">
+        <span className="ob-panel-title">Activity</span>
+        <span className="ob-badge subtle">live</span>
+      </div>
+      <div className="ob-activity-log">
+        {events.length === 0 && <p className="muted">No orchestration activity recorded.</p>}
+        {events.map((event) => (
+          <div key={event.id} className={`ob-log-line ${orchestrationEventClass(event)}`}>
+            <span className="ob-log-time">{formatLogTime(event.recorded_at)}</span>
+            <span className="ob-log-text">
+              <span className="ob-log-kind">{orchestrationEventKind(event)}</span>
+              {" · "}
+              {event.summary}
+            </span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1412,70 +1692,6 @@ function ListBlock({ title, items }: { title: string; items: string[] }) {
   );
 }
 
-function OrchestrationActivity({ telemetry }: { telemetry: OrchestrationPayload | null }) {
-  const events = telemetry?.events?.slice(0, 8) || [];
-  if (!events.length) {
-    return <p className="muted">No orchestration activity recorded.</p>;
-  }
-  return (
-    <div className="activity-list">
-      {events.map((event) => (
-        <article key={event.id} className={`activity-row ${orchestrationEventClass(event)}`}>
-          <header>
-            <span className="status-pill">{orchestrationEventKind(event)}</span>
-            <small>{formatTime(event.recorded_at)}</small>
-          </header>
-          <p>{event.summary}</p>
-          <dl className="compact-dl">
-            {event.mission_statement && (
-              <>
-                <dt>Mission</dt>
-                <dd>{shortText(event.mission_statement, 96)}</dd>
-              </>
-            )}
-            {event.goal_statement && (
-              <>
-                <dt>Goal</dt>
-                <dd>{shortText(event.goal_statement, 96)}</dd>
-              </>
-            )}
-            {event.trigger && (
-              <>
-                <dt>Trigger</dt>
-                <dd>{event.trigger}</dd>
-              </>
-            )}
-            {event.agent_id && (
-              <>
-                <dt>Agent</dt>
-                <dd>{event.agent_id}</dd>
-              </>
-            )}
-            {event.parent_assignment_id && (
-              <>
-                <dt>Parent</dt>
-                <dd>{shortText(event.parent_assignment_id, 24)}</dd>
-              </>
-            )}
-            {event.child_assignment_ids.length > 0 && (
-              <>
-                <dt>Children</dt>
-                <dd>{event.child_assignment_ids.length}</dd>
-              </>
-            )}
-            {event.idempotency_key && (
-              <>
-                <dt>Idempotency</dt>
-                <dd>{shortText(event.idempotency_key, 76)}</dd>
-              </>
-            )}
-          </dl>
-        </article>
-      ))}
-    </div>
-  );
-}
-
 function orchestrationEventKind(event: OrchestrationEvent) {
   if (event.type === "cycle_outcome") {
     return (event.decision || "cycle outcome").replace(/_/g, " ");
@@ -1592,70 +1808,20 @@ function AlertList({
   );
 }
 
-function TaskBoard({
-  tasks,
-  agents,
-  canCreate,
-  onOpenTaskDialog,
-  onSelectAgent,
-}: {
-  tasks: CockpitPayload["tasks"] | null;
-  agents: VisualAgent[];
-  canCreate: boolean;
-  onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
-  onSelectAgent: (agentId: string) => void;
-}) {
-  const [filter, setFilter] = useState<"active" | "queued" | "blocked" | "all">("active");
-  const source = tasks ? tasks[filter] : [];
-  const agentNames = new Map(agents.map((agent) => [agent.agent_id, agent.display_name]));
-  return (
-    <div className="task-board">
-      <div className="toolbar-row">
-        <div className="segmented">
-          {(["active", "queued", "blocked", "all"] as const).map((item) => (
-            <button
-              key={item}
-              className={filter === item ? "active" : ""}
-              onClick={() => setFilter(item)}
-            >
-              {item}
-            </button>
-          ))}
-        </div>
-        <button disabled={!canCreate} onClick={onOpenTaskDialog}>
-          Add Task
-        </button>
-      </div>
-      <PermissionNotice
-        allowed={canCreate}
-        permission="task:write"
-        action="task creation is disabled"
-      />
-      <div className="stack-list task-list">
-        {source.map((task) => (
-          <article
-            key={task.assignment_id}
-            className={`task-row ${task.status}`}
-            onClick={() => onSelectAgent(task.assigned_to)}
-          >
-            <span>
-              {agentNames.get(task.assigned_to) || task.assigned_to} / {task.status} /{" "}
-              {task.priority}
-            </span>
-            <p>{task.assignment}</p>
-            {task.blockers.length > 0 && <small>{task.blockers.join("; ")}</small>}
-          </article>
-        ))}
-        {source.length === 0 && <p className="muted">No {filter} tasks.</p>}
-      </div>
-    </div>
-  );
+function slugifyId(value: string) {
+  return value
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function TeamBoard({
   teams,
   agents,
   canEdit,
+  canManageAgents,
+  models,
   api,
   onDone,
   setStatus,
@@ -1663,6 +1829,8 @@ function TeamBoard({
   teams: Team[];
   agents: VisualAgent[];
   canEdit: boolean;
+  canManageAgents: boolean;
+  models: ModelInventory | null;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
   onDone: () => Promise<void>;
   setStatus: (status: string) => void;
@@ -1671,7 +1839,38 @@ function TeamBoard({
   const selected = teams.find((team) => team.team_id === selectedTeamId) || teams[0] || null;
   const [displayName, setDisplayName] = useState(selected?.display_name || "");
   const [delegationPolicy, setDelegationPolicy] = useState(selected?.delegation_policy || "chief_only");
+  const [parentTeamId, setParentTeamId] = useState(selected?.parent_team_id || "");
+  const [escalationTeamId, setEscalationTeamId] = useState(selected?.escalation_team_id || "");
+  const [chiefId, setChiefId] = useState(selected?.crew_chief_id || "");
+  const [addMemberId, setAddMemberId] = useState("");
   const agentNames = new Map(agents.map((agent) => [agent.agent_id, agent.display_name]));
+  const modelOptions = visibleModelOptions(models);
+  const defaultModelKey = models ? `${models.default.provider}::${models.default.model}` : "";
+
+  // Add-agent form.
+  const [agName, setAgName] = useState("");
+  const [agId, setAgId] = useState("");
+  const [agIdEdited, setAgIdEdited] = useState(false);
+  const [agRole, setAgRole] = useState("line_worker");
+  const [agModelKey, setAgModelKey] = useState(defaultModelKey);
+  const [agTeamId, setAgTeamId] = useState("");
+  const [agNewTeamId, setAgNewTeamId] = useState("");
+  const [agMakeChief, setAgMakeChief] = useState(false);
+
+  // New-team form.
+  const [ntId, setNtId] = useState("");
+  const [ntName, setNtName] = useState("");
+  const [ntParent, setNtParent] = useState("");
+  const [ntPolicy, setNtPolicy] = useState("chief_only");
+
+  // Delegate form.
+  const [dTarget, setDTarget] = useState("");
+  const [dAssignment, setDAssignment] = useState("");
+  const [dGoal, setDGoal] = useState("");
+  const [dPriority, setDPriority] = useState("normal");
+
+  // Delete-agent form.
+  const [delAgentId, setDelAgentId] = useState("");
 
   useEffect(() => {
     if (!selectedTeamId && teams[0]) {
@@ -1682,79 +1881,515 @@ function TeamBoard({
   useEffect(() => {
     setDisplayName(selected?.display_name || "");
     setDelegationPolicy(selected?.delegation_policy || "chief_only");
+    setParentTeamId(selected?.parent_team_id || "");
+    setEscalationTeamId(selected?.escalation_team_id || "");
+    setChiefId(selected?.crew_chief_id || "");
+    setAddMemberId("");
+    setDTarget("");
   }, [selected]);
 
-  async function saveTeam() {
+  useEffect(() => {
+    if (!agModelKey && defaultModelKey) {
+      setAgModelKey(defaultModelKey);
+    }
+  }, [agModelKey, defaultModelKey]);
+
+  function run(label: string, action: () => Promise<unknown>, reset?: () => void) {
+    setStatus(label);
+    action()
+      .then(async () => {
+        reset?.();
+        await onDone();
+      })
+      .catch((error) => setStatus(errorMessage(error)));
+  }
+
+  function patchTeam(teamId: string, json: Record<string, unknown>, label: string) {
+    run(label, () =>
+      api<Team>(`/api/teams/${encodeURIComponent(teamId)}`, { method: "PATCH", json }),
+    );
+  }
+
+  function saveTeam() {
     if (!selected) {
       return;
     }
-    setStatus("Saving team");
-    await api<Team>(`/api/teams/${encodeURIComponent(selected.team_id)}`, {
-      method: "PATCH",
-      json: {
+    patchTeam(
+      selected.team_id,
+      {
         display_name: displayName,
         delegation_policy: delegationPolicy,
+        parent_team_id: parentTeamId || null,
+        escalation_team_id: escalationTeamId || null,
+        crew_chief_id: chiefId || null,
       },
-    });
-    setStatus("Team saved");
-    await onDone();
+      "Saving team",
+    );
   }
 
-  if (!teams.length) {
-    return <p className="muted">No teams configured.</p>;
+  function addMember() {
+    if (!selected || !addMemberId) {
+      return;
+    }
+    const members = Array.from(new Set([...selected.members, addMemberId]));
+    patchTeam(selected.team_id, { members }, "Adding member");
   }
+
+  function removeMember(agentId: string) {
+    if (!selected) {
+      return;
+    }
+    const members = selected.members.filter((id) => id !== agentId);
+    const json: Record<string, unknown> = { members };
+    if (selected.crew_chief_id === agentId) {
+      json.crew_chief_id = null;
+    }
+    patchTeam(selected.team_id, json, "Removing member");
+  }
+
+  function addAgent() {
+    if (!agName.trim()) {
+      return;
+    }
+    const agentId = (agIdEdited ? agId : slugifyId(agName)).trim();
+    if (!agentId) {
+      setStatus("Agent id is required");
+      return;
+    }
+    const useNewTeam = agTeamId === "__new__";
+    const teamId = (useNewTeam ? agNewTeamId : agTeamId).trim();
+    if (agMakeChief && !teamId) {
+      setStatus("Crew chief needs a team");
+      return;
+    }
+    const [provider, model] = agModelKey.split("::");
+    run(
+      `Onboarding ${agentId}`,
+      async () => {
+        const result = await api<{ valid: boolean; diagnostics: { message: string }[] }>(
+          "/api/agents",
+          {
+            method: "POST",
+            json: {
+              agent_id: agentId,
+              display_name: agName.trim(),
+              role: agRole.trim() || "line_worker",
+              model_provider: provider || undefined,
+              model_name: model || undefined,
+              team_id: teamId || undefined,
+              create_team: useNewTeam || undefined,
+              crew_chief: agMakeChief || undefined,
+            },
+          },
+        );
+        setStatus(
+          result.valid
+            ? `Onboarded ${agentId}`
+            : `Onboarded ${agentId} with warnings: ${result.diagnostics.map((d) => d.message).join("; ")}`,
+        );
+      },
+      () => {
+        setAgName("");
+        setAgId("");
+        setAgIdEdited(false);
+        setAgMakeChief(false);
+        setAgNewTeamId("");
+      },
+    );
+  }
+
+  function createTeam() {
+    const teamId = (ntId.trim() ? ntId : slugifyId(ntName)).trim();
+    if (!teamId) {
+      setStatus("Team id is required");
+      return;
+    }
+    run(
+      `Creating ${teamId}`,
+      () =>
+        api<Team>("/api/teams", {
+          method: "POST",
+          json: {
+            team_id: teamId,
+            display_name: ntName.trim() || teamId,
+            parent_team_id: ntParent || undefined,
+            delegation_policy: ntPolicy,
+          },
+        }),
+      () => {
+        setNtId("");
+        setNtName("");
+        setNtParent("");
+      },
+    );
+  }
+
+  function delegate() {
+    if (!selected || !selected.crew_chief_id || !dTarget || !dAssignment.trim()) {
+      return;
+    }
+    run(
+      "Delegating work",
+      () =>
+        api(`/api/teams/${encodeURIComponent(selected.team_id)}/delegate`, {
+          method: "POST",
+          json: {
+            chief_agent_id: selected.crew_chief_id,
+            target_agent_id: dTarget,
+            assignment: dAssignment.trim(),
+            goal_statement: dGoal.trim() || undefined,
+            priority: dPriority,
+          },
+        }),
+      () => {
+        setDAssignment("");
+        setDGoal("");
+      },
+    );
+  }
+
+  function deleteAgent() {
+    if (!delAgentId) {
+      return;
+    }
+    const name = agentNames.get(delAgentId) || delAgentId;
+    if (!confirm(`Delete agent ${name}? This removes it from any team.`)) {
+      return;
+    }
+    run(`Deleting ${delAgentId}`, () =>
+      api(`/api/agents/${encodeURIComponent(delAgentId)}`, { method: "DELETE" }),
+    );
+    setDelAgentId("");
+  }
+
+  const otherTeams = teams.filter((team) => team.team_id !== selected?.team_id);
+  const nonMembers = agents.filter((agent) => !selected?.members.includes(agent.agent_id));
+
   return (
     <div className="team-board">
-      <select value={selected?.team_id || ""} onChange={(event) => setSelectedTeamId(event.target.value)}>
-        {teams.map((team) => (
-          <option key={team.team_id} value={team.team_id}>
-            {team.display_name}
-          </option>
-        ))}
-      </select>
-      {selected && (
-        <>
-          <dl className="compact-dl">
-            <dt>Crew Chief</dt>
-            <dd>{selected.crew_chief_id ? agentNames.get(selected.crew_chief_id) || selected.crew_chief_id : "none"}</dd>
-            <dt>Members</dt>
-            <dd>{selected.members.map((id) => agentNames.get(id) || id).join(", ") || "none"}</dd>
-            <dt>Escalation</dt>
-            <dd>{selected.escalation_team_id || "none"}</dd>
-          </dl>
-          <div className="form-stack compact-form">
+      <details className="compact-form">
+        <summary>Add agent</summary>
+        <div className="form-stack compact-form">
+          <label>
+            <span>Name</span>
+            <input
+              value={agName}
+              disabled={!canManageAgents}
+              onChange={(event) => {
+                setAgName(event.target.value);
+                if (!agIdEdited) {
+                  setAgId(slugifyId(event.target.value));
+                }
+              }}
+            />
+          </label>
+          <label>
+            <span>Agent id</span>
+            <input
+              value={agIdEdited ? agId : slugifyId(agName)}
+              disabled={!canManageAgents}
+              onChange={(event) => {
+                setAgIdEdited(true);
+                setAgId(event.target.value);
+              }}
+            />
+          </label>
+          <label>
+            <span>Role</span>
+            <input
+              list="agent-roles"
+              value={agRole}
+              disabled={!canManageAgents}
+              onChange={(event) => setAgRole(event.target.value)}
+            />
+            <datalist id="agent-roles">
+              <option value="crew_chief" />
+              <option value="researcher" />
+              <option value="builder" />
+              <option value="line_worker" />
+            </datalist>
+          </label>
+          <label>
+            <span>Model</span>
+            <select
+              value={agModelKey}
+              disabled={!canManageAgents}
+              onChange={(event) => setAgModelKey(event.target.value)}
+            >
+              {modelOptions.map((option) => (
+                <option key={`${option.provider}::${option.model}`} value={`${option.provider}::${option.model}`}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Team</span>
+            <select
+              value={agTeamId}
+              disabled={!canManageAgents}
+              onChange={(event) => {
+                setAgTeamId(event.target.value);
+                if (!event.target.value) {
+                  setAgMakeChief(false);
+                }
+              }}
+            >
+              <option value="">— none —</option>
+              {teams.map((team) => (
+                <option key={team.team_id} value={team.team_id}>
+                  {team.display_name}
+                </option>
+              ))}
+              <option value="__new__">+ new team…</option>
+            </select>
+          </label>
+          {agTeamId === "__new__" && (
             <label>
-              <span>Display name</span>
+              <span>New team id</span>
               <input
-                value={displayName}
-                disabled={!canEdit}
-                onChange={(event) => setDisplayName(event.target.value)}
+                value={agNewTeamId}
+                disabled={!canManageAgents}
+                onChange={(event) => setAgNewTeamId(event.target.value)}
               />
             </label>
-            <label>
-              <span>Delegation policy</span>
-              <select
-                value={delegationPolicy}
-                disabled={!canEdit}
-                onChange={(event) => setDelegationPolicy(event.target.value)}
-              >
-                <option value="chief_only">chief_only</option>
-                <option value="open">open</option>
-              </select>
-            </label>
-            <button
-              disabled={!canEdit}
-              onClick={() => saveTeam().catch((error) => setStatus(errorMessage(error)))}
-            >
-              Save Team
-            </button>
-            <PermissionNotice
-              allowed={canEdit}
-              permission="team:write"
-              action="team edits are disabled"
+          )}
+          <label className="inline-checkbox">
+            <input
+              type="checkbox"
+              checked={agMakeChief}
+              disabled={!canManageAgents || (!agTeamId)}
+              onChange={(event) => setAgMakeChief(event.target.checked)}
             />
-          </div>
+            <span>Make crew chief of this team</span>
+          </label>
+          <button disabled={!canManageAgents} onClick={addAgent}>
+            Add Agent
+          </button>
+          <PermissionNotice
+            allowed={canManageAgents}
+            permission="agent:write"
+            action="agent creation is disabled"
+          />
+        </div>
+      </details>
+
+      <details className="compact-form">
+        <summary>New team</summary>
+        <div className="form-stack compact-form">
+          <label>
+            <span>Display name</span>
+            <input value={ntName} disabled={!canEdit} onChange={(event) => setNtName(event.target.value)} />
+          </label>
+          <label>
+            <span>Team id</span>
+            <input
+              value={ntId || slugifyId(ntName)}
+              disabled={!canEdit}
+              onChange={(event) => setNtId(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>Parent team</span>
+            <select value={ntParent} disabled={!canEdit} onChange={(event) => setNtParent(event.target.value)}>
+              <option value="">— none —</option>
+              {teams.map((team) => (
+                <option key={team.team_id} value={team.team_id}>
+                  {team.display_name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Delegation policy</span>
+            <select value={ntPolicy} disabled={!canEdit} onChange={(event) => setNtPolicy(event.target.value)}>
+              <option value="chief_only">chief_only</option>
+              <option value="open">open</option>
+              <option value="orchestrator_only">orchestrator_only</option>
+            </select>
+          </label>
+          <button disabled={!canEdit} onClick={createTeam}>
+            Create Team
+          </button>
+          <PermissionNotice allowed={canEdit} permission="team:write" action="team creation is disabled" />
+        </div>
+      </details>
+
+      {!teams.length ? (
+        <p className="muted">No teams configured. Add an agent or create a team to start.</p>
+      ) : (
+        <>
+          <select value={selected?.team_id || ""} onChange={(event) => setSelectedTeamId(event.target.value)}>
+            {teams.map((team) => (
+              <option key={team.team_id} value={team.team_id}>
+                {team.display_name}
+              </option>
+            ))}
+          </select>
+          {selected && (
+            <>
+              <dl className="compact-dl">
+                <dt>Crew Chief</dt>
+                <dd>{selected.crew_chief_id ? agentNames.get(selected.crew_chief_id) || selected.crew_chief_id : "none"}</dd>
+                <dt>Members</dt>
+                <dd>
+                  {selected.members.length
+                    ? selected.members.map((id) => (
+                        <span key={id} className="member-chip">
+                          {agentNames.get(id) || id}
+                          {canEdit && (
+                            <button className="chip-remove" title="Remove from team" onClick={() => removeMember(id)}>
+                              ×
+                            </button>
+                          )}
+                        </span>
+                      ))
+                    : "none"}
+                </dd>
+                <dt>Parent</dt>
+                <dd>{selected.parent_team_id || "none"}</dd>
+                <dt>Escalation</dt>
+                <dd>{selected.escalation_team_id || "none"}</dd>
+              </dl>
+              <div className="form-stack compact-form">
+                <label>
+                  <span>Display name</span>
+                  <input value={displayName} disabled={!canEdit} onChange={(event) => setDisplayName(event.target.value)} />
+                </label>
+                <label>
+                  <span>Crew chief</span>
+                  <select value={chiefId} disabled={!canEdit} onChange={(event) => setChiefId(event.target.value)}>
+                    <option value="">— none —</option>
+                    {selected.members.map((id) => (
+                      <option key={id} value={id}>
+                        {agentNames.get(id) || id}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Parent team</span>
+                  <select value={parentTeamId} disabled={!canEdit} onChange={(event) => setParentTeamId(event.target.value)}>
+                    <option value="">— none —</option>
+                    {otherTeams.map((team) => (
+                      <option key={team.team_id} value={team.team_id}>
+                        {team.display_name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Escalation team</span>
+                  <select
+                    value={escalationTeamId}
+                    disabled={!canEdit}
+                    onChange={(event) => setEscalationTeamId(event.target.value)}
+                  >
+                    <option value="">— none —</option>
+                    {otherTeams.map((team) => (
+                      <option key={team.team_id} value={team.team_id}>
+                        {team.display_name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Delegation policy</span>
+                  <select value={delegationPolicy} disabled={!canEdit} onChange={(event) => setDelegationPolicy(event.target.value)}>
+                    <option value="chief_only">chief_only</option>
+                    <option value="open">open</option>
+                    <option value="orchestrator_only">orchestrator_only</option>
+                  </select>
+                </label>
+                <div className="inline-fields">
+                  <select value={addMemberId} disabled={!canEdit} onChange={(event) => setAddMemberId(event.target.value)}>
+                    <option value="">— add member —</option>
+                    {nonMembers.map((agent) => (
+                      <option key={agent.agent_id} value={agent.agent_id}>
+                        {agent.display_name}
+                      </option>
+                    ))}
+                  </select>
+                  <button disabled={!canEdit || !addMemberId} onClick={addMember}>
+                    Add
+                  </button>
+                </div>
+                <button disabled={!canEdit} onClick={saveTeam}>
+                  Save Team
+                </button>
+                <PermissionNotice allowed={canEdit} permission="team:write" action="team edits are disabled" />
+              </div>
+
+              <details className="compact-form">
+                <summary>Delegate work</summary>
+                <div className="form-stack compact-form">
+                  {selected.crew_chief_id ? (
+                    <>
+                      <p className="muted">
+                        From chief {agentNames.get(selected.crew_chief_id) || selected.crew_chief_id}
+                      </p>
+                      <label>
+                        <span>To member</span>
+                        <select value={dTarget} disabled={!canEdit} onChange={(event) => setDTarget(event.target.value)}>
+                          <option value="">— select —</option>
+                          {selected.members
+                            .filter((id) => id !== selected.crew_chief_id)
+                            .map((id) => (
+                              <option key={id} value={id}>
+                                {agentNames.get(id) || id}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                      <label>
+                        <span>Assignment</span>
+                        <textarea value={dAssignment} disabled={!canEdit} onChange={(event) => setDAssignment(event.target.value)} />
+                      </label>
+                      <label>
+                        <span>Goal (optional)</span>
+                        <input value={dGoal} disabled={!canEdit} onChange={(event) => setDGoal(event.target.value)} />
+                      </label>
+                      <label>
+                        <span>Priority</span>
+                        <select value={dPriority} disabled={!canEdit} onChange={(event) => setDPriority(event.target.value)}>
+                          <option value="low">low</option>
+                          <option value="normal">normal</option>
+                          <option value="high">high</option>
+                          <option value="urgent">urgent</option>
+                        </select>
+                      </label>
+                      <button disabled={!canEdit || !dTarget || !dAssignment.trim()} onClick={delegate}>
+                        Delegate
+                      </button>
+                    </>
+                  ) : (
+                    <p className="muted">Designate a crew chief to delegate work.</p>
+                  )}
+                  <PermissionNotice allowed={canEdit} permission="team:write" action="delegation is disabled" />
+                </div>
+              </details>
+            </>
+          )}
         </>
+      )}
+
+      {canManageAgents && agents.length > 0 && (
+        <details className="compact-form">
+          <summary>Delete agent</summary>
+          <div className="inline-fields compact-form">
+            <select value={delAgentId} onChange={(event) => setDelAgentId(event.target.value)}>
+              <option value="">— select agent —</option>
+              {agents.map((agent) => (
+                <option key={agent.agent_id} value={agent.agent_id}>
+                  {agent.display_name}
+                </option>
+              ))}
+            </select>
+            <button className="danger" disabled={!delAgentId} onClick={deleteAgent}>
+              Delete
+            </button>
+          </div>
+        </details>
       )}
     </div>
   );
@@ -2871,25 +3506,9 @@ function allAgents(cockpit: CockpitPayload | null, snapshot: OpsRoomSnapshot | n
   return cockpit?.agents || snapshot?.agents || [];
 }
 
-function allTasks(cockpit: CockpitPayload | null, snapshot: OpsRoomSnapshot | null) {
-  return cockpit?.tasks.all || snapshot?.assignments || [];
-}
-
-function isBlockedTask(task: Assignment) {
-  return task.status === "blocked" || task.awaiting_human || task.blockers.length > 0;
-}
-
 function taskSortKey(task: Assignment) {
   const rank = task.status === "working" || task.status === "assigned" ? "0" : "1";
   return `${rank}:${task.created_at || task.updated_at || ""}:${task.assignment_id}`;
-}
-
-function blockerSummary(agent: VisualAgent) {
-  const blockers = agent.current_assignment?.blockers || agent.state?.blockers || [];
-  if (agent.status === "awaiting_human") {
-    return "Needs user input";
-  }
-  return blockers[0] || "Blocked";
 }
 
 function lines(value: string) {
