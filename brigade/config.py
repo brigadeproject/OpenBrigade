@@ -17,8 +17,8 @@ class Settings:
     hung_task_seconds: int = 1800
     auto_recover_enabled: bool = True
     max_auto_reissue: int = 2
-    proactive_mode: str = "propose"
-    proactive_creation_enabled: bool = False
+    proactive_mode: str = "create"
+    proactive_creation_enabled: bool = True
     max_proactive_proposals_per_cycle: int = 1
     max_proactive_creations_per_cycle: int = 1
     intake_mode: str = "propose"
@@ -242,13 +242,13 @@ def load_settings(
             config.get("max_auto_reissue", 2),
         ),
         proactive_mode=(
-            _env("BRIGADE_PROACTIVE_MODE", dotenv, config.get("proactive_mode", "propose"))
-            or "propose"
+            _env("BRIGADE_PROACTIVE_MODE", dotenv, config.get("proactive_mode", "create"))
+            or "create"
         ),
         proactive_creation_enabled=_env_bool(
             "BRIGADE_PROACTIVE_CREATION_ENABLED",
             dotenv,
-            config.get("proactive_creation_enabled", False),
+            config.get("proactive_creation_enabled", True),
         ),
         max_proactive_proposals_per_cycle=_env_int(
             "BRIGADE_MAX_PROACTIVE_PROPOSALS_PER_CYCLE",

@@ -2954,6 +2954,11 @@ button.danger:disabled {
   }
 }
 
+.ob-beat-next {
+  color: var(--c-accent-2);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ===== Manual Orchestration ===== */
 .ob-mo {
   display: flex;

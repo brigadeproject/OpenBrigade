@@ -1780,7 +1780,11 @@ function CockpitView({
 
         {/* ============ CENTER — ORCHESTRATOR ============ */}
         <div className="ob-orchestrator">
-          <OrchestratorHeader telemetry={telemetry} paused={heartbeatPaused} />
+          <OrchestratorHeader
+            telemetry={telemetry}
+            paused={heartbeatPaused}
+            cadenceSeconds={Number(settings?.orchestrator_cadence_seconds) || 900}
+          />
           <MissionStrip
             mission={cockpit?.mission || null}
             latestReasoning={cockpit?.latest_reasoning || null}
@@ -2074,12 +2078,42 @@ function DatastorePanel({
   );
 }
 
+function NextCycleCountdown({
+  events,
+  cadenceSeconds,
+}: {
+  events: OrchestrationEvent[];
+  cadenceSeconds: number;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const lastCycle = events.find((event) => (event.type || "").startsWith("cycle"));
+  if (!lastCycle?.recorded_at || !cadenceSeconds) {
+    return null;
+  }
+  const lastMs = new Date(lastCycle.recorded_at).getTime();
+  if (Number.isNaN(lastMs)) {
+    return null;
+  }
+  const remaining = Math.round((lastMs + cadenceSeconds * 1000 - now) / 1000);
+  const label =
+    remaining <= 0
+      ? "due now"
+      : `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
+  return <span className="ob-beat-next"> · next cycle {label}</span>;
+}
+
 function OrchestratorHeader({
   telemetry,
   paused,
+  cadenceSeconds,
 }: {
   telemetry: OrchestrationPayload | null;
   paused: boolean;
+  cadenceSeconds: number;
 }) {
   const latest = telemetry?.latest_event || telemetry?.events?.[0] || null;
   const beatState = latest ? orchestrationEventKind(latest).toUpperCase() : "IDLE";
@@ -2098,7 +2132,10 @@ function OrchestratorHeader({
       <div className="ob-beat">
         <div className="ob-beat-state">{paused ? "PAUSED" : beatState}</div>
         <div className="ob-beat-sub">
-          {latest ? `last beat ${formatLogTime(latest.recorded_at)}` : "no beats yet"} · {beatCount} events
+          {latest ? `last beat ${formatLogTime(latest.recorded_at)}` : "no beats yet"}
+          <NextCycleCountdown events={telemetry?.events || []} cadenceSeconds={cadenceSeconds} />
+          {" · "}
+          {beatCount} events
         </div>
       </div>
     </div>
