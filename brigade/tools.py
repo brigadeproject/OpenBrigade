@@ -246,9 +246,24 @@ def _safe_workspace_path(workspace: Path, raw_path: str | None) -> Path:
 
 
 def _list_files(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-    root = _safe_workspace_path(context.workspace, _arg_text(arguments, "path", "."))
+    raw_path = _arg_text(arguments, "path", ".") or "."
+    root = _safe_workspace_path(context.workspace, raw_path)
     if not root.exists():
-        return ToolResult(False, f"path does not exist: {root.relative_to(context.workspace)}")
+        # A missing path in the agent's own workspace is empty scratch space, not an
+        # error: report it empty so the agent creates what it needs instead of
+        # blocking. write_file makes parent folders on demand.
+        return ToolResult(
+            True,
+            "[]",
+            {
+                "count": 0,
+                "exists": False,
+                "note": (
+                    f"'{raw_path}' does not exist yet; it is yours to create — "
+                    "write_file makes parent folders automatically"
+                ),
+            },
+        )
     if root.is_file():
         return ToolResult(True, str(root.relative_to(context.workspace)))
     files = [
@@ -260,9 +275,19 @@ def _list_files(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
 
 
 def _read_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-    path = _safe_workspace_path(context.workspace, _required_text(arguments, "path"))
+    raw_path = _required_text(arguments, "path")
+    path = _safe_workspace_path(context.workspace, raw_path)
     if not path.exists() or not path.is_file():
-        return ToolResult(False, f"file does not exist: {path.relative_to(context.workspace)}")
+        # Missing workspace file == empty, not an error: lets the agent proceed and
+        # create it with write_file rather than treating it as a blocker.
+        return ToolResult(
+            True,
+            "",
+            {
+                "exists": False,
+                "note": f"'{raw_path}' does not exist yet; create it with write_file",
+            },
+        )
     text = path.read_text(encoding="utf-8")
     truncated = text[:12_000]
     detail = "truncated" if len(text) > len(truncated) else "complete"

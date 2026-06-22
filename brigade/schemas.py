@@ -8,6 +8,52 @@ from uuid import uuid4
 from brigade.time import utc_now_iso
 
 
+def extract_json_object(text: str) -> str:
+    """Best-effort extraction of a single JSON object from model output.
+
+    Tolerates Markdown code fences (```json ... ```) and leading/trailing prose by
+    returning the first balanced ``{...}`` span. Returns the stripped input
+    unchanged when no object is found, so callers still ``json.loads`` and surface
+    a clear error.
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        body = stripped[3:]
+        if body[:4].lower() == "json":
+            body = body[4:]
+        end = body.rfind("```")
+        if end != -1:
+            body = body[:end]
+        stripped = body.strip()
+    if stripped.startswith("{"):
+        return stripped
+    start = stripped.find("{")
+    if start == -1:
+        return stripped
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(stripped)):
+        char = stripped[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return stripped[start : index + 1]
+    return stripped[start:]
+
+
 class AssignmentStatus(str, Enum):
     QUEUED = "queued"
     ASSIGNED = "assigned"
@@ -161,6 +207,7 @@ class Assignment:
     created_by_role: str | None = None
     idempotency_key: str | None = None
     room_id: str | None = None
+    reissued_from_assignment_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.assignment, "assignment")
@@ -256,7 +303,7 @@ class Agent:
     role: str = "line_worker"
     team_id: str | None = None
     model_provider: str = "ollama"
-    model_name: str = "gpt-oss:20b"
+    model_name: str = "qwen2.5-coder:7b"
     specialties: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now_iso)
 
@@ -382,6 +429,7 @@ def assignment_from_dict(item: dict[str, Any]) -> Assignment:
         created_by_role=item.get("created_by_role"),
         idempotency_key=item.get("idempotency_key"),
         room_id=item.get("room_id"),
+        reissued_from_assignment_id=item.get("reissued_from_assignment_id"),
     )
 
 

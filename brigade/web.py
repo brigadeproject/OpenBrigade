@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -28,6 +29,7 @@ from brigade.markdown import render_markdown_html
 from brigade.providers import available_model_options, provider_from_settings
 from brigade.rbac import ROLE_PERMISSIONS, can
 from brigade.schemas import (
+    Agent,
     Assignment,
     ChatMessage,
     Goal,
@@ -40,19 +42,26 @@ from brigade.schemas import (
 )
 from brigade.services import (
     OPS_ROOM_ROOMS,
+    AssignmentActionError,
     build_chat_payload,
     build_cockpit_payload,
     build_hierarchy_payload,
     build_ops_room_payload,
     build_orchestration_payload,
     build_settings_payload,
+    cancel_assignment,
+    delegate_from_crew_chief,
+    reissue_assignment,
+    reissue_assignment_as_new,
     send_orchestrator_chat,
     send_user_chat,
     set_config_value,
+    update_assignment_fields,
 )
 from brigade.store import RedisRuntimeClient, StateStore, open_state_store
 from brigade.time import utc_now_iso
 from brigade.tui import build_dashboard_payload
+from brigade.workspace import ensure_agent_workspace, validate_agent_workspace
 
 
 def create_app(
@@ -400,6 +409,122 @@ def create_app(
         require("status:read", current)
         return [agent.to_dict() for agent in store.agents()]
 
+    @app.post("/api/agents")
+    async def create_agent(
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        # Mirrors the CLI `agent onboard` flow so a brigade can be built from the
+        # browser: create the agent record, seed its on-disk workspace, and (when a
+        # team is named) join it, optionally as Crew Chief.
+        require("agent:write", current)
+        agent_id = str(payload.get("agent_id") or "").strip()
+        if not agent_id:
+            raise HTTPException(status_code=400, detail="agent_id is required")
+        display_name = str(payload.get("display_name") or agent_id).strip()
+        team_id = str(payload.get("team_id") or "").strip() or None
+        make_chief = bool(payload.get("crew_chief"))
+        if make_chief and not team_id:
+            raise HTTPException(status_code=400, detail="crew_chief requires team_id")
+        workspace = str(payload.get("workspace_path") or "").strip() or f"workspace-{agent_id}"
+        role = str(payload.get("role") or ("crew_chief" if make_chief else "line_worker")).strip()
+        team: Team | None = None
+        if team_id:
+            team = next((item for item in store.teams() if item.team_id == team_id), None)
+            if team is None:
+                if not bool(payload.get("create_team")):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"unknown team: {team_id}; set create_team to create it",
+                    )
+                team = Team(team_id=team_id, display_name=team_id)
+                store.upsert_team(team)
+        agent = Agent(
+            agent_id=agent_id,
+            display_name=display_name,
+            workspace_path=workspace,
+            role=role,
+            team_id=team_id,
+            model_provider=str(payload.get("model_provider") or settings.default_provider),
+            model_name=str(payload.get("model_name") or settings.default_model),
+            specialties=_string_list(payload.get("specialties")),
+        )
+        store.add_agent(agent)
+        ensure_agent_workspace(agent, settings.data_dir)
+        if team is not None:
+            members = list(dict.fromkeys([*team.members, agent_id]))
+            team = Team(
+                team_id=team.team_id,
+                display_name=team.display_name,
+                description=team.description,
+                parent_team_id=team.parent_team_id,
+                crew_chief_id=agent_id if make_chief else team.crew_chief_id,
+                members=members,
+                delegation_policy=team.delegation_policy,
+                escalation_team_id=team.escalation_team_id,
+                created_at=team.created_at,
+            )
+            store.upsert_team(team)
+        diagnostics = validate_agent_workspace(agent, settings.data_dir)
+        return {
+            "agent": agent.to_dict(),
+            "team": team.to_dict() if team else None,
+            "workspace": str(settings.data_dir / agent.workspace_path),
+            "diagnostics": [item.to_dict() for item in diagnostics],
+            "valid": not any(item.severity == "error" for item in diagnostics),
+        }
+
+    @app.delete("/api/agents/{agent_id}")
+    async def delete_agent(
+        agent_id: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        require("agent:write", current)
+        if next((agent for agent in store.agents() if agent.agent_id == agent_id), None) is None:
+            raise HTTPException(status_code=404, detail="unknown agent")
+        # Scrub the agent from any team membership / Crew Chief slot before deleting.
+        for team in store.teams():
+            if agent_id in team.members or team.crew_chief_id == agent_id:
+                chief_id = None if team.crew_chief_id == agent_id else team.crew_chief_id
+                store.upsert_team(
+                    Team(
+                        team_id=team.team_id,
+                        display_name=team.display_name,
+                        description=team.description,
+                        parent_team_id=team.parent_team_id,
+                        crew_chief_id=chief_id,
+                        members=[member for member in team.members if member != agent_id],
+                        delegation_policy=team.delegation_policy,
+                        escalation_team_id=team.escalation_team_id,
+                        created_at=team.created_at,
+                    )
+                )
+        store.delete_agent(agent_id)
+        return {"status": "deleted", "agent_id": agent_id}
+
+    @app.patch("/api/agents/{agent_id}")
+    async def update_agent(
+        agent_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        require("agent:write", current)
+        agent = next(
+            (item for item in store.agents() if item.agent_id == agent_id), None
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="unknown agent")
+        updates: dict[str, Any] = {}
+        if payload.get("model_provider") is not None:
+            updates["model_provider"] = str(payload["model_provider"])
+        if payload.get("model_name") is not None:
+            updates["model_name"] = str(payload["model_name"])
+        if not updates:
+            raise HTTPException(status_code=400, detail="no updatable fields provided")
+        updated = replace(agent, **updates)
+        store.add_agent(updated)
+        return updated.to_dict()
+
     @app.get("/api/teams")
     async def teams(current: AuthResult = auth_dependency) -> dict[str, object]:
         require("team:read", current)
@@ -432,19 +557,65 @@ def create_app(
         existing = next((team for team in store.teams() if team.team_id == team_id), None)
         if existing is None:
             raise HTTPException(status_code=404, detail="unknown team")
+        members = list(payload.get("members", existing.members))
         team = Team(
             team_id=existing.team_id,
             display_name=str(payload.get("display_name") or existing.display_name),
             description=payload.get("description", existing.description),
             parent_team_id=payload.get("parent_team_id", existing.parent_team_id),
             crew_chief_id=payload.get("crew_chief_id", existing.crew_chief_id),
-            members=list(payload.get("members", existing.members)),
+            members=members,
             delegation_policy=str(payload.get("delegation_policy") or existing.delegation_policy),
             escalation_team_id=payload.get("escalation_team_id", existing.escalation_team_id),
             created_at=existing.created_at,
         )
         store.upsert_team(team)
+        # Keep each agent's denormalized team_id consistent with membership changes.
+        added = set(members) - set(existing.members)
+        removed = set(existing.members) - set(members)
+        if added or removed:
+            agents_by_id = {agent.agent_id: agent for agent in store.agents()}
+            for agent_id in added:
+                agent = agents_by_id.get(agent_id)
+                if agent is not None and agent.team_id != team_id:
+                    store.add_agent(_agent_with_team_id(agent, team_id))
+            for agent_id in removed:
+                agent = agents_by_id.get(agent_id)
+                if agent is not None and agent.team_id == team_id:
+                    store.add_agent(_agent_with_team_id(agent, None))
         return team.to_dict()
+
+    @app.post("/api/teams/{team_id}/delegate")
+    async def delegate_team_work(
+        team_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("team:write", current)
+        chief_agent_id = str(payload.get("chief_agent_id") or "").strip()
+        target_agent_id = str(payload.get("target_agent_id") or "").strip()
+        assignment_text = str(payload.get("assignment") or "").strip()
+        if not chief_agent_id or not target_agent_id or not assignment_text:
+            raise HTTPException(
+                status_code=400,
+                detail="chief_agent_id, target_agent_id, and assignment are required",
+            )
+        try:
+            return delegate_from_crew_chief(
+                store,
+                team_id=team_id,
+                chief_agent_id=chief_agent_id,
+                target_agent_id=target_agent_id,
+                assignment_text=assignment_text,
+                goal_statement=payload.get("goal_statement"),
+                rationale=payload.get("rationale"),
+                priority=Priority(str(payload.get("priority") or "normal")),
+                current_user=user,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/tasks")
     async def tasks(current: AuthResult = auth_dependency) -> list[dict[str, object]]:
@@ -496,6 +667,78 @@ def create_app(
         if assignment is None:
             raise HTTPException(status_code=404, detail="unknown assignment")
         return assignment.to_dict()
+
+    @app.delete("/api/tasks/{assignment_id}")
+    async def cancel_task(
+        assignment_id: str,
+        force: bool = False,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        if store.find_assignment(assignment_id) is None:
+            raise HTTPException(status_code=404, detail="unknown assignment")
+        try:
+            return cancel_assignment(
+                store,
+                assignment_id,
+                by=user.username if user else "web",
+                force=force,
+            )
+        except AssignmentActionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/tasks/{assignment_id}/reissue")
+    async def reissue_task(
+        assignment_id: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        if store.find_assignment(assignment_id) is None:
+            raise HTTPException(status_code=404, detail="unknown assignment")
+        try:
+            return reissue_assignment(store, assignment_id, by=user.username if user else "web")
+        except AssignmentActionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.patch("/api/tasks/{assignment_id}")
+    async def edit_task(
+        assignment_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        if store.find_assignment(assignment_id) is None:
+            raise HTTPException(status_code=404, detail="unknown assignment")
+        try:
+            return update_assignment_fields(
+                store,
+                assignment_id,
+                assignment_text=payload.get("assignment"),
+                priority=payload.get("priority"),
+                assigned_to=payload.get("assigned_to") or payload.get("agent_id"),
+                by=user.username if user else "web",
+            )
+        except AssignmentActionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/tasks/{assignment_id}/reissue-as-new")
+    async def reissue_task_as_new(
+        assignment_id: str,
+        payload: dict[str, Any] | None = None,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        if store.find_assignment(assignment_id) is None:
+            raise HTTPException(status_code=404, detail="unknown assignment")
+        try:
+            return reissue_assignment_as_new(
+                store,
+                assignment_id,
+                by=user.username if user else "web",
+                note=(payload or {}).get("note"),
+            )
+        except AssignmentActionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/chat/channels")
     async def chat_channels(current: AuthResult = auth_dependency) -> list[dict[str, object]]:
@@ -698,6 +941,20 @@ def _string_list(value: Any) -> list[str]:
         return [str(item).strip() for item in value if str(item).strip()]
     text = str(value).strip()
     return [text] if text else []
+
+
+def _agent_with_team_id(agent: Agent, team_id: str | None) -> Agent:
+    return Agent(
+        agent_id=agent.agent_id,
+        display_name=agent.display_name,
+        workspace_path=agent.workspace_path,
+        role=agent.role,
+        team_id=team_id,
+        model_provider=agent.model_provider,
+        model_name=agent.model_name,
+        specialties=agent.specialties,
+        created_at=agent.created_at,
+    )
 
 
 def _fallback_html() -> str:

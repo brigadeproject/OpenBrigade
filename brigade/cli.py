@@ -84,6 +84,7 @@ from brigade.schemas import (
     Priority,
     Role,
     Team,
+    TERMINAL_STATUSES,
     User,
     WorkMode,
 )
@@ -94,9 +95,14 @@ from brigade.secrets import (
     write_oauth_credential,
 )
 from brigade.services import (
+    AssignmentActionError,
     build_chat_payload,
     build_settings_payload,
+    cancel_assignment,
+    cancel_assignments_where,
     decide_proposal,
+    delegate_from_crew_chief,
+    reissue_assignment,
     send_user_chat,
     set_config_value,
 )
@@ -540,6 +546,54 @@ def build_parser() -> argparse.ArgumentParser:
     task_inspect = task_sub.add_parser("inspect", help="Inspect one assignment.")
     task_inspect.add_argument("--id", required=True, help="Assignment id to inspect.")
     task_sub.add_parser("prompt", help="Create one assignment interactively.")
+    task_cancel = task_sub.add_parser("cancel", help="Cancel one assignment.")
+    task_cancel.add_argument("--id", required=True, help="Assignment id to cancel.")
+    task_cancel.add_argument(
+        "--reason",
+        default="cancelled by operator",
+        help="Cancellation reason recorded in history.",
+    )
+    task_cancel.add_argument(
+        "--force",
+        action="store_true",
+        help="Cancel even with active children/dependents (they are orphaned/released).",
+    )
+    task_reissue = task_sub.add_parser(
+        "reissue",
+        help="Reset a blocked assignment's failure state and re-dispatch it.",
+    )
+    task_reissue.add_argument("--id", required=True, help="Blocked assignment id to reissue.")
+    task_cancel_all = task_sub.add_parser(
+        "cancel-all",
+        help="Bulk-cancel active assignments matching a filter.",
+    )
+    task_cancel_all.add_argument(
+        "--status",
+        choices=[item.value for item in AssignmentStatus],
+        default=None,
+        help="Only cancel assignments with this status.",
+    )
+    task_cancel_all.add_argument(
+        "--blocker",
+        default=None,
+        help="Only cancel assignments whose blockers contain this substring.",
+    )
+    task_cancel_all.add_argument(
+        "--kind",
+        choices=[item.value for item in AssignmentKind],
+        default=None,
+        help="Only cancel assignments of this kind.",
+    )
+    task_cancel_all.add_argument(
+        "--reason",
+        default="bulk cancel by operator",
+        help="Cancellation reason recorded in history.",
+    )
+    task_cancel_all.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what would be cancelled without changing anything.",
+    )
 
     status = subcommands.add_parser("status")
     status.add_argument("--json", action="store_true")
@@ -1711,6 +1765,78 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(_inspect_assignment(store, args.id), indent=2, sort_keys=True))
         return 0
 
+    if args.command == "task" and args.task_command == "cancel":
+        _require_permission(store, settings, actor, "task:write")
+        actor_label = actor.user.username if actor.user else "cli"
+        try:
+            result = cancel_assignment(
+                store, args.id, reason=args.reason, by=actor_label, force=args.force
+            )
+        except AssignmentActionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "task" and args.task_command == "reissue":
+        _require_permission(store, settings, actor, "task:write")
+        actor_label = actor.user.username if actor.user else "cli"
+        try:
+            result = reissue_assignment(store, args.id, by=actor_label)
+        except AssignmentActionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "task" and args.task_command == "cancel-all":
+        _require_permission(store, settings, actor, "task:write")
+        actor_label = actor.user.username if actor.user else "cli"
+        if args.dry_run:
+            matches: list[dict[str, Any]] = []
+            for assignment in store.assignments():
+                if assignment.status in TERMINAL_STATUSES:
+                    continue
+                if args.status is not None and assignment.status.value != args.status:
+                    continue
+                if args.kind is not None and assignment.kind.value != args.kind:
+                    continue
+                if args.blocker is not None and not any(
+                    args.blocker.lower() in (b or "").lower() for b in assignment.blockers
+                ):
+                    continue
+                matches.append(
+                    {
+                        "assignment_id": assignment.assignment_id,
+                        "status": assignment.status.value,
+                        "kind": assignment.kind.value,
+                        "assigned_to": assignment.assigned_to,
+                        "blockers": assignment.blockers,
+                    }
+                )
+            print(
+                json.dumps(
+                    {"dry_run": True, "would_cancel": matches, "count": len(matches)},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        results = cancel_assignments_where(
+            store,
+            status=args.status,
+            blocker_contains=args.blocker,
+            kind=args.kind,
+            reason=args.reason,
+            by=actor_label,
+        )
+        print(
+            json.dumps(
+                {"cancelled": results, "count": len(results)}, indent=2, sort_keys=True
+            )
+        )
+        return 0
+
     if args.command == "status":
         _require_permission(store, settings, actor, "status:read")
         payload = _status_payload(store)
@@ -2742,61 +2868,19 @@ def _delegate_from_crew_chief(
     priority: Priority,
     current_user: User | None,
 ) -> dict[str, Any]:
-    team = _find_team(store, team_id)
-    if team is None:
-        raise ValueError(f"unknown team: {team_id}")
-    if team.crew_chief_id != chief_agent_id:
-        raise PermissionError(f"{chief_agent_id} is not Crew Chief for team {team_id}")
-    if team.delegation_policy == "orchestrator_only":
-        raise PermissionError(f"team {team_id} only accepts orchestrator-issued work")
-    if _find_agent(store, chief_agent_id) is None:
-        raise ValueError(f"unknown chief agent: {chief_agent_id}")
-    if _find_agent(store, target_agent_id) is None:
-        raise ValueError(f"unknown agent: {target_agent_id}")
-    if not _chief_authorized_for_agent(store.teams(), chief_agent_id, target_agent_id):
-        raise PermissionError(f"{target_agent_id} is outside {chief_agent_id}'s command scope")
-    target_team = _team_for_agent(store, target_agent_id)
-    if target_team and target_team.delegation_policy == "orchestrator_only":
-        raise PermissionError(
-            f"team {target_team.team_id} only accepts orchestrator-issued work"
-        )
-
-    assignment = Assignment(
-        assignment=assignment_text,
-        assigned_to=target_agent_id,
-        created_by=chief_agent_id,
-        source="crew_chief_delegate",
-        priority=priority,
-        work_mode=WorkMode.HEARTBEAT,
+    # Delegation lives in brigade.services so the CLI and web gateway share one
+    # implementation; this thin wrapper preserves the existing CLI call site.
+    return delegate_from_crew_chief(
+        store,
+        team_id=team_id,
+        chief_agent_id=chief_agent_id,
+        target_agent_id=target_agent_id,
+        assignment_text=assignment_text,
         goal_statement=goal_statement,
-        assignment_rationale=rationale or "Crew Chief delegated team work.",
-        created_by_user_id=current_user.username if current_user else None,
-        created_by_role="crew_chief",
-        idempotency_key=f"chief:{team_id}:{chief_agent_id}:{target_agent_id}:{assignment_text}",
+        rationale=rationale,
+        priority=priority,
+        current_user=current_user,
     )
-    persisted = store.add_assignment(assignment)
-    created = persisted.assignment_id == assignment.assignment_id
-    if created:
-        record = _reasoning_event(
-            source="crew_chief_delegate",
-            decision_summary=(
-                f"{chief_agent_id} delegated assignment {persisted.assignment_id} "
-                f"to {target_agent_id}"
-            ),
-            payload={
-                "team_id": team_id,
-                "chief_agent_id": chief_agent_id,
-                "target_agent_id": target_agent_id,
-                "assignment_id": persisted.assignment_id,
-            },
-        )
-        store.add_orchestrator_reasoning(record)
-    return {
-        "status": "queued" if created else "existing",
-        "team_id": team_id,
-        "chief_agent_id": chief_agent_id,
-        "assignment": persisted.to_dict(),
-    }
 
 
 def _route_team_work(

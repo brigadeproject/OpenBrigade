@@ -96,6 +96,8 @@ class StateStore(Protocol):
 
     def agents(self) -> list[Agent]: ...
 
+    def delete_agent(self, agent_id: str) -> None: ...
+
     def upsert_team(self, team: Team) -> None: ...
 
     def teams(self) -> list[Team]: ...
@@ -831,6 +833,9 @@ class PostgresStateStore:
             agent_from_dict(record)
             for record in self._records("select record from brigade_agents order by created_at, id")
         ]
+
+    def delete_agent(self, agent_id: str) -> None:
+        self._execute("delete from brigade_agents where id = %s", (agent_id,))
 
     def upsert_team(self, team: Team) -> None:
         record = team.to_dict()

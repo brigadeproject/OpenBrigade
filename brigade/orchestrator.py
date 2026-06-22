@@ -28,7 +28,9 @@ from brigade.schemas import (
     Goal,
     GoalEngagementMode,
     Priority,
+    TERMINAL_STATUSES,
     WorkMode,
+    extract_json_object,
 )
 from brigade.store import StateStore
 from brigade.time import parse_utc_iso, utc_now, utc_now_iso
@@ -128,6 +130,11 @@ class OrchestrationConfig:
     blocker_resolution_enabled: bool = True
     recurrence_detection_threshold: int = 3
     recurrence_lookback_days: int = 14
+    hung_task_seconds: int = 1800
+    auto_recover_enabled: bool = True
+    max_auto_reissue: int = 2
+    telegram_bot_token: str | None = None
+    operator_telegram_chat_id: str | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> OrchestrationConfig:
@@ -150,6 +157,11 @@ class OrchestrationConfig:
             blocker_resolution_enabled=settings.blocker_resolution_enabled,
             recurrence_detection_threshold=settings.recurrence_detection_threshold,
             recurrence_lookback_days=settings.recurrence_lookback_days,
+            hung_task_seconds=settings.hung_task_seconds,
+            auto_recover_enabled=settings.auto_recover_enabled,
+            max_auto_reissue=settings.max_auto_reissue,
+            telegram_bot_token=settings.telegram_bot_token,
+            operator_telegram_chat_id=settings.operator_telegram_chat_id,
         )
 
     def proactive(self) -> ProactiveContinuationConfig:
@@ -176,6 +188,12 @@ class OrchestrationConfig:
             "blocker_resolution_enabled": self.blocker_resolution_enabled,
             "recurrence_detection_threshold": self.recurrence_detection_threshold,
             "recurrence_lookback_days": self.recurrence_lookback_days,
+            "hung_task_seconds": self.hung_task_seconds,
+            "auto_recover_enabled": self.auto_recover_enabled,
+            "max_auto_reissue": self.max_auto_reissue,
+            "operator_notify_configured": bool(
+                self.telegram_bot_token and self.operator_telegram_chat_id
+            ),
         }
 
 
@@ -905,17 +923,23 @@ def deterministic_cycle(
         ),
     )
 
+    now = utc_now()
     busy_agents: set[str] = {
         item.assigned_to
         for item in assignments
         if item.status in {AssignmentStatus.ASSIGNED, AssignmentStatus.WORKING}
     }
-    # Blocked work counts as occupancy: the agent's attention belongs to the
-    # blocker-resolution ladder, not to fresh dispatch.
+    # Blocked work counts as occupancy only while the blocker-resolution ladder is
+    # actively working it. Once a blocked task is parked for a human
+    # (``awaiting_human``) or backed off (a future ``checkpoint_at``), it must no
+    # longer pin the agent — otherwise a single stuck/escalated task wedges every
+    # other queued item for that agent indefinitely (the "all agents stuck" case).
     blocked_agents: set[str] = {
         item.assigned_to
         for item in assignments
         if item.status == AssignmentStatus.BLOCKED
+        and not item.awaiting_human
+        and not _has_future_checkpoint(item, now)
     }
     queued_non_rest_agents: set[str] = {
         item.assigned_to for item in queued if item.kind != AssignmentKind.REST
@@ -1335,7 +1359,7 @@ def build_orchestrator_escalation_prompt(
 
 def parse_orchestrator_response(text: str) -> ParsedOrchestratorResponse:
     try:
-        payload = json.loads(text.strip())
+        payload = json.loads(extract_json_object(text))
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid orchestrator JSON response: {exc.msg}") from exc
     status = str(payload.get("status") or "").strip().lower()
@@ -2079,6 +2103,175 @@ def _cycle_decision_events(
     return events
 
 
+def recover_hung_tasks(store: StateStore, config: OrchestrationConfig) -> dict[str, Any]:
+    """Detect and act on hung tasks (no progress past ``hung_task_seconds``).
+
+    Hybrid by severity: a hung task with no related work (no parent, children, or
+    dependents) is routed into the blocker-resolution ladder for automatic
+    retry/reassignment; a hung task with related work is escalated to the operator
+    (``awaiting_human``) rather than killed, so dependent work is never orphaned.
+    Either way the owning agent is freed, because a parked/escalated blocked task no
+    longer counts as occupancy in ``deterministic_cycle``.
+    """
+    if not config.auto_recover_enabled:
+        return {"enabled": False, "actions": [], "events": []}
+    now = utc_now()
+    assignments = store.assignments()
+    actions: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    for assignment in assignments:
+        if assignment.status not in {
+            AssignmentStatus.ASSIGNED,
+            AssignmentStatus.WORKING,
+        }:
+            continue
+        if _has_future_checkpoint(assignment, now):
+            continue
+        try:
+            age = (now - parse_utc_iso(assignment.updated_at)).total_seconds()
+        except ValueError:
+            continue
+        if age <= config.hung_task_seconds:
+            continue
+        children = [
+            item
+            for item in assignments
+            if item.parent_assignment_id == assignment.assignment_id
+            and item.status not in TERMINAL_STATUSES
+        ]
+        dependents = [
+            item
+            for item in assignments
+            if assignment.assignment_id in (item.dependency_ids or [])
+            and item.status not in TERMINAL_STATUSES
+        ]
+        structural = bool(children or dependents or assignment.parent_assignment_id)
+        error = (
+            f"hung: no progress for {int(age)}s (threshold {config.hung_task_seconds}s)"
+        )
+        if structural:
+            assignment.register_failure(
+                error,
+                blockers=[
+                    f"hung task ({int(age)}s); structural — escalated to operator"
+                ],
+                awaiting_human=True,
+            )
+            store.update_assignment(assignment)
+            store.add_alert(
+                f"assignment {assignment.assignment_id} hung for {int(age)}s with "
+                f"related work (children={len(children)}, dependents={len(dependents)}); "
+                "escalated to operator instead of auto-killing."
+            )
+            decision = "escalated_operator"
+            event_type = "hung_task_escalated"
+            summary = (
+                f"Hung assignment {assignment.assignment_id} ({assignment.assigned_to}) "
+                f"idle {int(age)}s has related work; escalated to operator."
+            )
+        else:
+            assignment.register_failure(error, blockers=[f"hung task ({int(age)}s)"])
+            store.update_assignment(assignment)
+            decision = "auto_recover"
+            event_type = "hung_task_recovered"
+            summary = (
+                f"Hung assignment {assignment.assignment_id} ({assignment.assigned_to}) "
+                f"idle {int(age)}s routed to the recovery ladder."
+            )
+        action = {
+            "assignment_id": assignment.assignment_id,
+            "agent_id": assignment.assigned_to,
+            "age_seconds": int(age),
+            "classification": "structural" if structural else "transient",
+            "decision": decision,
+        }
+        actions.append(action)
+        events.append(
+            orchestration_event(
+                event_type,
+                summary,
+                source="orchestrator_recovery",
+                decision=decision,
+                assignment_id=assignment.assignment_id,
+                agent_id=assignment.assigned_to,
+                parent_assignment_id=assignment.parent_assignment_id,
+                payload=action,
+            )
+        )
+    return {"enabled": True, "actions": actions, "events": events}
+
+
+def _deliver_operator_notification(
+    config: OrchestrationConfig, text: str
+) -> dict[str, Any]:
+    bot_token = config.telegram_bot_token
+    chat_id = config.operator_telegram_chat_id
+    if not bot_token or not chat_id:
+        return {
+            "channel": "none",
+            "status": "skipped",
+            "reason": "operator telegram not configured",
+        }
+    try:
+        from brigade.connectors import send_telegram_message
+
+        result = send_telegram_message(bot_token, chat_id=chat_id, text=text)
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"channel": "telegram", "status": "failed", "reason": str(exc)}
+    return {
+        "channel": "telegram",
+        "status": getattr(result, "status", "unknown"),
+        "reason": getattr(result, "reason", None),
+    }
+
+
+def _notify_operator_escalations(
+    store: StateStore, config: OrchestrationConfig
+) -> dict[str, Any]:
+    """Send one outbound operator notification per awaiting-human assignment.
+
+    Covers every path that parks work for a human (ladder escalation, hung-task
+    escalation, goal-misalignment interrupt). De-duped via an idempotency event so
+    each assignment notifies the operator at most once.
+    """
+    notified: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    for assignment in store.assignments():
+        if not assignment.awaiting_human:
+            continue
+        key = f"operator-notify:v1:{assignment.assignment_id}"
+        if _idempotency_seen(store, key):
+            continue
+        reason = (
+            assignment.last_error
+            or assignment.progress_summary
+            or (assignment.blockers[0] if assignment.blockers else "see ladder history")
+        )
+        text = (
+            "OpenBrigade needs an operator. Assignment "
+            f"{assignment.assignment_id} (agent {assignment.assigned_to}) is awaiting "
+            f"human attention. Reason: {reason}"
+        )
+        delivery = _deliver_operator_notification(config, text)
+        notified.append(
+            {"assignment_id": assignment.assignment_id, "delivery": delivery}
+        )
+        events.append(
+            orchestration_event(
+                "operator_escalation_notified",
+                text,
+                source="orchestrator_recovery",
+                decision="escalated_operator",
+                assignment_id=assignment.assignment_id,
+                agent_id=assignment.assigned_to,
+                parent_assignment_id=assignment.parent_assignment_id,
+                idempotency_key=key,
+                payload={"delivery": delivery},
+            )
+        )
+    return {"notified": notified, "events": events}
+
+
 def run_full_cycle(
     store: StateStore,
     provider: ModelProvider | None = None,
@@ -2117,13 +2310,6 @@ def run_full_cycle(
             sub_results=sub_results,
         )
 
-    # Step 3: blocker-resolution ladder runs before any fresh dispatch.
-    ladder_result: dict[str, Any] = {
-        "enabled": config.blocker_resolution_enabled,
-        "actions": [],
-    }
-    if config.blocker_resolution_enabled:
-        ladder_result = _run_ladder_step(store, config)
     step_events: list[dict[str, Any]] = []
 
     def collect(name: str, result: dict[str, Any]) -> None:
@@ -2133,7 +2319,21 @@ def run_full_cycle(
             key: value for key, value in result.items() if key != "events"
         }
 
+    # Step 2.5: recover hung tasks before the ladder so freshly-blocked hung work
+    # flows into the same cycle's ladder and dispatch.
+    collect("hung_recovery", recover_hung_tasks(store, config))
+
+    # Step 3: blocker-resolution ladder runs before any fresh dispatch.
+    ladder_result: dict[str, Any] = {
+        "enabled": config.blocker_resolution_enabled,
+        "actions": [],
+    }
+    if config.blocker_resolution_enabled:
+        ladder_result = _run_ladder_step(store, config)
     collect("ladder", ladder_result)
+
+    # Step 3.5: notify the operator about any awaiting-human work (de-duped).
+    collect("operator_escalation", _notify_operator_escalations(store, config))
 
     # Step 4: intake drain.
     intake_result = _run_intake_step(store, config)

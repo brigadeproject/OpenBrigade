@@ -15,6 +15,7 @@ backups/
 web/node_modules/
 web/dist/
 reference/
+resources/
 AGENTS.md
 checklists/
 .codex/

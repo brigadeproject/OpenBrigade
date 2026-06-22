@@ -91,6 +91,13 @@ refreshing the page. If needed, issue a fresh owner token and paste it into the 
 
 ## 4. Create A Minimal Team
 
+> **GUI alternative:** As of 1.0.1 the Cockpit **Teams** widget can do everything in
+> this section without the CLI. "Add agent" onboards an agent (seeding its workspace),
+> optionally creating its team inline and marking it Crew Chief; "New team" sets up a
+> team with a parent for hierarchy; the per-team controls manage the chief, members,
+> parent, and escalation; and "Delegate work" covers section 8. Agent creation requires
+> the `agent:write` permission (owner). The CLI steps below remain fully supported.
+
 Set the mission:
 
 ```bash

@@ -14,6 +14,9 @@ class Settings:
     log_level: str = "INFO"
     orchestrator_cadence_seconds: int = 900
     stale_work_seconds: int = 86_400
+    hung_task_seconds: int = 1800
+    auto_recover_enabled: bool = True
+    max_auto_reissue: int = 2
     proactive_mode: str = "propose"
     proactive_creation_enabled: bool = False
     max_proactive_proposals_per_cycle: int = 1
@@ -47,7 +50,7 @@ class Settings:
     web_host: str = "0.0.0.0"
     web_port: int = 8080
     default_provider: str = "ollama"
-    default_model: str = "gpt-oss:20b"
+    default_model: str = "qwen2.5-coder:7b"
     ollama_base_url: str = "http://127.0.0.1:11434"
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
@@ -61,6 +64,7 @@ class Settings:
     telegram_webhook_secret: str | None = None
     telegram_default_agent: str = "sage"
     telegram_allowlist: str | None = None
+    operator_telegram_chat_id: str | None = None
     google_chat_webhook_enabled: bool = False
     google_chat_secret: str | None = None
     google_chat_default_agent: str = "sage"
@@ -222,6 +226,21 @@ def load_settings(
             dotenv,
             config.get("stale_work_seconds", 86_400),
         ),
+        hung_task_seconds=_env_int(
+            "BRIGADE_HUNG_TASK_SECONDS",
+            dotenv,
+            config.get("hung_task_seconds", 1800),
+        ),
+        auto_recover_enabled=_env_bool(
+            "BRIGADE_AUTO_RECOVER_ENABLED",
+            dotenv,
+            config.get("auto_recover_enabled", True),
+        ),
+        max_auto_reissue=_env_int(
+            "BRIGADE_MAX_AUTO_REISSUE",
+            dotenv,
+            config.get("max_auto_reissue", 2),
+        ),
         proactive_mode=(
             _env("BRIGADE_PROACTIVE_MODE", dotenv, config.get("proactive_mode", "propose"))
             or "propose"
@@ -373,9 +392,9 @@ def load_settings(
         default_model=_env(
             "BRIGADE_DEFAULT_MODEL",
             dotenv,
-            config.get("default_model", "gpt-oss:20b"),
+            config.get("default_model", "qwen2.5-coder:7b"),
         )
-        or "gpt-oss:20b",
+        or "qwen2.5-coder:7b",
         ollama_base_url=ollama_base_url,
         openai_api_key=_env("OPENAI_API_KEY", dotenv, config.get("openai_api_key")),
         anthropic_api_key=_env("ANTHROPIC_API_KEY", dotenv, config.get("anthropic_api_key")),
@@ -431,6 +450,11 @@ def load_settings(
             "BRIGADE_TELEGRAM_ALLOWLIST",
             dotenv,
             config.get("telegram_allowlist"),
+        ),
+        operator_telegram_chat_id=_env(
+            "BRIGADE_OPERATOR_TELEGRAM_CHAT_ID",
+            dotenv,
+            config.get("operator_telegram_chat_id"),
         ),
         google_chat_webhook_enabled=_env_bool(
             "BRIGADE_GOOGLE_CHAT_WEBHOOK_ENABLED",

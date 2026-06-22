@@ -171,6 +171,13 @@ class JsonStateStore:
     def agents(self) -> list[Agent]:
         return [agent_from_dict(item) for item in self.load().get("agents", [])]
 
+    def delete_agent(self, agent_id: str) -> None:
+        state = self.load()
+        state["agents"] = [
+            item for item in state.get("agents", []) if item["agent_id"] != agent_id
+        ]
+        self.save(state)
+
     def upsert_team(self, team: Team) -> None:
         state = self.load()
         teams = [item for item in state.get("teams", []) if item["team_id"] != team.team_id]

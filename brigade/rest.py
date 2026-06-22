@@ -61,6 +61,11 @@ def rest_assignment_text(date_key: str) -> str:
         [
             "Rest cycle: curate memory, reflect, and ponder using your normal "
             "file tools.",
+            "Your workspace is yours to manage: create, read, write, and modify any "
+            "files or folders inside it without restriction. Missing files or folders "
+            "are normal (especially on a first rest) — create them with write_file, "
+            "which makes parent folders automatically. Never block on a missing "
+            "workspace path; make it.",
             "1. Read your daily notes (memory/*-MEMORY.md) and promote durable "
             "facts into MEMORY.md, keeping it at or under 2KB; prune outdated "
             "or irrelevant entries.",

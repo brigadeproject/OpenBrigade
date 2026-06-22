@@ -12,7 +12,13 @@ from brigade.finance import persist_financial_report
 from brigade.orchestrator import orchestration_event, record_orchestration_events
 from brigade.prompt_floors import build_agent_floor, compact_json
 from brigade.providers import ModelProvider, ModelResponse, ModelUnavailableError
-from brigade.schemas import AgentState, Assignment, AssignmentKind, AssignmentStatus
+from brigade.schemas import (
+    AgentState,
+    Assignment,
+    AssignmentKind,
+    AssignmentStatus,
+    extract_json_object,
+)
 from brigade.store import StateStore
 from brigade.time import add_seconds_iso, parse_utc_iso, utc_now, utc_now_iso
 from brigade.tools import (
@@ -553,9 +559,10 @@ def parse_agent_response(text: str) -> ParsedAgentResponse:
     stripped = text.strip()
     if not stripped:
         raise MalformedProviderOutput("empty model response")
-    if stripped.startswith("{"):
+    candidate = extract_json_object(stripped)
+    if candidate.startswith("{"):
         try:
-            payload = json.loads(stripped)
+            payload = json.loads(candidate)
         except json.JSONDecodeError as exc:
             raise MalformedProviderOutput(f"invalid JSON response: {exc.msg}") from exc
         status = str(payload.get("status", "")).strip().lower()

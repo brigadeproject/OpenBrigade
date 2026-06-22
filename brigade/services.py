@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -21,10 +22,17 @@ from brigade.schemas import (
     AssignmentKind,
     AssignmentStatus,
     ChatMessage,
+    Priority,
+    Team,
+    TERMINAL_STATUSES,
     User,
+    WorkMode,
 )
 from brigade.store import StateStore
 from brigade.time import utc_now_iso
+from brigade.workspace import write_heartbeat_assignment
+
+LOGGER = logging.getLogger("brigade.services")
 
 OPS_ROOM_ROOMS: list[dict[str, Any]] = [
     {
@@ -621,6 +629,127 @@ def _create_recurrence_from_proposal(
     return {"recurrence_id": persisted.get("recurrence_id")}
 
 
+def _team_descendant_ids(teams: list[Team], team_id: str) -> list[str]:
+    children = [team.team_id for team in teams if team.parent_team_id == team_id]
+    descendants: list[str] = []
+    for child in children:
+        descendants.append(child)
+        descendants.extend(_team_descendant_ids(teams, child))
+    return descendants
+
+
+def _chief_authorized_for_agent(
+    teams: list[Team],
+    chief_agent_id: str,
+    target_agent_id: str,
+) -> bool:
+    chief_teams = [team for team in teams if team.crew_chief_id == chief_agent_id]
+    if not chief_teams:
+        return False
+    for team in chief_teams:
+        scoped_team_ids = {team.team_id, *_team_descendant_ids(teams, team.team_id)}
+        for candidate in teams:
+            if candidate.team_id in scoped_team_ids and target_agent_id in candidate.members:
+                return True
+    return False
+
+
+def delegate_from_crew_chief(
+    store: StateStore,
+    *,
+    team_id: str,
+    chief_agent_id: str,
+    target_agent_id: str,
+    assignment_text: str,
+    goal_statement: str | None,
+    rationale: str | None,
+    priority: Priority,
+    current_user: User | None,
+) -> dict[str, Any]:
+    """Create a Crew Chief delegation assignment for a team member.
+
+    Single source of truth for chief->member delegation, shared by the CLI
+    (`team delegate`) and the web gateway (`POST /api/teams/{id}/delegate`).
+    Raises ``ValueError`` for unknown team/agent and ``PermissionError`` when
+    the actor is not the team's Crew Chief, the target is out of command scope,
+    or a team only accepts orchestrator-issued work.
+    """
+    teams = store.teams()
+    team = next((item for item in teams if item.team_id == team_id), None)
+    if team is None:
+        raise ValueError(f"unknown team: {team_id}")
+    if team.crew_chief_id != chief_agent_id:
+        raise PermissionError(f"{chief_agent_id} is not Crew Chief for team {team_id}")
+    if team.delegation_policy == "orchestrator_only":
+        raise PermissionError(f"team {team_id} only accepts orchestrator-issued work")
+    agents = {agent.agent_id: agent for agent in store.agents()}
+    if chief_agent_id not in agents:
+        raise ValueError(f"unknown chief agent: {chief_agent_id}")
+    target = agents.get(target_agent_id)
+    if target is None:
+        raise ValueError(f"unknown agent: {target_agent_id}")
+    if not _chief_authorized_for_agent(teams, chief_agent_id, target_agent_id):
+        raise PermissionError(f"{target_agent_id} is outside {chief_agent_id}'s command scope")
+    target_team_id = target.team_id or next(
+        (item.team_id for item in teams if target_agent_id in item.members), None
+    )
+    target_team = next((item for item in teams if item.team_id == target_team_id), None)
+    if target_team and target_team.delegation_policy == "orchestrator_only":
+        raise PermissionError(
+            f"team {target_team.team_id} only accepts orchestrator-issued work"
+        )
+
+    assignment = Assignment(
+        assignment=assignment_text,
+        assigned_to=target_agent_id,
+        created_by=chief_agent_id,
+        source="crew_chief_delegate",
+        priority=priority,
+        work_mode=WorkMode.HEARTBEAT,
+        goal_statement=goal_statement,
+        assignment_rationale=rationale or "Crew Chief delegated team work.",
+        created_by_user_id=current_user.username if current_user else None,
+        created_by_role="crew_chief",
+        idempotency_key=f"chief:{team_id}:{chief_agent_id}:{target_agent_id}:{assignment_text}",
+    )
+    persisted = store.add_assignment(assignment)
+    created = persisted.assignment_id == assignment.assignment_id
+    if created:
+        now = utc_now_iso()
+        store.add_orchestrator_reasoning(
+            {
+                "reasoning_id": str(uuid4()),
+                "cycle_id": str(uuid4()),
+                "started_at": now,
+                "ended_at": now,
+                "source": "crew_chief_delegate",
+                "mission_statement": None,
+                "queued_assignments": [],
+                "assigned": [],
+                "skipped": [],
+                "alerts": [],
+                "agent_states": {},
+                "decision_summary": (
+                    f"{chief_agent_id} delegated assignment {persisted.assignment_id} "
+                    f"to {target_agent_id}"
+                ),
+                "events": [],
+                "payload": {
+                    "team_id": team_id,
+                    "chief_agent_id": chief_agent_id,
+                    "target_agent_id": target_agent_id,
+                    "assignment_id": persisted.assignment_id,
+                },
+            }
+        )
+    return {
+        "status": "queued" if created else "existing",
+        "team_id": team_id,
+        "chief_agent_id": chief_agent_id,
+        "assignment": persisted.to_dict(),
+    }
+
+
 def build_hierarchy_payload(store: StateStore) -> dict[str, Any]:
     teams = [team.to_dict() for team in store.teams()]
     agents = [agent.to_dict() for agent in store.agents()]
@@ -698,6 +827,396 @@ def build_ops_room_payload(
         "cloud_jobs": store.cloud_jobs(),
         "messages": [message.to_dict() for message in store.messages()[-30:]],
     }
+
+
+class AssignmentActionError(RuntimeError):
+    """A task cancel/reissue could not be applied as requested."""
+
+
+def assignment_relations(store: StateStore, assignment_id: str) -> dict[str, Any]:
+    """Active parent/children/dependents for an assignment (orphan safety).
+
+    Children are found by reverse-scanning ``parent_assignment_id``; dependents
+    are active assignments whose ``dependency_ids`` include this one.
+    """
+    assignments = store.assignments()
+    target = next((a for a in assignments if a.assignment_id == assignment_id), None)
+    parent = None
+    if target is not None and target.parent_assignment_id:
+        parent = next(
+            (a for a in assignments if a.assignment_id == target.parent_assignment_id),
+            None,
+        )
+    children = [a for a in assignments if a.parent_assignment_id == assignment_id]
+    dependents = [a for a in assignments if assignment_id in (a.dependency_ids or [])]
+    return {
+        "target": target,
+        "parent": parent,
+        "children": children,
+        "dependents": dependents,
+    }
+
+
+def active_blocking_relations(relations: dict[str, Any]) -> list[Assignment]:
+    """Children + dependents still active — work that a kill would orphan/hang."""
+    blocking = list(relations["children"]) + list(relations["dependents"])
+    return [a for a in blocking if a.status not in TERMINAL_STATUSES]
+
+
+def cancel_assignment(
+    store: StateStore,
+    assignment_id: str,
+    *,
+    reason: str = "cancelled by operator",
+    by: str = "operator",
+    force: bool = False,
+) -> dict[str, Any]:
+    """Cancel an assignment: move it to a terminal state and archive it.
+
+    ``QUEUED`` work becomes ``SUPERSEDED``; in-flight/blocked work becomes
+    ``ABANDONED``. Refuses (unless ``force``) when active children/dependents
+    would be orphaned. Dependents are released from the cancelled dependency so
+    they do not wait on it forever.
+    """
+    relations = assignment_relations(store, assignment_id)
+    target = relations["target"]
+    if target is None:
+        raise AssignmentActionError(f"unknown assignment: {assignment_id}")
+    if target.status in TERMINAL_STATUSES:
+        raise AssignmentActionError(
+            f"assignment {assignment_id} is already {target.status.value}"
+        )
+    blocking = active_blocking_relations(relations)
+    if blocking and not force:
+        ids = ", ".join(a.assignment_id for a in blocking)
+        raise AssignmentActionError(
+            f"assignment {assignment_id} has {len(blocking)} active child/dependent "
+            f"task(s) ({ids}); cancelling would orphan them. Re-run with force to "
+            "cancel anyway."
+        )
+    orphaned = [
+        a.assignment_id
+        for a in relations["children"]
+        if a.status not in TERMINAL_STATUSES
+    ]
+    terminal = (
+        AssignmentStatus.SUPERSEDED
+        if target.status == AssignmentStatus.QUEUED
+        else AssignmentStatus.ABANDONED
+    )
+    target.transition_to(terminal)
+    summary = f"{reason} (by {by})"
+    target.progress_summary = summary
+    store.archive_assignment(target, summary)
+    released: list[str] = []
+    for dependent in relations["dependents"]:
+        if assignment_id in (dependent.dependency_ids or []):
+            dependent.dependency_ids = [
+                dep for dep in dependent.dependency_ids if dep != assignment_id
+            ]
+            store.update_assignment(dependent)
+            released.append(dependent.assignment_id)
+    LOGGER.info(
+        "assignment_cancelled",
+        extra={
+            "assignment_id": assignment_id,
+            "status": terminal.value,
+            "by": by,
+            "orphaned_children": orphaned,
+            "released_dependents": released,
+        },
+    )
+    _record_operator_event(
+        store,
+        action="cancel",
+        summary=summary,
+        assignment_id=assignment_id,
+        agent_id=target.assigned_to,
+        by=by,
+        payload={"status": terminal.value, "released_dependents": released},
+    )
+    return {
+        "assignment_id": assignment_id,
+        "status": terminal.value,
+        "reason": summary,
+        "orphaned_children": orphaned,
+        "released_dependents": released,
+    }
+
+
+def reissue_assignment(
+    store: StateStore,
+    assignment_id: str,
+    *,
+    by: str = "operator",
+) -> dict[str, Any]:
+    """Reset a blocked assignment's failure state and re-dispatch it.
+
+    Clears ``consecutive_failures``/blockers/``awaiting_human`` and transitions
+    ``BLOCKED -> ASSIGNED`` (re-queued for its owner) with a fresh heartbeat.
+    """
+    target = store.find_assignment(assignment_id)
+    if target is None:
+        raise AssignmentActionError(f"unknown assignment: {assignment_id}")
+    if target.status != AssignmentStatus.BLOCKED:
+        raise AssignmentActionError(
+            f"assignment {assignment_id} is {target.status.value}; only blocked "
+            "assignments can be reissued"
+        )
+    target.consecutive_failures = 0
+    target.blockers = []
+    target.last_error = None
+    target.awaiting_human = False
+    target.checkpoint_at = None
+    target.progress_summary = f"reissued by {by}"
+    target.transition_to(AssignmentStatus.ASSIGNED)
+    store.update_assignment(target)
+    _rewrite_assignment_heartbeat(store, target)
+    LOGGER.info(
+        "assignment_reissued",
+        extra={
+            "assignment_id": assignment_id,
+            "agent_id": target.assigned_to,
+            "by": by,
+        },
+    )
+    _record_operator_event(
+        store,
+        action="retry",
+        summary=f"{assignment_id} retried (unblocked) by {by}",
+        assignment_id=assignment_id,
+        agent_id=target.assigned_to,
+        by=by,
+    )
+    return {"assignment_id": assignment_id, "status": target.status.value}
+
+
+def cancel_assignments_where(
+    store: StateStore,
+    *,
+    status: str | None = None,
+    blocker_contains: str | None = None,
+    kind: str | None = None,
+    reason: str = "bulk cancel by operator",
+    by: str = "operator",
+    force: bool = True,
+) -> list[dict[str, Any]]:
+    """Bulk-cancel active assignments matching a status/blocker/kind filter."""
+    results: list[dict[str, Any]] = []
+    for assignment in list(store.assignments()):
+        if assignment.status in TERMINAL_STATUSES:
+            continue
+        if status is not None and assignment.status.value != status:
+            continue
+        if kind is not None and assignment.kind.value != kind:
+            continue
+        if blocker_contains is not None and not any(
+            blocker_contains.lower() in (b or "").lower() for b in assignment.blockers
+        ):
+            continue
+        try:
+            results.append(
+                cancel_assignment(
+                    store,
+                    assignment.assignment_id,
+                    reason=reason,
+                    by=by,
+                    force=force,
+                )
+            )
+        except AssignmentActionError as exc:
+            results.append(
+                {"assignment_id": assignment.assignment_id, "error": str(exc)}
+            )
+    return results
+
+
+def _record_operator_event(
+    store: StateStore,
+    *,
+    action: str,
+    summary: str,
+    assignment_id: str,
+    agent_id: str | None = None,
+    by: str = "operator",
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Record a manual operator action in the orchestration audit stream."""
+    mission = store.mission()
+    record_orchestration_events(
+        store,
+        source="operator",
+        decision_summary=summary,
+        mission_statement=mission.statement if mission else None,
+        events=[
+            orchestration_event(
+                f"operator_{action}",
+                summary,
+                source="operator",
+                decision=action,
+                assignment_id=assignment_id,
+                agent_id=agent_id,
+                payload={"by": by, "action": action, **(payload or {})},
+            )
+        ],
+    )
+
+
+def reissue_assignment_as_new(
+    store: StateStore,
+    assignment_id: str,
+    *,
+    by: str = "operator",
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Supersede a task and create a fresh QUEUED attempt with a NEW id.
+
+    Task IDs are never reused: the original is archived (SUPERSEDED for queued
+    work, ABANDONED otherwise) and a new assignment is created carrying
+    ``reissued_from_assignment_id`` lineage. Dependents are re-pointed to the new
+    attempt so the dependency chain stays intact.
+    """
+    original = store.find_assignment(assignment_id)
+    if original is None:
+        raise AssignmentActionError(f"unknown assignment: {assignment_id}")
+    if original.status in TERMINAL_STATUSES:
+        raise AssignmentActionError(
+            f"assignment {assignment_id} is already {original.status.value}"
+        )
+    new_assignment = Assignment(
+        assignment=original.assignment,
+        assigned_to=original.assigned_to,
+        created_by=by,
+        source="manual_orchestration",
+        priority=original.priority,
+        work_mode=original.work_mode,
+        kind=original.kind,
+        goal_statement=original.goal_statement,
+        assignment_rationale=(
+            f"Reissued from {original.assignment_id} by {by}"
+            + (f": {note}" if note else "")
+        ),
+        dependency_ids=list(original.dependency_ids or []),
+        parent_assignment_id=original.parent_assignment_id,
+        created_by_role="operator",
+        reissued_from_assignment_id=original.assignment_id,
+    )
+    persisted = store.add_assignment(new_assignment)
+    terminal = (
+        AssignmentStatus.SUPERSEDED
+        if original.status == AssignmentStatus.QUEUED
+        else AssignmentStatus.ABANDONED
+    )
+    original.transition_to(terminal)
+    original.progress_summary = f"superseded by {persisted.assignment_id} (by {by})"
+    store.archive_assignment(original, original.progress_summary)
+    repointed: list[str] = []
+    for dependent in store.assignments():
+        if assignment_id in (dependent.dependency_ids or []):
+            dependent.dependency_ids = [
+                persisted.assignment_id if dep == assignment_id else dep
+                for dep in dependent.dependency_ids
+            ]
+            store.update_assignment(dependent)
+            repointed.append(dependent.assignment_id)
+    _record_operator_event(
+        store,
+        action="reissue",
+        summary=(
+            f"{assignment_id} reissued as {persisted.assignment_id}; original "
+            f"{terminal.value} and its id retired (never reused)."
+        ),
+        assignment_id=persisted.assignment_id,
+        agent_id=persisted.assigned_to,
+        by=by,
+        payload={"reissued_from": assignment_id, "original_status": terminal.value},
+    )
+    LOGGER.info(
+        "assignment_reissued_as_new",
+        extra={"from": assignment_id, "to": persisted.assignment_id, "by": by},
+    )
+    return {
+        "assignment_id": persisted.assignment_id,
+        "reissued_from_assignment_id": assignment_id,
+        "original_status": terminal.value,
+        "status": persisted.status.value,
+        "repointed_dependents": repointed,
+    }
+
+
+def update_assignment_fields(
+    store: StateStore,
+    assignment_id: str,
+    *,
+    assignment_text: str | None = None,
+    priority: str | None = None,
+    assigned_to: str | None = None,
+    by: str = "operator",
+) -> dict[str, Any]:
+    """Edit / reassign / reprioritize a non-running (queued or blocked) task."""
+    target = store.find_assignment(assignment_id)
+    if target is None:
+        raise AssignmentActionError(f"unknown assignment: {assignment_id}")
+    if target.status in TERMINAL_STATUSES:
+        raise AssignmentActionError(
+            f"assignment {assignment_id} is already {target.status.value}"
+        )
+    if target.status in {AssignmentStatus.ASSIGNED, AssignmentStatus.WORKING}:
+        raise AssignmentActionError(
+            f"assignment {assignment_id} is running; reissue or pause it before editing"
+        )
+    changes: list[str] = []
+    previous_agent = target.assigned_to
+    if assignment_text is not None and assignment_text.strip():
+        target.assignment = assignment_text.strip()
+        changes.append("text")
+    if priority is not None:
+        try:
+            target.priority = Priority(priority)
+        except ValueError as exc:
+            raise AssignmentActionError(f"unsupported priority: {priority}") from exc
+        changes.append(f"priority={priority}")
+    reassigned = False
+    if assigned_to is not None and assigned_to != target.assigned_to:
+        if assigned_to not in {agent.agent_id for agent in store.agents()}:
+            raise AssignmentActionError(f"unknown agent: {assigned_to}")
+        target.assigned_to = assigned_to
+        reassigned = True
+        changes.append(f"agent={assigned_to}")
+    if not changes:
+        raise AssignmentActionError("no updatable fields provided")
+    target.updated_at = utc_now_iso()
+    store.update_assignment(target)
+    if reassigned:
+        _rewrite_assignment_heartbeat(store, target)
+    _record_operator_event(
+        store,
+        action="reassign" if reassigned else "edit",
+        summary=(
+            f"{assignment_id} updated ({', '.join(changes)}) by {by}"
+            + (f"; {previous_agent} -> {assigned_to}" if reassigned else "")
+        ),
+        assignment_id=assignment_id,
+        agent_id=target.assigned_to,
+        by=by,
+        payload={"changes": changes, "previous_agent": previous_agent},
+    )
+    return {
+        "assignment_id": assignment_id,
+        "status": target.status.value,
+        "changes": changes,
+    }
+
+
+def _rewrite_assignment_heartbeat(store: StateStore, assignment: Assignment) -> None:
+    agent = next(
+        (a for a in store.agents() if a.agent_id == assignment.assigned_to), None
+    )
+    if agent is None:
+        return
+    heartbeat = write_heartbeat_assignment(agent, assignment, store.data_dir)
+    assignment.state_row_written_to = str(heartbeat)
+    store.update_assignment(assignment)
 
 
 def build_cockpit_payload(

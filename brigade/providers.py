@@ -81,15 +81,18 @@ class OllamaProvider:
         self.model = model
 
     def complete(self, prompt: str) -> ModelResponse:
+        # Use /api/chat (not the legacy /api/generate): chat returns the
+        # assistant's answer in message.content separately from any reasoning,
+        # so "thinking" models populate content instead of leaving it empty.
         payload = json.dumps(
             {
                 "model": self.model,
-                "prompt": prompt,
+                "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
             }
         ).encode("utf-8")
         request = urllib.request.Request(
-            f"{self.base_url}/api/generate",
+            f"{self.base_url}/api/chat",
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -115,7 +118,17 @@ class OllamaProvider:
         except urllib.error.URLError as exc:
             raise RuntimeError(f"ollama request failed: {exc}") from exc
 
-        text = str(data.get("response", ""))
+        message = data.get("message")
+        text = str((message or {}).get("content", "") or "")
+        if not text.strip():
+            # A reasoning-only model can return content="" (everything went to
+            # message.thinking). Fail loudly so this surfaces as a provider/config
+            # error (alert + deferral) instead of masquerading as a task blocker.
+            raise ModelUnavailableError(
+                f"ollama model '{self.model}' returned an empty assistant message; "
+                "it may be a reasoning-only/thinking model that emits no content over "
+                "/api/chat — choose a chat/instruct model (e.g. qwen2.5-coder:7b)"
+            )
         return ModelResponse(
             text=text,
             input_tokens=int(data.get("prompt_eval_count", 0) or 0),
