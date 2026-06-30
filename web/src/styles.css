@@ -2898,6 +2898,59 @@ button.danger:disabled {
   min-height: 0;
 }
 
+.ob-tele-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px;
+}
+
+.ob-tele-control-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--c-text-dim);
+  line-height: 1.4;
+}
+
+.ob-control-row {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.ob-control-row > label {
+  font: 700 11px var(--font);
+  color: var(--c-text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ob-control-number {
+  max-width: 110px;
+}
+
+.ob-control-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font: 700 11px var(--font);
+  color: var(--c-text);
+  cursor: pointer;
+}
+
+.ob-control-toggle input:disabled {
+  cursor: not-allowed;
+}
+
+.ob-control-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 2px;
+}
+
 .ob-tele-list {
   display: flex;
   flex-direction: column;
@@ -3300,6 +3353,28 @@ button.danger:disabled {
   font-size: 9px;
   opacity: 0.55;
 }
+.ob-mo-rel-vertical {
+  flex-direction: column;
+  align-items: stretch;
+}
+.ob-mo-rel-row {
+  display: flex;
+  gap: 8px;
+}
+.ob-mo-rel-row .ob-mo-rel-node {
+  flex: 1;
+  min-width: 0;
+}
+.ob-mo-rel-vlink {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 0;
+  font: 700 7.5px var(--font);
+  letter-spacing: 0.1em;
+  color: var(--c-text-faint);
+}
 
 .ob-mo-form {
   display: flex;
@@ -3331,6 +3406,45 @@ button.danger:disabled {
   resize: vertical;
 }
 
+.ob-mo-search {
+  display: flex;
+  gap: 6px;
+  padding: 8px 11px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.ob-mo-search .ob-mo-input {
+  flex: 1;
+  resize: none;
+}
+.ob-mo-search .ob-mo-btn {
+  flex: none;
+  padding: 8px 12px;
+}
+
+.ob-mo-search-hit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 11px;
+  font-size: 11px;
+  background: rgba(91, 157, 255, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.ob-mo-archived {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 13px;
+  border-radius: 6px;
+  background: rgba(214, 178, 92, 0.08);
+  border-left: 3px solid var(--c-warn);
+}
+.ob-mo-archived-head {
+  font: 700 11px var(--font);
+  color: var(--c-warn);
+}
+
 .ob-mo-actions {
   display: flex;
   gap: 8px;
@@ -3360,6 +3474,21 @@ button.danger:disabled {
 }
 .ob-mo-btn.danger {
   color: var(--c-bad);
+}
+
+.ob-mo-reassign {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 13px;
+  background: var(--c-inset);
+  border-radius: 4px;
+  box-shadow: var(--bevel-in);
+}
+.ob-mo-reassign .ob-mo-input {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
 }
 
 .ob-mo-locked {

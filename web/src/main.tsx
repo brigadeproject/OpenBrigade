@@ -73,6 +73,11 @@ type Assignment = {
   reissued_from_assignment_id?: string | null;
   created_at?: string;
   updated_at?: string;
+  archived?: boolean;
+  final_status?: string | null;
+  executive_summary?: string | null;
+  archived_at?: string | null;
+  failure_info?: string | null;
 };
 
 type AgentState = {
@@ -259,6 +264,8 @@ type SettingsPayload = {
   proactive_creation_enabled?: boolean;
   max_proactive_proposals_per_cycle?: number;
   max_proactive_creations_per_cycle?: number;
+  runtime_overrides?: Record<string, unknown>;
+  runtime_override_keys?: string[];
   postgres_configured: boolean;
   redis_configured: boolean;
   qdrant_configured: boolean;
@@ -698,7 +705,15 @@ function App() {
             onOpenTaskDialog={openTaskDialog}
           />
         ) : view === "telemetry" ? (
-          <TelemetryView cockpit={cockpit} settings={settings} models={models} />
+          <TelemetryView
+            cockpit={cockpit}
+            settings={settings}
+            models={models}
+            canEdit={can("task:write")}
+            api={api}
+            onSettingsChange={setSettings}
+            setStatus={setStatus}
+          />
         ) : view === "manual" ? (
           <ManualOrchestrationView
             assignments={snapshot?.assignments || cockpit?.tasks?.all || []}
@@ -1027,10 +1042,18 @@ function TelemetryView({
   cockpit,
   settings,
   models,
+  canEdit,
+  api,
+  onSettingsChange,
+  setStatus,
 }: {
   cockpit: CockpitPayload | null;
   settings: SettingsPayload | null;
   models: ModelInventory | null;
+  canEdit: boolean;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  onSettingsChange: (settings: SettingsPayload) => void;
+  setStatus: (message: string) => void;
 }) {
   const usage = cockpit?.usage || null;
   const datastores = cockpit?.datastores || [];
@@ -1052,6 +1075,54 @@ function TelemetryView({
     status?: string;
   }[];
   const infBusy = localInference?.status === "busy";
+
+  const proactiveMode = String(settings?.proactive_mode ?? "propose");
+  const proactiveCreationEnabled = Boolean(settings?.proactive_creation_enabled);
+  const maxProactivePerCycle = Number(settings?.max_proactive_creations_per_cycle ?? 1);
+  const overriddenKeys = settings?.runtime_overrides
+    ? Object.keys(settings.runtime_overrides)
+    : [];
+
+  const [modeDraft, setModeDraft] = useState(proactiveMode);
+  const [creationDraft, setCreationDraft] = useState(proactiveCreationEnabled);
+  const [maxDraft, setMaxDraft] = useState(String(maxProactivePerCycle));
+  const [savingProactive, setSavingProactive] = useState(false);
+
+  useEffect(() => {
+    setModeDraft(proactiveMode);
+    setCreationDraft(proactiveCreationEnabled);
+    setMaxDraft(String(maxProactivePerCycle));
+  }, [proactiveMode, proactiveCreationEnabled, maxProactivePerCycle]);
+
+  const proactiveDirty =
+    modeDraft !== proactiveMode ||
+    creationDraft !== proactiveCreationEnabled ||
+    maxDraft !== String(maxProactivePerCycle);
+
+  const saveProactive = async () => {
+    const parsedMax = Number.parseInt(maxDraft, 10);
+    if (!Number.isFinite(parsedMax) || parsedMax < 0) {
+      setStatus("Max creations per cycle must be a non-negative integer");
+      return;
+    }
+    setSavingProactive(true);
+    try {
+      const next = await api<SettingsPayload>("/api/settings/runtime", {
+        method: "PUT",
+        json: {
+          proactive_mode: modeDraft,
+          proactive_creation_enabled: creationDraft,
+          max_proactive_creations_per_cycle: parsedMax,
+        },
+      });
+      onSettingsChange(next);
+      setStatus("Proactive controls saved — applies on the next orchestrator cycle.");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      setSavingProactive(false);
+    }
+  };
 
   const settingValue = (key: string): string => {
     const raw = settings ? settings[key] : null;
@@ -1251,6 +1322,74 @@ function TelemetryView({
             ))}
           </div>
         </div>
+
+        <div className="ob-panel ob-tele-panel ob-tele-controls">
+          <div className="ob-panel-head">
+            <span className="ob-panel-title">Proactive Continuation</span>
+            {overriddenKeys.length > 0 ? (
+              <span className="ob-badge subtle">RUNTIME OVERRIDE</span>
+            ) : (
+              <span className="ob-badge subtle">CONFIG DEFAULT</span>
+            )}
+          </div>
+          <p className="ob-tele-control-note">
+            Live orchestrator controls. Changes are stored as runtime overrides and take
+            effect on the next cycle — no redeploy.
+          </p>
+          <div className="ob-control-row">
+            <label htmlFor="ob-proactive-mode">Mode</label>
+            <select
+              id="ob-proactive-mode"
+              className="ob-mo-input"
+              value={modeDraft}
+              disabled={!canEdit || savingProactive}
+              onChange={(event) => setModeDraft(event.target.value)}
+            >
+              <option value="off">off — no proactive work</option>
+              <option value="propose">propose — suggest only</option>
+              <option value="create">create — auto-create &amp; assign</option>
+            </select>
+          </div>
+          <div className="ob-control-row">
+            <label htmlFor="ob-proactive-creation">Creation enabled</label>
+            <label className="ob-control-toggle">
+              <input
+                id="ob-proactive-creation"
+                type="checkbox"
+                checked={creationDraft}
+                disabled={!canEdit || savingProactive}
+                onChange={(event) => setCreationDraft(event.target.checked)}
+              />
+              <span>{creationDraft ? "ON" : "OFF"}</span>
+            </label>
+          </div>
+          <div className="ob-control-row">
+            <label htmlFor="ob-proactive-max">Max creations / cycle</label>
+            <input
+              id="ob-proactive-max"
+              className="ob-mo-input ob-control-number"
+              type="number"
+              min={0}
+              step={1}
+              value={maxDraft}
+              disabled={!canEdit || savingProactive}
+              onChange={(event) => setMaxDraft(event.target.value)}
+            />
+          </div>
+          <div className="ob-control-actions">
+            {!canEdit && (
+              <span className="muted">Operator or owner role required to edit.</span>
+            )}
+            <button
+              type="button"
+              className="ob-mo-btn primary"
+              disabled={!canEdit || savingProactive || !proactiveDirty}
+              onClick={saveProactive}
+            >
+              {savingProactive ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </div>
       </div>
     </section>
   );
@@ -1447,6 +1586,11 @@ function ManualOrchestrationView({
   const [draft, setDraft] = useState({ assignment: "", priority: "normal", assigned_to: "" });
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResult, setSearchResult] = useState<Assignment | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [reassigning, setReassigning] = useState(false);
+  const [reassignTarget, setReassignTarget] = useState("");
 
   if (role !== "owner" && role !== "operator") {
     return (
@@ -1463,7 +1607,9 @@ function ManualOrchestrationView({
   const blocked = assignments.filter((a) => moStatusGroup(a.status) === "blocked");
   const queued = assignments.filter((a) => moStatusGroup(a.status) === "queued");
   const done = assignments.filter((a) => moStatusGroup(a.status) === "done");
-  const selected = assignments.find((a) => a.assignment_id === selectedId) || null;
+  const selected =
+    assignments.find((a) => a.assignment_id === selectedId) ||
+    (searchResult && searchResult.assignment_id === selectedId ? searchResult : null);
   const agentName = (id: string) => agents.find((a) => a.agent_id === id)?.display_name || id;
   const deps = manualDependencyHealth(assignments);
   const dependents = selected
@@ -1473,7 +1619,44 @@ function ManualOrchestrationView({
   const select = (id: string) => {
     setSelectedId(id);
     setEditing(false);
+    setReassigning(false);
     setNote("");
+    if (!assignments.some((a) => a.assignment_id === id)) return;
+    setSearchResult(null);
+  };
+
+  const runSearch = async () => {
+    const query = searchQuery.trim();
+    if (!query) return;
+    const local = assignments.find(
+      (a) => a.assignment_id === query || a.assignment_id.startsWith(query),
+    );
+    if (local) {
+      select(local.assignment_id);
+      setSearchResult(null);
+      setStatus(`Selected ${local.assignment_id.slice(0, 8)}`);
+      return;
+    }
+    setSearching(true);
+    try {
+      const found = await api<Assignment>(
+        `/api/tasks/${encodeURIComponent(query)}?include_history=true`,
+      );
+      setSearchResult(found);
+      setSelectedId(found.assignment_id);
+      setEditing(false);
+      setNote("");
+      setStatus(
+        found.archived
+          ? `Found archived task ${found.assignment_id.slice(0, 8)} (${found.status})`
+          : `Found ${found.assignment_id.slice(0, 8)}`,
+      );
+    } catch (error) {
+      setSearchResult(null);
+      setStatus(errorMessage(error));
+    } finally {
+      setSearching(false);
+    }
   };
 
   const run = (label: string, work: Promise<unknown>) => {
@@ -1497,6 +1680,10 @@ function ManualOrchestrationView({
     run(`Retried ${id}`, api(`${path(id)}/reissue`, { method: "POST" }));
   const reissueAsNew = (id: string) =>
     run(`Reissued ${id} as a new task`, api(`${path(id)}/reissue-as-new`, { method: "POST", json: { note } }));
+  const reassignTask = (id: string, agentId: string) => {
+    setReassigning(false);
+    run(`Reassigned ${id.slice(0, 8)} → ${agents.find((a) => a.agent_id === agentId)?.display_name ?? agentId}`, api(path(id), { method: "PATCH", json: { assigned_to: agentId } }));
+  };
   const saveEdit = (id: string) =>
     run(`Updated ${id}`, api(path(id), {
       method: "PATCH",
@@ -1517,6 +1704,34 @@ function ManualOrchestrationView({
           <span className="ob-panel-title">Task Queue</span>
           <span className="ob-mo-summary">{running.length}R · {blocked.length}B · {queued.length}Q</span>
         </div>
+        <form
+          className="ob-mo-search"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void runSearch();
+          }}
+        >
+          <input
+            className="ob-mo-input"
+            type="text"
+            placeholder="Find by task ID (incl. failed/archived)…"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            spellCheck={false}
+          />
+          <button type="submit" className="ob-mo-btn" disabled={searching || !searchQuery.trim()}>
+            {searching ? "…" : "Find"}
+          </button>
+        </form>
+        {searchResult && searchResult.assignment_id === selectedId && (
+          <div className="ob-mo-search-hit">
+            <span className={`ob-badge ${searchResult.archived ? "warn" : "ok"}`}>
+              {searchResult.archived ? "ARCHIVED" : "LIVE"}
+            </span>
+            <span className="ob-mono-id">{searchResult.assignment_id.slice(0, 8)}</span>
+            <span className="muted">· {searchResult.status}</span>
+          </div>
+        )}
         <div className="ob-mo-list">
           <ManualTaskGroup label="RUNNING" tone="run" tasks={running} selectedId={selectedId} agents={agents} onSelect={select} spinning />
           <ManualTaskGroup label="BLOCKED" tone="warn" tasks={blocked} selectedId={selectedId} agents={agents} onSelect={select} />
@@ -1580,29 +1795,88 @@ function ManualOrchestrationView({
                 )}
               </div>
 
-              {/* BLOCKED: relationship ER graph */}
-              {moStatusGroup(selected.status) === "blocked" && (
-                <div className="ob-mo-rel">
-                  <div className="ob-mo-rel-head">TASK RELATIONSHIPS</div>
-                  <div className="ob-mo-rel-graph">
-                    <div className="ob-mo-rel-node warn">
-                      <div className="ob-mo-rel-bar" style={{ background: "var(--c-warn)" }} />
-                      <div className="ob-mo-rel-id">{selected.assignment_id.slice(0, 8)}</div>
-                      <div className="ob-mo-rel-title">{selected.assignment}</div>
-                    </div>
-                    <div className="ob-mo-rel-link"><span>blocks</span><span className="ob-mo-rel-arrow">▶</span></div>
-                    {dependents[0] ? (
-                      <button type="button" className="ob-mo-rel-node clickable" style={sigStyle(dependents[0].assigned_to)} onClick={() => select(dependents[0].assignment_id)}>
-                        <div className="ob-mo-rel-bar" style={{ background: "var(--sig)" }} />
-                        <div className="ob-mo-rel-id">{dependents[0].assignment_id.slice(0, 8)} · inspect →</div>
-                        <div className="ob-mo-rel-title">{dependents[0].assignment}</div>
-                      </button>
-                    ) : (
-                      <div className="ob-mo-rel-node empty"><div className="ob-mo-rel-title muted">no downstream tasks</div></div>
+              {/* ARCHIVED: read-only history record */}
+              {selected.archived && (
+                <div className="ob-mo-archived">
+                  <div className="ob-mo-archived-head">
+                    ⓘ Archived task — read-only history record. IDs are never reused.
+                  </div>
+                  <div className="ob-mo-fields">
+                    <span>Final status</span>
+                    <span>{selected.final_status || selected.status}</span>
+                    <span>Archived at</span>
+                    <span>{selected.archived_at ? formatLogTime(selected.archived_at) : "—"}</span>
+                    {selected.executive_summary && (
+                      <>
+                        <span>Summary</span>
+                        <span className="ob-mo-desc">{selected.executive_summary}</span>
+                      </>
+                    )}
+                    {selected.failure_info && (
+                      <>
+                        <span>Failure</span>
+                        <span className="ob-mo-block">{selected.failure_info}</span>
+                      </>
                     )}
                   </div>
                 </div>
               )}
+
+              {/* TASK RELATIONSHIPS: full upstream → selected → downstream tree */}
+              {!selected.archived && ((selected.dependency_ids || []).length > 0 || dependents.length > 0) && (() => {
+                const upstreamIds = selected.dependency_ids || [];
+                const selectedColor = moStatusGroup(selected.status) === "blocked" ? "var(--c-warn)" : moStatusGroup(selected.status) === "running" ? "var(--sig)" : "var(--c-text-faint)";
+                const depColor = (s: string) => moStatusGroup(s) === "done" ? "var(--c-ok)" : moStatusGroup(s) === "blocked" ? "var(--c-warn)" : moStatusGroup(s) === "running" ? "var(--sig)" : "var(--c-text-faint)";
+                return (
+                  <div className="ob-mo-rel">
+                    <div className="ob-mo-rel-head">TASK RELATIONSHIPS</div>
+                    <div className="ob-mo-rel-graph ob-mo-rel-vertical">
+                      {upstreamIds.length > 0 && (
+                        <>
+                          <div className="ob-mo-rel-row">
+                            {upstreamIds.map((depId) => {
+                              const dep = assignments.find((a) => a.assignment_id === depId);
+                              return dep ? (
+                                <button key={depId} type="button" className="ob-mo-rel-node clickable" style={sigStyle(dep.assigned_to)} onClick={() => select(dep.assignment_id)}>
+                                  <div className="ob-mo-rel-bar" style={{ background: depColor(dep.status) }} />
+                                  <div className="ob-mo-rel-id">{dep.assignment_id.slice(0, 8)} · inspect →</div>
+                                  <div className="ob-mo-rel-title">{dep.assignment}</div>
+                                </button>
+                              ) : (
+                                <div key={depId} className="ob-mo-rel-node">
+                                  <div className="ob-mo-rel-bar" style={{ background: "var(--c-text-faint)" }} />
+                                  <div className="ob-mo-rel-id">{depId.slice(0, 8)}</div>
+                                  <div className="ob-mo-rel-title muted">not in active queue</div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                          <div className="ob-mo-rel-vlink"><span>blocks</span><span className="ob-mo-rel-arrow">▼</span></div>
+                        </>
+                      )}
+                      <div className="ob-mo-rel-node" style={{ outline: "1px solid var(--c-border)" }}>
+                        <div className="ob-mo-rel-bar" style={{ background: selectedColor }} />
+                        <div className="ob-mo-rel-id">{selected.assignment_id.slice(0, 8)} ← this task</div>
+                        <div className="ob-mo-rel-title">{selected.assignment}</div>
+                      </div>
+                      {dependents.length > 0 && (
+                        <>
+                          <div className="ob-mo-rel-vlink"><span>blocks</span><span className="ob-mo-rel-arrow">▼</span></div>
+                          <div className="ob-mo-rel-row">
+                            {dependents.map((dep) => (
+                              <button key={dep.assignment_id} type="button" className="ob-mo-rel-node clickable" style={sigStyle(dep.assigned_to)} onClick={() => select(dep.assignment_id)}>
+                                <div className="ob-mo-rel-bar" style={{ background: depColor(dep.status) }} />
+                                <div className="ob-mo-rel-id">{dep.assignment_id.slice(0, 8)} · inspect →</div>
+                                <div className="ob-mo-rel-title">{dep.assignment}</div>
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* QUEUED edit form */}
               {moStatusGroup(selected.status) === "queued" && editing ? (
@@ -1633,19 +1907,43 @@ function ManualOrchestrationView({
                 <>
                   {/* Action buttons by status */}
                   {moStatusGroup(selected.status) === "queued" && (
-                    <div className="ob-mo-actions">
-                      <button className="ob-mo-btn" disabled={busy} onClick={beginEdit}>Edit Task</button>
-                      <button className="ob-mo-btn" disabled={busy} onClick={() => reissueAsNew(selected.assignment_id)}>Reissue as New ↗</button>
-                      <button className="ob-mo-btn danger" disabled={busy} onClick={() => cancelTask(selected.assignment_id)}>Cancel Task</button>
-                    </div>
+                    <>
+                      <div className="ob-mo-actions">
+                        <button className="ob-mo-btn" disabled={busy} onClick={beginEdit}>Edit Task</button>
+                        <button className="ob-mo-btn" disabled={busy} onClick={() => { setReassignTarget(selected.assigned_to); setReassigning((r) => !r); }}>↔ Reassign</button>
+                        <button className="ob-mo-btn" disabled={busy} onClick={() => reissueAsNew(selected.assignment_id)}>Reissue as New ↗</button>
+                        <button className="ob-mo-btn danger" disabled={busy} onClick={() => cancelTask(selected.assignment_id)}>Cancel Task</button>
+                      </div>
+                      {reassigning && (
+                        <div className="ob-mo-reassign">
+                          <select className="ob-mo-input" value={reassignTarget} onChange={(e) => setReassignTarget(e.target.value)}>
+                            {agents.map((a) => <option key={a.agent_id} value={a.agent_id}>{a.display_name}</option>)}
+                          </select>
+                          <button className="ob-mo-btn primary" disabled={busy || reassignTarget === selected.assigned_to} onClick={() => reassignTask(selected.assignment_id, reassignTarget)}>Confirm Reassign</button>
+                          <button className="ob-mo-btn" onClick={() => setReassigning(false)}>Cancel</button>
+                        </div>
+                      )}
+                    </>
                   )}
                   {moStatusGroup(selected.status) === "blocked" && (
-                    <div className="ob-mo-actions">
-                      <button className="ob-mo-btn" disabled={busy} onClick={() => retryTask(selected.assignment_id)}>↻ Retry Now</button>
-                      <button className="ob-mo-btn" disabled={busy} onClick={() => reissueAsNew(selected.assignment_id)}>Reissue as New ↗</button>
-                      <button className="ob-mo-btn danger" disabled={busy} onClick={() => cancelTask(selected.assignment_id)}>✕ Retire Task</button>
-                      <button className="ob-mo-btn" disabled title="Phase 2">⬡ Repair Relationship</button>
-                    </div>
+                    <>
+                      <div className="ob-mo-actions">
+                        <button className="ob-mo-btn" disabled={busy} onClick={() => retryTask(selected.assignment_id)}>↻ Retry Now</button>
+                        <button className="ob-mo-btn" disabled={busy} onClick={() => { setReassignTarget(selected.assigned_to); setReassigning((r) => !r); }}>↔ Reassign</button>
+                        <button className="ob-mo-btn" disabled={busy} onClick={() => reissueAsNew(selected.assignment_id)}>Reissue as New ↗</button>
+                        <button className="ob-mo-btn danger" disabled={busy} onClick={() => cancelTask(selected.assignment_id)}>✕ Retire Task</button>
+                        <button className="ob-mo-btn" disabled title="Phase 2">⬡ Repair Relationship</button>
+                      </div>
+                      {reassigning && (
+                        <div className="ob-mo-reassign">
+                          <select className="ob-mo-input" value={reassignTarget} onChange={(e) => setReassignTarget(e.target.value)}>
+                            {agents.map((a) => <option key={a.agent_id} value={a.agent_id}>{a.display_name}</option>)}
+                          </select>
+                          <button className="ob-mo-btn primary" disabled={busy || reassignTarget === selected.assigned_to} onClick={() => reassignTask(selected.assignment_id, reassignTarget)}>Confirm Reassign</button>
+                          <button className="ob-mo-btn" onClick={() => setReassigning(false)}>Cancel</button>
+                        </div>
+                      )}
+                    </>
                   )}
                   {moStatusGroup(selected.status) === "running" && (
                     <>
@@ -1663,9 +1961,11 @@ function ManualOrchestrationView({
                   {(moStatusGroup(selected.status) === "queued" || moStatusGroup(selected.status) === "blocked") && (
                     <input className="ob-mo-input" placeholder="Optional note for reissue / audit…" value={note} onChange={(e) => setNote(e.target.value)} />
                   )}
-                  <div className="ob-mo-rules">
-                    Cancel archives the task — started tasks are never hard-deleted. Reissue as New mints a new task ID and retires this one (IDs are never reused). Every action is written to the audit log.
-                  </div>
+                  {!selected.archived && (
+                    <div className="ob-mo-rules">
+                      Cancel archives the task — started tasks are never hard-deleted. Reissue as New mints a new task ID and retires this one (IDs are never reused). Every action is written to the audit log.
+                    </div>
+                  )}
                 </>
               )}
             </div>
