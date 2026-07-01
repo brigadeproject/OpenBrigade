@@ -14,7 +14,7 @@ COPY pyproject.toml README.md ./
 COPY brigade ./brigade
 COPY migrations ./migrations
 COPY --from=web-build /app/web/dist ./web/dist
-RUN python -m pip install --no-cache-dir ".[web]"
+RUN python -m pip install --no-cache-dir ".[web,models]"
 
 ENTRYPOINT ["brigade"]
 CMD ["dashboard"]

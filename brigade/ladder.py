@@ -16,9 +16,11 @@ from typing import Any
 from brigade.orchestrator import (
     _idempotency_seen,
     orchestration_event,
+    policy_routed_chief_id,
     route_to_chief,
 )
 from brigade.schemas import (
+    MALFORMED_PROVIDER_OUTPUT_MARKER,
     Agent,
     Assignment,
     AssignmentKind,
@@ -53,6 +55,21 @@ def ladder_idempotency_key(assignment_id: str, step: str, failures: int) -> str:
     return f"ladder:v1:{assignment_id}:{step}:{failures}"
 
 
+def _is_malformed_output_failure(blocked: Assignment) -> bool:
+    return bool(blocked.last_error) and MALFORMED_PROVIDER_OUTPUT_MARKER in blocked.last_error
+
+
+def _skips_analysis(blocked: Assignment) -> bool:
+    """Failure-analysis children never get their own analysis child (no
+    diagnosis-of-a-diagnosis chains), and a malformed-provider-output
+    failure isn't something another agent turn can usefully diagnose — it's
+    prone to hitting the exact same parse failure, which is how a single bad
+    response used to cascade into an unbounded tree of analysis tasks."""
+    return blocked.kind == AssignmentKind.FAILURE_ANALYSIS or _is_malformed_output_failure(
+        blocked
+    )
+
+
 def ladder_state(
     store: StateStore,
     blocked: Assignment,
@@ -66,7 +83,10 @@ def ladder_state(
     failures = blocked.consecutive_failures
     if failures >= HUMAN_ESCALATION_FAILURES:
         return LADDER_STEP_HUMAN
+    skip_analysis = _skips_analysis(blocked)
     if failures >= REASSIGN_FAILURES:
+        if skip_analysis:
+            return LADDER_STEP_REASSIGN
         # The ==2 step can be skipped when failures jump between cycles, so
         # the analysis is created here as a catch-up rather than deadlocking.
         child = find_analysis_child(assignments or store.assignments(), blocked)
@@ -76,7 +96,7 @@ def ladder_state(
             return LADDER_STEP_REASSIGN
         return LADDER_WAITING_ANALYSIS
     if failures >= ANALYSIS_FAILURES:
-        return LADDER_STEP_ANALYSIS
+        return LADDER_STEP_RETRY if skip_analysis else LADDER_STEP_ANALYSIS
     return LADDER_STEP_RETRY
 
 
@@ -219,9 +239,14 @@ def create_failure_analysis(
     )
     if _idempotency_seen(store, key):
         return None
+    if _skips_analysis(blocked):
+        return None
     if find_analysis_child(store.assignments(), blocked) is not None:
         return None
-    chief = route_to_chief(store, agent_id=blocked.assigned_to)
+    prefer_chief_id = policy_routed_chief_id(store, AssignmentKind.FAILURE_ANALYSIS.value)
+    chief = route_to_chief(
+        store, agent_id=blocked.assigned_to, prefer_chief_id=prefer_chief_id
+    )
     target = chief.agent_id if chief is not None else blocked.assigned_to
     child = Assignment(
         assignment=_failure_analysis_text(blocked),

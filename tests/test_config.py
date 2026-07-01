@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from brigade.config import load_settings
 
 
@@ -31,8 +33,9 @@ def test_load_settings_reads_dotenv(tmp_path):
 
     assert settings.orchestrator_cadence_seconds == 30
     assert settings.stale_work_seconds == 3600
-    assert settings.proactive_mode == "propose"
-    assert settings.proactive_creation_enabled is False
+    # Proactive create-mode is the default as of 1.0.2 (see load_settings fallback).
+    assert settings.proactive_mode == "create"
+    assert settings.proactive_creation_enabled is True
 
 
 def test_load_settings_reads_proactive_controls(tmp_path):
@@ -71,6 +74,42 @@ def test_load_settings_uses_configured_ollama_as_live_default(tmp_path):
     assert settings.default_provider == "ollama"
     assert settings.ollama_base_url == "http://host.docker.internal:11434"
     assert settings.default_model == "gpt-oss:20b"
+
+
+def test_load_settings_can_use_openai_codex_default(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "BRIGADE_DEFAULT_PROVIDER=openai-codex\n"
+        "BRIGADE_DEFAULT_MODEL=gpt-5.3-codex-spark\n"
+        "BRIGADE_OPENAI_CODEX_AUTH_MODE=api_key\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=tmp_path / "missing.json", env_path=env)
+
+    assert settings.default_provider == "openai-codex"
+    assert settings.default_model == "gpt-5.3-codex-spark"
+    assert settings.openai_codex_auth_mode == "api_key"
+
+
+def test_load_settings_rejects_unknown_default_provider(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("BRIGADE_DEFAULT_PROVIDER=codex\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported default model provider"):
+        load_settings(config_path=tmp_path / "missing.json", env_path=env)
+
+
+def test_load_settings_rejects_unknown_auth_mode(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "BRIGADE_DEFAULT_PROVIDER=openai-codex\n"
+        "BRIGADE_OPENAI_CODEX_AUTH_MODE=ollama\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported auth mode"):
+        load_settings(config_path=tmp_path / "missing.json", env_path=env)
 
 
 def test_load_settings_retired_provider_falls_back_to_ollama(tmp_path):

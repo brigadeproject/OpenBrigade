@@ -403,6 +403,94 @@ def test_cli_chat_tui_uses_available_recommended_model_when_not_overridden(tmp_p
     assert provider.complete("hello").model == "test-model"
 
 
+def test_cli_agent_model_updates_persisted_provider_route(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "agent",
+                "add",
+                "--id",
+                "builder",
+                "--name",
+                "Builder",
+                "--workspace",
+                "workspace-builder",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "agent",
+                "model",
+                "--id",
+                "builder",
+                "--provider",
+                "openai-codex",
+                "--model",
+                "gpt-5.3-codex-spark",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["model_provider"] == "openai-codex"
+    assert payload["model_name"] == "gpt-5.3-codex-spark"
+
+
+def test_cli_model_probe_updates_cached_inventory(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    def fake_probe(settings, *, providers=None):
+        assert providers == ["openai-codex"]
+        return {
+            "updated_at": "2026-06-29T00:00:00+00:00",
+            "providers": {
+                "openai-codex": {
+                    "provider": "openai-codex",
+                    "status": "ok",
+                    "probed_at": "2026-06-29T00:00:00+00:00",
+                    "models": [{"provider": "openai-codex", "model": "codex-test"}],
+                }
+            },
+        }
+
+    monkeypatch.setattr("brigade.cli.probe_model_inventory", fake_probe)
+
+    assert main(["model", "probe", "--provider", "openai-codex"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    state = json.loads((tmp_path / ".brigade" / "state.json").read_text(encoding="utf-8"))
+
+    assert payload["providers"]["openai-codex"]["status"] == "ok"
+    assert state["model_inventory"]["providers"]["openai-codex"]["models"][0]["model"] == (
+        "codex-test"
+    )
+
+
+def test_cli_orchestrator_daemon_probes_models_once_at_start(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    def fake_probe(settings, *, providers=None):
+        calls.append(providers)
+        return {"updated_at": "2026-06-29T00:00:00+00:00", "providers": {}}
+
+    monkeypatch.setattr("brigade.cli.probe_model_inventory", fake_probe)
+
+    assert main(["orchestrator", "daemon", "--max-cycles", "0", "--no-run-agents"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert calls == [None]
+    assert payload["cycles"] == 0
+    assert payload["model_inventory"]["providers"] == {}
+
+
 def test_cli_chat_group_records_pass_the_mic_turns(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -1129,6 +1217,10 @@ def test_cli_daemon_records_one_idle_mission_proposal_without_creating_assignmen
     capsys,
 ):
     monkeypatch.chdir(tmp_path)
+    # This test exercises the propose-only path; pin it explicitly since the
+    # shipped default is now create-mode (1.0.2).
+    monkeypatch.setenv("BRIGADE_PROACTIVE_MODE", "propose")
+    monkeypatch.setenv("BRIGADE_PROACTIVE_CREATION_ENABLED", "false")
     monkeypatch.setattr(
         "brigade.cli.provider_from_settings",
         lambda *args, **kwargs: TestProvider(),

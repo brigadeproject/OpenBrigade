@@ -62,3 +62,20 @@ def test_proposals_and_recurrences_migration_exists():
     assert "create table if not exists brigade_recurrences" in sql
     assert "brigade_proposals_idempotency_key_unique_idx" in sql
     assert "next_due_at timestamptz not null" in sql
+
+
+def test_model_inventory_migration_exists():
+    sql = Path("migrations/0012_model_inventory.sql").read_text(encoding="utf-8")
+
+    assert "create table if not exists brigade_model_inventory" in sql
+    assert "provider text primary key" in sql
+    assert "record jsonb not null" in sql
+
+
+def test_orchestrator_policies_migration_exists():
+    sql = Path("migrations/0013_orchestrator_policies.sql").read_text(encoding="utf-8")
+
+    assert "create table if not exists brigade_orchestrator_policies" in sql
+    assert "rule_kind text not null default 'freeform'" in sql
+    assert "assignment_kind text" in sql
+    assert "active boolean not null default true" in sql

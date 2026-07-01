@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
+import sys
 
 import pytest
 
@@ -712,6 +714,34 @@ def test_cli_model_oauth_login_status_logout_redacts_tokens(tmp_path, monkeypatc
     assert main(["model", "auth", "logout", "--provider", "openai"]) == 0
     logout_payload = json.loads(capsys.readouterr().out)
     assert logout_payload["deleted"] is True
+
+
+def test_cli_model_oauth_login_reads_access_token_from_stdin(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("stdin-secret-token\n"))
+
+    assert (
+        main(
+            [
+                "model",
+                "auth",
+                "login",
+                "--provider",
+                "openai-codex",
+                "--method",
+                "oauth",
+                "--access-token-stdin",
+            ]
+        )
+        == 0
+    )
+
+    login_payload = json.loads(capsys.readouterr().out)
+    assert login_payload["ok"] is True
+    assert login_payload["credential"]["access_token"] == "***redacted***"
+    credential_path = tmp_path / ".brigade" / "secrets" / "model-auth" / "openai-codex.oauth.json"
+    credential = json.loads(credential_path.read_text(encoding="utf-8"))
+    assert credential["access_token"] == "stdin-secret-token"
 
 
 def test_web_auth_api_running_service_behaviour(tmp_path, monkeypatch):

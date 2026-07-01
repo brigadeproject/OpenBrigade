@@ -93,6 +93,7 @@ brigade task inspect --id <assignment-id>
 brigade knowledge upload --path ./notes/reference.md
 brigade model complete --provider ollama --model gpt-oss:20b --prompt "Summarize the mission"
 brigade model complete --provider openai --model gpt-4.1-mini --prompt "Summarize"
+brigade model complete --provider openai-codex --model gpt-5.3-codex-spark --prompt "Summarize"
 brigade model complete --provider gemini --model gemini-1.5-flash --prompt "Summarize"
 brigade model route --task-type research --risk normal
 brigade orchestrator propose-stalled-goals
@@ -105,6 +106,15 @@ brigade datastore inspect --backend qdrant
 brigade datastore inspect --backend neo4j
 ./ops/brigade-live.sh chat tui --agent sage --plain
 brigade settings tui --plain
+```
+
+When using OAuth credentials with the live Docker harness, import an access token through stdin:
+
+```bash
+printf '%s' "$OPENCLAW_ACCESS_TOKEN" | ./ops/brigade-live.sh model auth login \
+  --provider openai-codex \
+  --method oauth \
+  --access-token-stdin
 ```
 
 Prototype v0.5 adds onboarding, team structure, Crew Chief delegation, inter-agent chat, model

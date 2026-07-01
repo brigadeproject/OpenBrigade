@@ -9,6 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -60,6 +61,7 @@ from brigade.providers import (
     OllamaProvider,
     ProviderAuthError,
     available_model_options,
+    probe_model_inventory,
     provider_from_settings,
 )
 from brigade.rbac import can
@@ -73,6 +75,7 @@ from brigade.runner import (
 from brigade.schemas import (
     PROPOSAL_KINDS,
     PROPOSAL_STATUSES,
+    TERMINAL_STATUSES,
     Agent,
     Assignment,
     AssignmentKind,
@@ -84,7 +87,6 @@ from brigade.schemas import (
     Priority,
     Role,
     Team,
-    TERMINAL_STATUSES,
     User,
     WorkMode,
 )
@@ -315,6 +317,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_provider_args(agent_run)
     agent_run_all = agent_sub.add_parser("run-all")
     _add_provider_args(agent_run_all)
+    agent_model = agent_sub.add_parser(
+        "model",
+        help="Update one agent's persisted model provider and model.",
+    )
+    agent_model.add_argument("--id", required=True)
+    agent_model.add_argument(
+        "--provider",
+        required=True,
+        choices=["ollama", "litellm", "openai", "openai-codex", "anthropic", "gemini"],
+    )
+    agent_model.add_argument("--model", required=True)
     agent_sub.add_parser("list")
 
     team = subcommands.add_parser(
@@ -867,6 +880,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     model_auth_login.add_argument("--method", choices=["oauth"], required=True)
     model_auth_login.add_argument("--access-token", default=None)
+    model_auth_login.add_argument(
+        "--access-token-stdin",
+        action="store_true",
+        help="Read the OAuth access token from stdin instead of the command line.",
+    )
     model_auth_login.add_argument("--refresh-token", default=None)
     model_auth_login.add_argument("--expires-at", default=None)
     model_auth_login.add_argument("--expires-in", type=int, default=None)
@@ -900,6 +918,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     complete = model_sub.add_parser("complete", help="Run one completion request.")
     _add_provider_args(complete, require_prompt=True)
+    probe = model_sub.add_parser(
+        "probe",
+        help="Probe provider model inventories and update the cached model list.",
+    )
+    probe.add_argument(
+        "--provider",
+        action="append",
+        choices=["ollama", "litellm", "openai", "openai-codex", "anthropic", "gemini"],
+        default=None,
+        help="Provider to probe. Repeat for multiple. Default: configured providers.",
+    )
     route = model_sub.add_parser(
         "route",
         help="Recommend a provider/model for a task using cost and in-flight cloud state.",
@@ -1426,6 +1455,27 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "model" and args.model_command == "probe":
+        _require_permission(store, settings, actor, "admin")
+        inventory = probe_model_inventory(settings, providers=args.provider)
+        store.set_model_inventory(inventory)
+        print(json.dumps(inventory, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "agent" and args.agent_command == "model":
+        _require_permission(store, settings, actor, "agent:write")
+        agent = _find_agent(store, args.id)
+        if agent is None:
+            raise ValueError(f"unknown agent: {args.id}")
+        updated = replace(
+            agent,
+            model_provider=args.provider,
+            model_name=args.model,
+        )
+        store.add_agent(updated)
+        print(json.dumps(updated.to_dict(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "agent" and args.agent_command == "validate":
@@ -2128,7 +2178,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
         _require_permission(store, settings, actor, "orchestrator:write")
         result = run_full_cycle(
             store,
-            config=OrchestrationConfig.from_settings(settings),
+            config=OrchestrationConfig.from_settings(settings).with_overrides(
+                store.runtime_overrides()
+            ),
         )
         print(
             json.dumps(
@@ -2163,11 +2215,15 @@ def _main(argv: Sequence[str] | None = None) -> int:
         agent_results = []
         provider = _provider_from_args(args, settings)
         provider_factory = _managed_agent_provider_factory(args, settings, store)
+        model_inventory = probe_model_inventory(settings)
+        store.set_model_inventory(model_inventory)
         while max_cycles is None or completed < max_cycles:
             run_full_cycle(
                 store,
                 provider=provider,
-                config=OrchestrationConfig.from_settings(settings),
+                config=OrchestrationConfig.from_settings(settings).with_overrides(
+                    store.runtime_overrides()
+                ),
             )
             if not args.no_run_agents:
                 agent_results.extend(
@@ -2187,6 +2243,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 {
                     "cycles": completed,
                     "agent_runs": [item.to_dict() for item in agent_results],
+                    "model_inventory": model_inventory,
                 },
                 indent=2,
                 sort_keys=True,
@@ -2287,6 +2344,9 @@ def _model_auth_command(args: argparse.Namespace, settings: Settings) -> int:
 
     if args.model_auth_command == "login":
         token_payload = None
+        access_token = args.access_token
+        if args.access_token_stdin:
+            access_token = sys.stdin.read().strip()
         if args.token_json:
             token_payload = json.loads(Path(args.token_json).read_text(encoding="utf-8"))
         if args.auth_code:
@@ -2299,7 +2359,7 @@ def _model_auth_command(args: argparse.Namespace, settings: Settings) -> int:
             status = write_oauth_credential(
                 settings,
                 provider=args.provider,
-                access_token=args.access_token,
+                access_token=access_token,
                 refresh_token=args.refresh_token,
                 expires_at=args.expires_at,
                 expires_in=args.expires_in,

@@ -11,22 +11,33 @@ from brigade.auth import AuthResult, build_user_identity_context
 from brigade.config import Settings
 from brigade.health import HealthCheck
 from brigade.orchestrator import (
+    _active_policy_summaries,
+    apply_orchestrator_actions,
     build_orchestration_telemetry,
     orchestration_event,
+    parse_orchestrator_response,
     record_orchestration_events,
+)
+from brigade.prompt_floors import (
+    compact_json,
+    orchestrator_system_prompt,
+    read_orchestrator_notes,
+    write_orchestrator_notes,
+    write_orchestrator_system_prompt,
 )
 from brigade.providers import ModelProvider
 from brigade.runner import _acquire_local_inference_lock
 from brigade.schemas import (
+    TERMINAL_STATUSES,
     Assignment,
     AssignmentKind,
     AssignmentStatus,
     ChatMessage,
     Priority,
     Team,
-    TERMINAL_STATUSES,
     User,
     WorkMode,
+    extract_json_object,
 )
 from brigade.store import StateStore
 from brigade.time import utc_now_iso
@@ -196,6 +207,9 @@ SAFE_CONFIG_KEYS = {
     "default_provider": str,
     "default_model": str,
     "ollama_base_url": str,
+    "openai_auth_mode": str,
+    "openai_codex_auth_mode": str,
+    "gemini_auth_mode": str,
     "web_host": str,
     "web_port": int,
     "intake_mode": str,
@@ -211,6 +225,18 @@ SAFE_CONFIG_KEYS = {
     "recurrence_detection_threshold": int,
     "recurrence_lookback_days": int,
 }
+
+# Keys an operator can change live from the Telemetry page. These are layered onto
+# OrchestrationConfig each cycle via a Redis-backed runtime override (see store
+# runtime_overrides), so the orchestrator daemon picks them up without a restart —
+# unlike SAFE_CONFIG_KEYS which write a per-container config file.
+RUNTIME_OVERRIDE_KEYS = {
+    "proactive_mode": str,
+    "proactive_creation_enabled": bool,
+    "max_proactive_creations_per_cycle": int,
+}
+
+VALID_PROACTIVE_MODES = ("off", "propose", "create")
 
 
 def build_chat_payload(
@@ -363,6 +389,81 @@ def send_user_chat(
     }
 
 
+_CHAT_CONFIRM_PHRASES = frozenset(
+    {"confirm", "confirmed", "yes", "y", "do it", "go ahead", "apply", "approved", "approve",
+     "proceed"}
+)
+_CHAT_DECLINE_PHRASES = frozenset(
+    {"cancel", "no", "n", "abort", "never mind", "nevermind", "stop", "decline", "discard",
+     "reject"}
+)
+
+
+def _classify_chat_confirmation(content: str) -> str | None:
+    normalized = content.strip().lower().strip("!.").strip()
+    if normalized in _CHAT_CONFIRM_PHRASES:
+        return "confirm"
+    if normalized in _CHAT_DECLINE_PHRASES:
+        return "decline"
+    return None
+
+
+def _pending_chat_proposal(store: StateStore, channel: str) -> dict[str, Any] | None:
+    for message in reversed(store.messages(channel)):
+        kind = message.metadata.get("kind")
+        if kind == "orchestrator_chat_proposal_resolved":
+            return None
+        if kind == "orchestrator_chat_proposal":
+            return message.metadata
+    return None
+
+
+def _parse_chat_reply(text: str) -> tuple[str, list[dict[str, Any]], str]:
+    """Splits an orchestrator chat reply into a plain-text answer or a
+    proposed-actions envelope. Anything that isn't a well-formed
+    ``propose_actions`` JSON object is treated as ordinary prose, same as
+    parse_agent_response treats non-JSON as a plain "working" summary."""
+    stripped = text.strip()
+    candidate = extract_json_object(stripped)
+    if candidate.startswith("{"):
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            return "text", [], stripped
+        if isinstance(payload, dict) and str(payload.get("status") or "").strip().lower() == (
+            "propose_actions"
+        ):
+            actions = payload.get("actions") or []
+            normalized = [item for item in actions if isinstance(item, dict)]
+            summary = str(payload.get("summary") or "").strip() or "Proposed action(s)."
+            if normalized:
+                return "actions", normalized, summary
+    return "text", [], stripped
+
+
+def _format_action_proposal(summary: str, actions: list[dict[str, Any]]) -> str:
+    lines = [summary, "", "This will:"]
+    for action in actions:
+        lines.append(f"- {json.dumps(action, sort_keys=True)}")
+    lines.extend(["", "Reply **confirm** to apply, or **cancel** to discard."])
+    return "\n".join(lines)
+
+
+def _format_action_result(result: dict[str, list[dict[str, Any]]]) -> str:
+    lines = ["Applied."]
+    if result["applied"]:
+        lines.append("")
+        lines.append("Applied:")
+        for item in result["applied"]:
+            lines.append(f"- {json.dumps(item, sort_keys=True, default=str)}")
+    if result["rejected"]:
+        lines.append("")
+        lines.append("Rejected:")
+        for item in result["rejected"]:
+            lines.append(f"- {item.get('reason')}")
+    return "\n".join(lines)
+
+
 def send_orchestrator_chat(
     store: StateStore,
     actor: AuthResult,
@@ -401,13 +502,22 @@ def send_orchestrator_chat(
     )
     store.add_message(request)
 
+    pending = _pending_chat_proposal(store, channel)
+    decision = _classify_chat_confirmation(content) if pending else None
+    if pending is not None and decision is not None:
+        return _resolve_chat_proposal(
+            store, pending, decision, channel=channel, sender=sender, request=request
+        )
+
     route_type = getattr(provider, "route_type", "unknown")
     lock_acquired = False
     try:
         if route_type == "local":
             _acquire_chat_local_inference_lock(store, "orchestrator")
             lock_acquired = True
-        response = provider.complete(_orchestrator_chat_prompt(store, content, user))
+        response = provider.complete(
+            _orchestrator_chat_prompt(store, content, user, pending=pending)
+        )
     except RuntimeError as exc:
         summary = str(exc)
         store.add_alert(f"orchestrator chat {channel}: {summary}")
@@ -424,7 +534,19 @@ def send_orchestrator_chat(
         if lock_acquired:
             _release_chat_local_inference_lock(store, "orchestrator")
 
-    response_text = response.text.strip()
+    kind, actions, display_text = _parse_chat_reply(response.text)
+    if kind == "actions":
+        return _stage_chat_proposal(
+            store,
+            actions,
+            display_text,
+            channel=channel,
+            sender=sender,
+            request=request,
+            response=response,
+        )
+
+    response_text = display_text
     response_message = ChatMessage(
         channel=channel,
         sender="orchestrator",
@@ -482,6 +604,110 @@ def send_orchestrator_chat(
         "provider": response.provider,
         "model": response.model,
         "route_type": response.route_type,
+    }
+
+
+def _stage_chat_proposal(
+    store: StateStore,
+    actions: list[dict[str, Any]],
+    summary: str,
+    *,
+    channel: str,
+    sender: str,
+    request: ChatMessage,
+    response: Any,
+) -> dict[str, Any]:
+    response_text = _format_action_proposal(summary, actions)
+    response_message = ChatMessage(
+        channel=channel,
+        sender="orchestrator",
+        recipient=sender,
+        content=response_text,
+        metadata={
+            "kind": "orchestrator_chat_proposal",
+            "conversation_id": channel,
+            "actions": actions,
+            "summary": summary,
+            "provider": response.provider,
+            "model": response.model,
+            "route_type": response.route_type,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "estimated_cost_usd": response.estimated_cost_usd,
+        },
+    )
+    store.add_message(response_message)
+    store.add_usage_record(
+        {
+            "usage_id": str(uuid4()),
+            "assignment_id": None,
+            "agent_id": "orchestrator",
+            "provider": response.provider,
+            "model": response.model,
+            "route_type": response.route_type,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "total_tokens": response.input_tokens + response.output_tokens,
+            "estimated_cost_usd": response.estimated_cost_usd,
+            "recorded_at": utc_now_iso(),
+            "conversation_id": channel,
+            "source": "orchestrator_chat",
+        }
+    )
+    return {
+        "status": "proposed",
+        "conversation_id": channel,
+        "summary": summary,
+        "request_message_id": request.message_id,
+        "response_message_id": response_message.message_id,
+        "agent_id": "orchestrator",
+        "actions_proposed": actions,
+        "provider": response.provider,
+        "model": response.model,
+        "route_type": response.route_type,
+    }
+
+
+def _resolve_chat_proposal(
+    store: StateStore,
+    pending: dict[str, Any],
+    decision: str,
+    *,
+    channel: str,
+    sender: str,
+    request: ChatMessage,
+) -> dict[str, Any]:
+    actions = pending.get("actions") or []
+    if decision == "confirm":
+        result = apply_orchestrator_chat_actions(store, actions, by=sender)
+        response_text = _format_action_result(result)
+        status = "applied"
+    else:
+        result = {"applied": [], "rejected": [], "skipped": []}
+        response_text = "Discarded the pending action(s); nothing was changed."
+        status = "declined"
+    response_message = ChatMessage(
+        channel=channel,
+        sender="orchestrator",
+        recipient=sender,
+        content=response_text,
+        metadata={
+            "kind": "orchestrator_chat_proposal_resolved",
+            "conversation_id": channel,
+            "decision": decision,
+            "result": result,
+        },
+    )
+    store.add_message(response_message)
+    return {
+        "status": status,
+        "conversation_id": channel,
+        "summary": _summarize(response_text),
+        "request_message_id": request.message_id,
+        "response_message_id": response_message.message_id,
+        "agent_id": "orchestrator",
+        "actions_applied": result["applied"],
+        "actions_rejected": result["rejected"],
     }
 
 
@@ -1031,6 +1257,170 @@ def cancel_assignments_where(
     return results
 
 
+CHAT_EXTENDED_ACTION_TYPES = frozenset(
+    {
+        "cancel_assignment",
+        "cancel_assignments_where",
+        "set_routing_policy",
+        "retire_policy",
+        "write_note",
+        "update_system_prompt",
+    }
+)
+
+
+def apply_orchestrator_chat_actions(
+    store: StateStore,
+    actions: list[dict[str, Any]],
+    *,
+    by: str = "operator",
+) -> dict[str, list[dict[str, Any]]]:
+    """Superset of ``apply_orchestrator_actions`` for operator-directed chat
+    commands: adds cancel/policy/memory actions the automated escalation
+    cycle never proposes and should not be able to trigger unattended."""
+    applied: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for action in actions:
+        action_type = str(action.get("type") or "").strip()
+        if action_type not in CHAT_EXTENDED_ACTION_TYPES:
+            sub = apply_orchestrator_actions(store, [action])
+            applied.extend(sub["applied"])
+            rejected.extend(sub["rejected"])
+            skipped.extend(sub.get("skipped", []))
+            continue
+        try:
+            if action_type == "cancel_assignment":
+                applied.append(_apply_chat_cancel_assignment(store, action, by=by))
+            elif action_type == "cancel_assignments_where":
+                applied.append(_apply_chat_cancel_assignments_where(store, action, by=by))
+            elif action_type == "set_routing_policy":
+                applied.append(_apply_chat_set_routing_policy(store, action, by=by))
+            elif action_type == "retire_policy":
+                applied.append(_apply_chat_retire_policy(store, action, by=by))
+            elif action_type == "write_note":
+                applied.append(_apply_chat_write_note(store, action))
+            else:
+                applied.append(_apply_chat_update_system_prompt(store, action))
+        except (AssignmentActionError, ValueError) as exc:
+            rejected.append({"action": action, "reason": str(exc)})
+    return {"applied": applied, "rejected": rejected, "skipped": skipped}
+
+
+def _apply_chat_cancel_assignment(
+    store: StateStore, action: dict[str, Any], *, by: str
+) -> dict[str, Any]:
+    assignment_id = str(action.get("assignment_id") or "").strip()
+    if not assignment_id:
+        raise ValueError("cancel_assignment is missing assignment_id")
+    reason = str(action.get("reason") or "cancelled via orchestrator chat")
+    result = cancel_assignment(store, assignment_id, reason=reason, by=by, force=True)
+    return {"type": "cancel_assignment", **result}
+
+
+def _apply_chat_cancel_assignments_where(
+    store: StateStore, action: dict[str, Any], *, by: str
+) -> dict[str, Any]:
+    status = action.get("status")
+    kind = action.get("kind")
+    blocker_contains = action.get("blocker_contains")
+    if not any([status, kind, blocker_contains]):
+        raise ValueError(
+            "cancel_assignments_where needs at least one of status, kind, blocker_contains"
+        )
+    reason = str(action.get("reason") or "bulk cancel via orchestrator chat")
+    results = cancel_assignments_where(
+        store,
+        status=str(status) if status else None,
+        kind=str(kind) if kind else None,
+        blocker_contains=str(blocker_contains) if blocker_contains else None,
+        reason=reason,
+        by=by,
+        force=True,
+    )
+    return {"type": "cancel_assignments_where", "cancelled": results, "count": len(results)}
+
+
+def _apply_chat_set_routing_policy(
+    store: StateStore, action: dict[str, Any], *, by: str
+) -> dict[str, Any]:
+    assignment_kind = str(action.get("assignment_kind") or "").strip()
+    target_team_id = str(action.get("target_team_id") or "").strip()
+    if not assignment_kind:
+        raise ValueError("set_routing_policy is missing assignment_kind")
+    if not target_team_id:
+        raise ValueError("set_routing_policy is missing target_team_id")
+    if not any(team.team_id == target_team_id for team in store.teams()):
+        raise ValueError(f"unknown team: {target_team_id}")
+    statement = str(
+        action.get("statement")
+        or f"{assignment_kind} assignments route to the {target_team_id} team."
+    )
+    now = utc_now_iso()
+    policy = {
+        "policy_id": str(uuid4()),
+        "rule_kind": "routing_rule",
+        "assignment_kind": assignment_kind,
+        "target_team_id": target_team_id,
+        "statement": statement,
+        "active": True,
+        "created_at": now,
+        "updated_at": now,
+        "created_by": by,
+    }
+    store.add_orchestrator_policy(policy)
+    _record_operator_event(
+        store,
+        action="set_routing_policy",
+        summary=statement,
+        assignment_id=f"policy:{policy['policy_id']}",
+        by=by,
+        payload=policy,
+    )
+    return {"type": "set_routing_policy", **policy}
+
+
+def _apply_chat_retire_policy(
+    store: StateStore, action: dict[str, Any], *, by: str
+) -> dict[str, Any]:
+    policy_id = str(action.get("policy_id") or "").strip()
+    if not policy_id:
+        raise ValueError("retire_policy is missing policy_id")
+    policy = store.find_orchestrator_policy(policy_id)
+    if policy is None:
+        raise ValueError(f"unknown policy: {policy_id}")
+    policy = dict(policy)
+    policy["active"] = False
+    policy["updated_at"] = utc_now_iso()
+    store.update_orchestrator_policy(policy)
+    _record_operator_event(
+        store,
+        action="retire_policy",
+        summary=f"retired policy {policy_id}",
+        assignment_id=f"policy:{policy_id}",
+        by=by,
+        payload=policy,
+    )
+    return {"type": "retire_policy", **policy}
+
+
+def _apply_chat_write_note(store: StateStore, action: dict[str, Any]) -> dict[str, Any]:
+    content = str(action.get("content") or "").strip()
+    if not content:
+        raise ValueError("write_note is missing content")
+    append = action.get("append")
+    write_orchestrator_notes(store, content, append=append is not False)
+    return {"type": "write_note", "content": content}
+
+
+def _apply_chat_update_system_prompt(store: StateStore, action: dict[str, Any]) -> dict[str, Any]:
+    content = str(action.get("content") or "").strip()
+    if not content:
+        raise ValueError("update_system_prompt is missing content")
+    write_orchestrator_system_prompt(store, content)
+    return {"type": "update_system_prompt", "content": content}
+
+
 def _record_operator_event(
     store: StateStore,
     *,
@@ -1060,6 +1450,57 @@ def _record_operator_event(
             )
         ],
     )
+
+
+def _history_entry_to_dict(entry: dict[str, Any]) -> dict[str, Any]:
+    record = entry.get("record") or {}
+    return {
+        **record,
+        "archived": True,
+        "final_status": entry.get("final_status"),
+        "executive_summary": entry.get("executive_summary"),
+        "archived_at": entry.get("archived_at"),
+        "failure_info": entry.get("failure_info"),
+    }
+
+
+def _history_entry_id(entry: dict[str, Any]) -> str:
+    record = entry.get("record") or {}
+    return str(record.get("assignment_id") or entry.get("assignment_id") or "")
+
+
+def lookup_assignment(store: StateStore, assignment_id: str) -> dict[str, Any] | None:
+    """Find a task by id across active work AND archived/failed history.
+
+    Resolution order: exact active match → exact history match → unique prefix
+    match across active + history (so an operator can search with the short
+    8-char id shown in the UI). Active assignments are returned with
+    ``archived: False``; archived tasks (completed/cancelled/superseded) carry
+    ``archived: True`` plus the archive metadata (``final_status``,
+    ``executive_summary``, ``archived_at``, ``failure_info``) so they remain
+    inspectable after leaving the live queue.
+    """
+    query = (assignment_id or "").strip()
+    if not query:
+        return None
+    active = store.find_assignment(query)
+    if active is not None:
+        return {**active.to_dict(), "archived": False}
+    history = store.assignment_history()
+    for entry in history:
+        if _history_entry_id(entry) == query:
+            return _history_entry_to_dict(entry)
+    if len(query) >= 4:
+        matches: list[dict[str, Any]] = []
+        for assignment in store.assignments():
+            if assignment.assignment_id.startswith(query):
+                matches.append({**assignment.to_dict(), "archived": False})
+        for entry in history:
+            if _history_entry_id(entry).startswith(query):
+                matches.append(_history_entry_to_dict(entry))
+        if len(matches) == 1:
+            return matches[0]
+    return None
 
 
 def reissue_assignment_as_new(
@@ -1315,7 +1756,12 @@ def build_dashboard_payload_data(store: StateStore) -> dict[str, Any]:
     return build_dashboard_payload(store)
 
 
-def build_settings_payload(settings: Settings) -> dict[str, Any]:
+def build_settings_payload(
+    settings: Settings,
+    *,
+    runtime_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    overrides = runtime_overrides or {}
     return {
         "config_path": str(settings.config_path),
         "config_hash": config_file_hash(settings.config_path),
@@ -1323,10 +1769,16 @@ def build_settings_payload(settings: Settings) -> dict[str, Any]:
         "log_level": settings.log_level,
         "orchestrator_cadence_seconds": settings.orchestrator_cadence_seconds,
         "stale_work_seconds": settings.stale_work_seconds,
-        "proactive_mode": settings.proactive_mode,
-        "proactive_creation_enabled": settings.proactive_creation_enabled,
+        "proactive_mode": overrides.get("proactive_mode", settings.proactive_mode),
+        "proactive_creation_enabled": overrides.get(
+            "proactive_creation_enabled", settings.proactive_creation_enabled
+        ),
         "max_proactive_proposals_per_cycle": settings.max_proactive_proposals_per_cycle,
-        "max_proactive_creations_per_cycle": settings.max_proactive_creations_per_cycle,
+        "max_proactive_creations_per_cycle": overrides.get(
+            "max_proactive_creations_per_cycle", settings.max_proactive_creations_per_cycle
+        ),
+        "runtime_overrides": overrides,
+        "runtime_override_keys": sorted(RUNTIME_OVERRIDE_KEYS),
         "require_auth": settings.require_auth,
         "jwt_issuer": settings.jwt_issuer,
         "jwt_audience": settings.jwt_audience,
@@ -1401,6 +1853,102 @@ def set_config_value(
         "previous_hash": current_hash,
         "config_hash": config_file_hash(config_path),
     }
+
+
+def get_runtime_overrides(store: StateStore) -> dict[str, Any]:
+    """Return the operator's live runtime config overrides (validated subset)."""
+    raw = store.runtime_overrides() or {}
+    result: dict[str, Any] = {}
+    for key in RUNTIME_OVERRIDE_KEYS:
+        if key not in raw:
+            continue
+        try:
+            result[key] = _coerce_runtime_value(key, raw[key])
+        except ValueError:
+            continue
+    return result
+
+
+def set_runtime_overrides(
+    store: StateStore,
+    values: dict[str, Any],
+    *,
+    by: str = "operator",
+) -> dict[str, Any]:
+    """Persist live runtime config overrides and audit the change.
+
+    Only ``RUNTIME_OVERRIDE_KEYS`` may be set. Values are validated/coerced, merged
+    onto any existing overrides, and stored where both the web and orchestrator
+    containers can read them (Redis in production), so the daemon applies them on
+    its next cycle without a restart.
+    """
+    unknown = [key for key in values if key not in RUNTIME_OVERRIDE_KEYS]
+    if unknown:
+        raise ValueError(
+            f"runtime override keys are not editable: {', '.join(sorted(unknown))}"
+        )
+    if not values:
+        return get_runtime_overrides(store)
+    changes = {key: _coerce_runtime_value(key, raw) for key, raw in values.items()}
+    current = store.runtime_overrides() or {}
+    merged = {**current, **changes}
+    merged = {key: merged[key] for key in RUNTIME_OVERRIDE_KEYS if key in merged}
+    store.set_runtime_overrides(merged)
+    _record_runtime_override_event(store, changes=changes, by=by)
+    return get_runtime_overrides(store)
+
+
+def _coerce_runtime_value(key: str, value: Any) -> Any:
+    expected = RUNTIME_OVERRIDE_KEYS[key]
+    if expected is bool:
+        if isinstance(value, bool):
+            return value
+        lowered = str(value).strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"{key} expects a boolean")
+    if expected is int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} expects an integer") from exc
+        if number < 0:
+            raise ValueError(f"{key} must be >= 0")
+        return number
+    text = str(value).strip()
+    if key == "proactive_mode" and text not in VALID_PROACTIVE_MODES:
+        raise ValueError(
+            f"proactive_mode must be one of {', '.join(VALID_PROACTIVE_MODES)}"
+        )
+    return text
+
+
+def _record_runtime_override_event(
+    store: StateStore,
+    *,
+    changes: dict[str, Any],
+    by: str,
+) -> None:
+    mission = store.mission()
+    detail = ", ".join(f"{key}={value}" for key, value in sorted(changes.items()))
+    summary = f"Operator updated runtime config: {detail}"
+    record_orchestration_events(
+        store,
+        source="operator",
+        decision_summary=summary,
+        mission_statement=mission.statement if mission else None,
+        events=[
+            orchestration_event(
+                "operator_runtime_config",
+                summary,
+                source="operator",
+                decision="runtime_config",
+                payload={"by": by, "changes": changes},
+            )
+        ],
+    )
 
 
 def config_file_hash(config_path: Path) -> str:
@@ -1677,38 +2225,145 @@ def _user_chat_prompt(
     return "\n".join(lines)
 
 
-def _orchestrator_chat_prompt(store: StateStore, content: str, user: User | None) -> str:
-    username = user.username if user else "operator"
-    mission = store.mission()
+SKIP_REASON_LABELS = {
+    "agent_busy": "agent already running other work",
+    "agent_blocked": "agent's other work is blocked",
+    "dependencies_unmet": "waiting on a dependency to complete",
+    "unknown_agent": "assigned to an agent that no longer exists",
+    "goal_misaligned": "interrupted for goal misalignment",
+    "rest_deferred": "rest deferred until queued mission work is dispatched",
+}
+
+
+def _chat_activity_snapshot(store: StateStore) -> dict[str, Any]:
+    """Everything the orchestrator needs to answer 'why are things skipped /
+    queued / blocked' without guessing — real counts and samples, not vibes."""
     assignments = store.assignments()
-    runnable_statuses = {
-        AssignmentStatus.ASSIGNED,
-        AssignmentStatus.WORKING,
-        AssignmentStatus.QUEUED,
-    }
-    active = [
+    counts_by_status: dict[str, int] = {}
+    for item in assignments:
+        counts_by_status[item.status.value] = counts_by_status.get(item.status.value, 0) + 1
+
+    agent_states = store.agent_states()
+    queued = [item for item in assignments if item.status == AssignmentStatus.QUEUED]
+    queued_agent_idle = [
+        {
+            "assignment_id": item.assignment_id,
+            "assigned_to": item.assigned_to,
+            "kind": item.kind.value,
+            "assignment": item.assignment[:160],
+        }
+        for item in queued
+        if agent_states.get(item.assigned_to) is None
+        or agent_states[item.assigned_to].status == "idle"
+    ]
+
+    latest_reasoning = store.orchestrator_reasoning()[-1:] or []
+    raw_skip_reasons = latest_reasoning[0].get("skip_reasons", {}) if latest_reasoning else {}
+    skip_reason_counts: dict[str, int] = {}
+    for reason in raw_skip_reasons.values():
+        label = SKIP_REASON_LABELS.get(reason, reason)
+        skip_reason_counts[label] = skip_reason_counts.get(label, 0) + 1
+
+    blocked = [
         item
         for item in assignments
-        if item.status in runnable_statuses
+        if item.status == AssignmentStatus.BLOCKED or item.awaiting_human
     ]
-    blocked = [
-        item for item in assignments
-        if item.status == AssignmentStatus.BLOCKED or item.awaiting_human or item.blockers
-    ]
-    latest_reasoning = store.orchestrator_reasoning()[-1:] or []
-    context = [
-        "You are the OpenBrigade orchestrator.",
-        f"User {username} is asking for operational guidance.",
-        "Answer directly and concisely. Prefer concrete next steps and mention uncertainty.",
-        "",
-        f"Mission: {mission.statement if mission else 'not set'}",
-        f"Active tasks: {len(active)}",
-        f"Blocked tasks: {len(blocked)}",
-    ]
-    if latest_reasoning:
-        context.append(f"Latest reasoning: {latest_reasoning[0].get('decision_summary')}")
-    context.extend(["", "Message:", content])
-    return "\n".join(context)
+    return {
+        "counts_by_status": counts_by_status,
+        "queued_but_agent_idle_sample": queued_agent_idle[:10],
+        "queued_but_agent_idle_total": len(queued_agent_idle),
+        "last_cycle_skip_reason_counts": skip_reason_counts,
+        "blocked_or_awaiting_human_sample": [
+            {
+                "assignment_id": item.assignment_id,
+                "assigned_to": item.assigned_to,
+                "kind": item.kind.value,
+                "consecutive_failures": item.consecutive_failures,
+                "awaiting_human": item.awaiting_human,
+                "last_error": item.last_error,
+            }
+            for item in blocked[:10]
+        ],
+        "blocked_or_awaiting_human_total": len(blocked),
+    }
+
+
+def _orchestrator_chat_prompt(
+    store: StateStore,
+    content: str,
+    user: User | None,
+    *,
+    pending: dict[str, Any] | None = None,
+) -> str:
+    username = user.username if user else "operator"
+    mission = store.mission()
+    context = {
+        "mission": mission.statement if mission else "not set",
+        "activity": _chat_activity_snapshot(store),
+        "active_policies": _active_policy_summaries(store),
+        "orchestrator_notes": read_orchestrator_notes(store)[-2000:],
+    }
+    if pending:
+        context["pending_proposal_awaiting_confirmation"] = {
+            "summary": pending.get("summary"),
+            "actions": pending.get("actions"),
+        }
+    return "\n".join(
+        [
+            orchestrator_system_prompt(store),
+            "",
+            f"User {username} is chatting with you directly: one-time commands, standing "
+            "policy changes, or questions about current activity.",
+            "Answer questions directly and concisely using the activity JSON below — it is "
+            "real current state, not a guess.",
+            "",
+            "If the message only asks a question or needs no state change, reply in plain "
+            "Markdown prose as normal.",
+            "If the message is a command that would change state (cancel/reassign tasks, "
+            "set or retire a policy, edit your notes or system prompt), do NOT apply it "
+            "yet. Reply with exactly one JSON object describing what you intend to do:",
+            (
+                '{"status":"propose_actions","summary":"one sentence describing the plan",'
+                '"actions":[...]}'
+            ),
+            "The operator must confirm before anything is applied. Allowed actions:",
+            (
+                '{"type":"cancel_assignment","assignment_id":"...","reason":"..."}'
+            ),
+            (
+                '{"type":"cancel_assignments_where","status":"blocked","kind":'
+                '"failure_analysis","blocker_contains":"...","reason":"..."}'
+            ),
+            (
+                '{"type":"set_routing_policy","assignment_kind":"failure_analysis",'
+                '"target_team_id":"...","statement":"..."}'
+            ),
+            '{"type":"retire_policy","policy_id":"..."}',
+            '{"type":"write_note","content":"...","append":true}',
+            '{"type":"update_system_prompt","content":"..."}',
+            (
+                '{"type":"create_assignment","agent_id":"...","assignment":"...",'
+                '"goal_statement":"...","priority":"normal","rationale":"..."}'
+            ),
+            (
+                '{"type":"rebalance_queued_assignment","assignment_id":"...",'
+                '"to_agent_id":"...","rationale":"..."}'
+            ),
+            '{"type":"retry_blocked_assignment","assignment_id":"..."}',
+            '{"type":"create_failure_analysis","assignment_id":"..."}',
+            '{"type":"reassign_blocked_assignment","assignment_id":"..."}',
+            "If a pending proposal is already shown below and this message confirms or "
+            "declines it in a way other than a bare 'confirm'/'cancel', treat this "
+            "message as the operator's real intent and propose fresh actions accordingly.",
+            "",
+            "Context JSON:",
+            compact_json(context),
+            "",
+            "Message:",
+            content,
+        ]
+    )
 
 
 def _coerce_config_value(key: str, raw_value: str) -> object:
@@ -1722,6 +2377,21 @@ def _coerce_config_value(key: str, raw_value: str) -> object:
         raise ValueError(f"{key} expects a boolean")
     if expected is int:
         return int(raw_value)
+    if key in {"openai_auth_mode", "openai_codex_auth_mode", "gemini_auth_mode"}:
+        value = raw_value.strip().lower()
+        if value not in {"api_key", "oauth"}:
+            raise ValueError(f"{key} expects api_key or oauth")
+        return value
+    if key == "default_provider":
+        value = raw_value.strip().lower()
+        if value == "fake":
+            raise ValueError("default_provider 'fake' has been removed")
+        if value not in {"ollama", "litellm", "openai", "openai-codex", "anthropic", "gemini"}:
+            raise ValueError(
+                "default_provider expects ollama, litellm, openai, openai-codex, "
+                "anthropic, or gemini"
+            )
+        return value
     return raw_value
 
 

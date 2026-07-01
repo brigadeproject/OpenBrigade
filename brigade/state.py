@@ -41,6 +41,7 @@ EMPTY_STATE: dict[str, Any] = {
     "orchestrator_reasoning": [],
     "proposals": [],
     "recurrences": [],
+    "orchestrator_policies": [],
     "usage_records": [],
     "cloud_jobs": [],
     "financial_reports": [],
@@ -54,6 +55,10 @@ EMPTY_STATE: dict[str, Any] = {
         "holder": None,
         "last_completed": None,
         "next_available": None,
+    },
+    "model_inventory": {
+        "providers": {},
+        "updated_at": None,
     },
 }
 
@@ -105,6 +110,24 @@ class JsonStateStore:
         state = self.load()
         state["assignments"] = [item.to_dict() for item in assignments]
         self.save(state)
+
+    def runtime_overrides(self) -> dict[str, Any]:
+        return dict(self.load().get("runtime_overrides", {}))
+
+    def set_runtime_overrides(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        state = self.load()
+        state["runtime_overrides"] = dict(overrides)
+        self.save(state)
+        return dict(overrides)
+
+    def set_model_inventory(self, inventory: dict[str, Any]) -> dict[str, Any]:
+        state = self.load()
+        state["model_inventory"] = dict(inventory)
+        self.save(state)
+        return dict(inventory)
+
+    def model_inventory(self) -> dict[str, Any]:
+        return dict(self.load().get("model_inventory", {}))
 
     def update_assignment(self, assignment: Assignment) -> None:
         assignments = self.assignments()
@@ -392,6 +415,49 @@ class JsonStateStore:
                 break
         else:
             records.append(dict(recurrence))
+        self.save(state)
+
+    def add_orchestrator_policy(self, policy: dict[str, Any]) -> dict[str, Any]:
+        state = self.load()
+        state.setdefault("orchestrator_policies", []).append(dict(policy))
+        self.save(state)
+        return policy
+
+    def orchestrator_policies(
+        self,
+        *,
+        active_only: bool = True,
+        rule_kind: str | None = None,
+        assignment_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        records = [dict(item) for item in self.load().get("orchestrator_policies", [])]
+        if active_only:
+            records = [item for item in records if bool(item.get("active", True))]
+        if rule_kind is not None:
+            records = [item for item in records if item.get("rule_kind") == rule_kind]
+        if assignment_kind is not None:
+            records = [item for item in records if item.get("assignment_kind") == assignment_kind]
+        return sorted(records, key=lambda item: str(item.get("created_at") or ""))
+
+    def find_orchestrator_policy(self, policy_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                dict(item)
+                for item in self.load().get("orchestrator_policies", [])
+                if item.get("policy_id") == policy_id
+            ),
+            None,
+        )
+
+    def update_orchestrator_policy(self, policy: dict[str, Any]) -> None:
+        state = self.load()
+        records = state.setdefault("orchestrator_policies", [])
+        for index, item in enumerate(records):
+            if item.get("policy_id") == policy.get("policy_id"):
+                records[index] = dict(policy)
+                break
+        else:
+            records.append(dict(policy))
         self.save(state)
 
     def add_usage_record(self, record: dict[str, Any]) -> None:

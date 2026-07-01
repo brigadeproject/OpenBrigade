@@ -51,11 +51,14 @@ from brigade.services import (
     build_settings_payload,
     cancel_assignment,
     delegate_from_crew_chief,
+    get_runtime_overrides,
+    lookup_assignment,
     reissue_assignment,
     reissue_assignment_as_new,
     send_orchestrator_chat,
     send_user_chat,
     set_config_value,
+    set_runtime_overrides,
     update_assignment_fields,
 )
 from brigade.store import RedisRuntimeClient, StateStore, open_state_store
@@ -321,7 +324,7 @@ def create_app(
     @app.get("/api/models")
     async def models(current: AuthResult = auth_dependency) -> dict[str, object]:
         require("status:read", current)
-        return available_model_options(settings)
+        return available_model_options(settings, store.model_inventory())
 
     @app.put("/api/models/default")
     async def set_default_model(
@@ -338,8 +341,13 @@ def create_app(
         set_config_value(settings.config_path, "default_model", model)
         settings = load_settings(settings.config_path)
         return {
-            "settings": {**build_settings_payload(settings), "api_version": __version__},
-            "models": available_model_options(settings),
+            "settings": {
+                **build_settings_payload(
+                    settings, runtime_overrides=get_runtime_overrides(store)
+                ),
+                "api_version": __version__,
+            },
+            "models": available_model_options(settings, store.model_inventory()),
         }
 
     @app.get("/api/ops-room")
@@ -660,9 +668,15 @@ def create_app(
     @app.get("/api/tasks/{assignment_id}")
     async def task(
         assignment_id: str,
+        include_history: bool = True,
         current: AuthResult = auth_dependency,
     ) -> dict[str, object]:
         require("task:read", current)
+        if include_history:
+            found = lookup_assignment(store, assignment_id)
+            if found is None:
+                raise HTTPException(status_code=404, detail="unknown assignment")
+            return found
         assignment = store.find_assignment(assignment_id)
         if assignment is None:
             raise HTTPException(status_code=404, detail="unknown assignment")
@@ -841,7 +855,35 @@ def create_app(
     @app.get("/api/settings/effective")
     async def settings_effective(current: AuthResult = auth_dependency) -> dict[str, object]:
         require("status:read", current)
-        return {**build_settings_payload(settings), "api_version": __version__}
+        return {
+            **build_settings_payload(
+                settings, runtime_overrides=get_runtime_overrides(store)
+            ),
+            "api_version": __version__,
+        }
+
+    @app.put("/api/settings/runtime")
+    async def update_runtime_settings(
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        try:
+            set_runtime_overrides(
+                store,
+                payload or {},
+                by=user.username if user else "web",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            **build_settings_payload(
+                settings, runtime_overrides=get_runtime_overrides(store)
+            ),
+            "api_version": __version__,
+        }
 
     @app.get("/api/users")
     async def users(current: AuthResult = auth_dependency) -> list[dict[str, object]]:

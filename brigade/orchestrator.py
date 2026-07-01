@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from uuid import uuid4
 
 from brigade.config import Settings
@@ -14,9 +14,9 @@ from brigade.meta import evaluate_assignment_alignment
 from brigade.prompt_floors import (
     DEFAULT_STALE_WORK_SECONDS,
     IMBALANCED_QUEUE_DEPTH,
-    ORCHESTRATOR_SYSTEM_PROMPT,
     build_orchestrator_floor,
     compact_json,
+    orchestrator_system_prompt,
 )
 from brigade.providers import ModelProvider
 from brigade.schemas import (
@@ -163,6 +163,46 @@ class OrchestrationConfig:
             telegram_bot_token=settings.telegram_bot_token,
             operator_telegram_chat_id=settings.operator_telegram_chat_id,
         )
+
+    # Keys an operator may override live (Redis-backed). Kept in sync with
+    # services.RUNTIME_OVERRIDE_KEYS — only these fields are layered per cycle.
+    RUNTIME_OVERRIDE_FIELDS = (
+        "proactive_mode",
+        "proactive_creation_enabled",
+        "max_proactive_creations_per_cycle",
+    )
+
+    def with_overrides(self, overrides: Mapping[str, Any] | None) -> OrchestrationConfig:
+        """Layer operator runtime overrides onto this config (live, no restart).
+
+        Only ``RUNTIME_OVERRIDE_FIELDS`` are applied, and only when the value
+        type matches the existing field — stale or malformed overrides are
+        ignored so a bad write can never break a cycle.
+        """
+        if not overrides:
+            return self
+        updates: dict[str, Any] = {}
+        for key in self.RUNTIME_OVERRIDE_FIELDS:
+            if key not in overrides:
+                continue
+            value = overrides[key]
+            if value is None:
+                continue
+            current = getattr(self, key)
+            if isinstance(current, bool):
+                if not isinstance(value, bool):
+                    continue
+            elif isinstance(current, int) and not isinstance(value, bool):
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(current, str):
+                value = str(value)
+            updates[key] = value
+        if not updates:
+            return self
+        return replace(self, **updates)
 
     def proactive(self) -> ProactiveContinuationConfig:
         return ProactiveContinuationConfig(
@@ -790,6 +830,42 @@ def route_to_chief(
     return next(iter(chiefs.values()), None) if chiefs else None
 
 
+ORCHESTRATOR_POLICY_ROUTING_RULE = "routing_rule"
+
+
+def _active_policy_summaries(store: StateStore) -> list[str]:
+    """Human-readable lines for every active policy, for prompt injection.
+
+    Structured routing rules are rendered alongside freeform statements so
+    the LLM sees (and can honor) the same standing directives the ladder
+    enforces mechanically via policy_routed_chief_id."""
+    return [
+        str(item.get("statement") or "")
+        for item in store.orchestrator_policies(active_only=True)
+        if item.get("statement")
+    ]
+
+
+def policy_routed_chief_id(store: StateStore, assignment_kind: str) -> str | None:
+    """The crew chief a routing policy assigns work of this kind to, if any.
+
+    When more than one active policy targets the same assignment_kind, the
+    most recently created one wins (list is created_at-ascending).
+    """
+    policies = store.orchestrator_policies(
+        active_only=True,
+        rule_kind=ORCHESTRATOR_POLICY_ROUTING_RULE,
+        assignment_kind=assignment_kind,
+    )
+    if not policies:
+        return None
+    target_team_id = policies[-1].get("target_team_id")
+    if not target_team_id:
+        return None
+    team = next((team for team in store.teams() if team.team_id == target_team_id), None)
+    return team.crew_chief_id if team else None
+
+
 def is_team_of_one(store: StateStore, chief_id: str) -> bool:
     """A chief whose managed roster is only themself is their own specialist."""
     managed = {chief_id}
@@ -1307,6 +1383,7 @@ def run_orchestrator_escalation(
         "triggers": triggers,
         "actions_applied": action_result["applied"],
         "actions_rejected": action_result["rejected"],
+        "actions_skipped": action_result.get("skipped", []),
         "provider": response.provider,
         "model": response.model,
     }
@@ -1322,10 +1399,11 @@ def build_orchestrator_escalation_prompt(
         "triggers": triggers,
         "targeted_provenance": _targeted_provenance(store, triggers),
         "knowledge_snippets": _targeted_knowledge_snippets(store, triggers),
+        "active_policies": _active_policy_summaries(store),
     }
     return "\n".join(
         [
-            ORCHESTRATOR_SYSTEM_PROMPT,
+            orchestrator_system_prompt(store),
             "",
             "OpenBrigade orchestrator escalation protocol:",
             "Return only one JSON object. Do not wrap it in Markdown.",
@@ -1377,12 +1455,23 @@ def parse_orchestrator_response(text: str) -> ParsedOrchestratorResponse:
     return ParsedOrchestratorResponse(status=status, summary=summary, actions=normalized)
 
 
+class StaleAssignmentTarget(ValueError):
+    """An action targeted an assignment that no longer exists.
+
+    Between the LLM building its escalation snapshot and the actions being
+    applied, the deterministic cycle may have completed/superseded/archived the
+    target. That is a benign race, not an operator-facing rejection — callers
+    treat it as a silent skip instead of a surfaced ``cycle_decision``.
+    """
+
+
 def apply_orchestrator_actions(
     store: StateStore,
     actions: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
     applied: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     for action in actions:
         action_type = str(action.get("type") or "").strip()
         try:
@@ -1401,11 +1490,17 @@ def apply_orchestrator_actions(
                 continue
             else:
                 raise ValueError(f"unsupported action type: {action_type}")
+        except StaleAssignmentTarget as exc:
+            # The target resolved itself between snapshot and apply — a benign
+            # race. Track it for debugging but do not surface it as a rejected
+            # decision or raise an operator alert.
+            skipped.append({"action": action, "reason": str(exc)})
+            LOGGER.debug("orchestrator_action_skipped_stale_target", extra={"reason": str(exc)})
         except ValueError as exc:
             record = {"action": action, "reason": str(exc)}
             rejected.append(record)
             store.add_alert(f"orchestrator action rejected: {exc}")
-    return {"applied": applied, "rejected": rejected}
+    return {"applied": applied, "rejected": rejected, "skipped": skipped}
 
 
 def _completed_assignment_ids(
@@ -1505,7 +1600,7 @@ def _apply_rebalance_queued_assignment(
         raise ValueError(f"rebalance target is unknown agent {to_agent_id}")
     assignment = store.find_assignment(assignment_id)
     if assignment is None:
-        raise ValueError(f"unknown assignment {assignment_id}")
+        raise StaleAssignmentTarget(f"unknown assignment {assignment_id}")
     if assignment.status != AssignmentStatus.QUEUED:
         raise ValueError(f"assignment {assignment_id} is not queued")
     previous = assignment.assigned_to
@@ -1555,7 +1650,7 @@ def _apply_ladder_action(
         raise ValueError(f"{action_type} is missing assignment_id")
     assignment = store.find_assignment(assignment_id)
     if assignment is None:
-        raise ValueError(f"unknown assignment {assignment_id}")
+        raise StaleAssignmentTarget(f"unknown assignment {assignment_id}")
     if assignment.status != AssignmentStatus.BLOCKED:
         raise ValueError(f"assignment {assignment_id} is not blocked")
     if assignment.awaiting_human:
@@ -1595,7 +1690,7 @@ def _validate_request_human(store: StateStore, action: dict[str, Any]) -> None:
     if assignment_id:
         assignment = store.find_assignment(assignment_id)
         if assignment is None:
-            raise ValueError(f"unknown assignment {assignment_id}")
+            raise StaleAssignmentTarget(f"unknown assignment {assignment_id}")
         if assignment.status == AssignmentStatus.BLOCKED and not (
             assignment.awaiting_human
             or assignment.consecutive_failures >= HUMAN_ESCALATION_FAILURES

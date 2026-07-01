@@ -68,7 +68,8 @@ effects.
 Provider routes include:
 
 - `ollama` for the local/default runtime model path.
-- LiteLLM-backed `openai`, `gemini`, and other external providers for v0.9.1 connection work.
+- LiteLLM-backed `openai`, `openai-codex`, `gemini`, and other external providers for v0.9.1
+  connection work.
 
 All provider responses are parsed into assignment state, transcript records, usage records, and
 financial reporting.

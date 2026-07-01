@@ -5,9 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 CONTAINER="${BRIGADE_LIVE_CONTAINER:-brigade_orchestrator}"
-DOCKER_EXEC=(docker exec)
+DOCKER_EXEC=(docker exec -i)
 if [[ -t 0 && -t 1 ]]; then
-  DOCKER_EXEC+=(-it)
+  DOCKER_EXEC+=(-t)
 fi
 
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then

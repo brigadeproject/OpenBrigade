@@ -86,10 +86,47 @@ Bounded live smoke:
 ```bash
 brigade model auth status
 brigade model complete --provider openai --model <small-model> --prompt "Return one sentence."
+brigade model complete --provider openai-codex --model gpt-5.4 --prompt "Return one sentence."
 ```
 
-Rollback: unset `OPENAI_API_KEY`, run `brigade model auth logout --provider openai`, and use
-local Ollama for bounded validation.
+To make OpenAI/Codex the runtime default for orchestrator and agent loops, set:
+
+```bash
+BRIGADE_DEFAULT_PROVIDER=openai-codex
+BRIGADE_DEFAULT_MODEL=gpt-5.4
+BRIGADE_OPENAI_CODEX_AUTH_MODE=oauth
+```
+
+For API-key fallback, use the same provider/model default with:
+
+```bash
+OPENAI_API_KEY=<openai-api-key>
+BRIGADE_OPENAI_CODEX_AUTH_MODE=api_key
+```
+
+For containerized local use, import a provider-issued access token through stdin so the token is not
+stored in shell history or visible as a process argument:
+
+```bash
+printf '%s' "$OPENCLAW_ACCESS_TOKEN" | ./ops/brigade-live.sh model auth login \
+  --provider openai-codex \
+  --method oauth \
+  --access-token-stdin
+```
+
+Existing agents keep their persisted `model_provider` and `model_name` until changed. Move one
+agent to Codex without recreating it:
+
+```bash
+./ops/brigade-live.sh agent model \
+  --id <agent-id> \
+  --provider openai-codex \
+  --model gpt-5.4
+```
+
+Rollback: unset `OPENAI_API_KEY`, run `brigade model auth logout --provider openai` and
+`brigade model auth logout --provider openai-codex`, set `BRIGADE_DEFAULT_PROVIDER=ollama`, and
+move any persisted agents back to an installed Ollama model.
 
 ## Anthropic / Claude
 

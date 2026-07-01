@@ -24,6 +24,60 @@ ORCHESTRATOR_SYSTEM_PROMPT = "\n".join(
     ]
 )
 
+ORCHESTRATOR_WORKSPACE_DIRNAME = "workspace-orchestrator"
+ORCHESTRATOR_SYSTEM_PROMPT_FILENAME = "SYSTEM_PROMPT.md"
+ORCHESTRATOR_NOTES_FILENAME = "NOTES.md"
+MAX_ORCHESTRATOR_NOTES_CHARS = 8000
+
+
+def orchestrator_workspace_path(store: StateStore) -> Path:
+    return store.data_dir / ORCHESTRATOR_WORKSPACE_DIRNAME
+
+
+def orchestrator_system_prompt(store: StateStore) -> str:
+    """The orchestrator's effective system prompt.
+
+    Falls back to the built-in default until the operator (via chat) writes
+    workspace-orchestrator/SYSTEM_PROMPT.md, at which point that file's
+    content wins for every subsequent cycle and chat turn."""
+    path = orchestrator_workspace_path(store) / ORCHESTRATOR_SYSTEM_PROMPT_FILENAME
+    if path.exists():
+        text = path.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    return ORCHESTRATOR_SYSTEM_PROMPT
+
+
+def write_orchestrator_system_prompt(store: StateStore, content: str) -> None:
+    workspace = orchestrator_workspace_path(store)
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / ORCHESTRATOR_SYSTEM_PROMPT_FILENAME).write_text(
+        content.strip() + "\n", encoding="utf-8"
+    )
+
+
+def read_orchestrator_notes(store: StateStore) -> str:
+    path = orchestrator_workspace_path(store) / ORCHESTRATOR_NOTES_FILENAME
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def write_orchestrator_notes(store: StateStore, content: str, *, append: bool = True) -> None:
+    workspace = orchestrator_workspace_path(store)
+    workspace.mkdir(parents=True, exist_ok=True)
+    path = workspace / ORCHESTRATOR_NOTES_FILENAME
+    if append and path.exists():
+        existing = path.read_text(encoding="utf-8")
+        combined = (existing.rstrip() + "\n" + content.strip() + "\n") if existing.strip() else (
+            content.strip() + "\n"
+        )
+    else:
+        combined = content.strip() + "\n"
+    if len(combined) > MAX_ORCHESTRATOR_NOTES_CHARS:
+        combined = combined[-MAX_ORCHESTRATOR_NOTES_CHARS :]
+    path.write_text(combined, encoding="utf-8")
+
 CREW_CHIEF_SYSTEM_PROMPT = "\n".join(
     [
         "You are an OpenBrigade Crew Chief.",
@@ -52,7 +106,7 @@ def build_orchestrator_floor(
     now = now or utc_now()
     mission = store.mission()
     return {
-        "system_prompt": ORCHESTRATOR_SYSTEM_PROMPT,
+        "system_prompt": orchestrator_system_prompt(store),
         "mission": mission.to_dict() if mission else None,
         "stale_work_seconds": stale_seconds,
         "goals": build_goal_snapshots(store, stale_seconds=stale_seconds, now=now),

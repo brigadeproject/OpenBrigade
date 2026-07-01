@@ -84,6 +84,14 @@ class StateStore(Protocol):
 
     def assignment_history(self) -> list[dict[str, Any]]: ...
 
+    def runtime_overrides(self) -> dict[str, Any]: ...
+
+    def set_runtime_overrides(self, overrides: dict[str, Any]) -> dict[str, Any]: ...
+
+    def set_model_inventory(self, inventory: dict[str, Any]) -> dict[str, Any]: ...
+
+    def model_inventory(self) -> dict[str, Any]: ...
+
     def set_mission(self, mission: Mission) -> None: ...
 
     def mission(self) -> Mission | None: ...
@@ -156,6 +164,20 @@ class StateStore(Protocol):
 
     def update_recurrence(self, recurrence: dict[str, Any]) -> None: ...
 
+    def add_orchestrator_policy(self, policy: dict[str, Any]) -> dict[str, Any]: ...
+
+    def orchestrator_policies(
+        self,
+        *,
+        active_only: bool = True,
+        rule_kind: str | None = None,
+        assignment_kind: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def find_orchestrator_policy(self, policy_id: str) -> dict[str, Any] | None: ...
+
+    def update_orchestrator_policy(self, policy: dict[str, Any]) -> None: ...
+
     def add_usage_record(self, record: dict[str, Any]) -> None: ...
 
     def usage_records(self) -> list[dict[str, Any]]: ...
@@ -215,6 +237,7 @@ class RedisRuntimeClient:
     ALERT_QUEUE_KEY = "brigade:runtime:alerts"
     LOCAL_INFERENCE_KEY = "brigade:runtime:local_inference"
     LOCAL_INFERENCE_LOCK_KEY = "brigade:runtime:locks:local_inference"
+    RUNTIME_CONFIG_KEY = "brigade:runtime:config"
 
     def __init__(self, url: str | None) -> None:
         self.url = url
@@ -239,6 +262,12 @@ class RedisRuntimeClient:
 
     def set_json(self, key: str, payload: dict[str, Any]) -> None:
         self._execute(lambda client: client.set(key, json.dumps(payload, sort_keys=True)))
+
+    def runtime_overrides(self) -> dict[str, Any]:
+        return self.get_json(self.RUNTIME_CONFIG_KEY) or {}
+
+    def set_runtime_overrides(self, overrides: dict[str, Any]) -> None:
+        self.set_json(self.RUNTIME_CONFIG_KEY, dict(overrides))
 
     def enqueue_pending_assignment(self, assignment: Assignment) -> None:
         if assignment.status != AssignmentStatus.QUEUED:
@@ -1286,6 +1315,68 @@ class PostgresStateStore:
             ),
         )
 
+    def add_orchestrator_policy(self, policy: dict[str, Any]) -> dict[str, Any]:
+        self._upsert_orchestrator_policy(policy)
+        return policy
+
+    def orchestrator_policies(
+        self,
+        *,
+        active_only: bool = True,
+        rule_kind: str | None = None,
+        assignment_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "select record from brigade_orchestrator_policies"
+        clauses: list[str] = []
+        params: list[object] = []
+        if active_only:
+            clauses.append("active = %s")
+            params.append(True)
+        if rule_kind is not None:
+            clauses.append("rule_kind = %s")
+            params.append(rule_kind)
+        if assignment_kind is not None:
+            clauses.append("assignment_kind = %s")
+            params.append(assignment_kind)
+        if clauses:
+            sql += " where " + " and ".join(clauses)
+        sql += " order by created_at, id"
+        return list(self._records(sql, tuple(params)))
+
+    def find_orchestrator_policy(self, policy_id: str) -> dict[str, Any] | None:
+        return self._record_or_none(
+            "select record from brigade_orchestrator_policies where id = %s",
+            (policy_id,),
+        )
+
+    def update_orchestrator_policy(self, policy: dict[str, Any]) -> None:
+        self._upsert_orchestrator_policy(policy)
+
+    def _upsert_orchestrator_policy(self, policy: dict[str, Any]) -> None:
+        self._execute(
+            """
+            insert into brigade_orchestrator_policies (
+              id, rule_kind, assignment_kind, active, created_at, updated_at, record
+            )
+            values (%s, %s, %s, %s, %s, %s, %s::jsonb)
+            on conflict (id) do update set
+              rule_kind = excluded.rule_kind,
+              assignment_kind = excluded.assignment_kind,
+              active = excluded.active,
+              updated_at = excluded.updated_at,
+              record = excluded.record
+            """,
+            (
+                policy["policy_id"],
+                policy.get("rule_kind", "freeform"),
+                policy.get("assignment_kind"),
+                bool(policy.get("active", True)),
+                policy["created_at"],
+                policy.get("updated_at") or policy["created_at"],
+                json.dumps(policy, sort_keys=True),
+            ),
+        )
+
     def add_usage_record(self, record: dict[str, Any]) -> None:
         self._execute(
             """
@@ -1310,6 +1401,42 @@ class PostgresStateStore:
         return list(
             self._records("select record from brigade_usage_records order by recorded_at, id")
         )
+
+    def set_model_inventory(self, inventory: dict[str, Any]) -> dict[str, Any]:
+        providers = inventory.get("providers")
+        if not isinstance(providers, dict):
+            providers = {}
+        updated_at = str(inventory.get("updated_at") or utc_now_iso())
+        for provider, record in providers.items():
+            if not isinstance(record, dict):
+                continue
+            probed_at = str(record.get("probed_at") or updated_at)
+            status = str(record.get("status") or "unknown")
+            self._execute(
+                """
+                insert into brigade_model_inventory (provider, probed_at, status, record)
+                values (%s, %s, %s, %s::jsonb)
+                on conflict (provider) do update set
+                  probed_at = excluded.probed_at,
+                  status = excluded.status,
+                  record = excluded.record
+                """,
+                (str(provider), probed_at, status, json.dumps(record, sort_keys=True)),
+            )
+        return self.model_inventory()
+
+    def model_inventory(self) -> dict[str, Any]:
+        providers = {
+            str(record.get("provider")): record
+            for record in self._records(
+                "select record from brigade_model_inventory order by provider"
+            )
+            if record.get("provider")
+        }
+        updated_at = None
+        if providers:
+            updated_at = max(str(item.get("probed_at") or "") for item in providers.values())
+        return {"providers": providers, "updated_at": updated_at}
 
     def upsert_cloud_job(self, job: dict[str, Any]) -> None:
         self._execute(
@@ -1695,6 +1822,22 @@ class PostgresStateStore:
         sql += " order by updated_at, provider, external_user_id"
         return list(self._records(sql, params))
 
+    def runtime_overrides(self) -> dict[str, Any]:
+        if not self._redis.available():
+            return {}
+        try:
+            return self._redis.runtime_overrides()
+        except RuntimeError:
+            return {}
+
+    def set_runtime_overrides(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        if not self._redis.available():
+            raise RuntimeError(
+                "redis runtime store is required to persist runtime config overrides"
+            )
+        self._redis.set_runtime_overrides(overrides)
+        return dict(overrides)
+
     def _sync_assignment_runtime(self, assignment: Assignment) -> None:
         if not self._redis.available():
             return
@@ -2024,6 +2167,9 @@ def _import_legacy_state(path: Path, store: StateStore) -> None:
         store.add_orchestrator_reasoning(reasoning)
     for usage in legacy.usage_records():
         store.add_usage_record(usage)
+    inventory = legacy.model_inventory()
+    if inventory:
+        store.set_model_inventory(inventory)
     for job in legacy.cloud_jobs():
         store.upsert_cloud_job(job)
     report = legacy.latest_financial_report()

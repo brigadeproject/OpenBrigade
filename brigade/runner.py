@@ -13,6 +13,7 @@ from brigade.orchestrator import orchestration_event, record_orchestration_event
 from brigade.prompt_floors import build_agent_floor, compact_json
 from brigade.providers import ModelProvider, ModelResponse, ModelUnavailableError
 from brigade.schemas import (
+    MALFORMED_PROVIDER_OUTPUT_MARKER,
     AgentState,
     Assignment,
     AssignmentKind,
@@ -837,9 +838,10 @@ def _handle_heartbeat_validation_failure(
 def _complete_with_retries(provider: ModelProvider, prompt: str) -> ModelResponse:
     last_error: Exception | None = None
     last_response: ModelResponse | None = None
+    attempt_prompt = prompt
     for attempt in range(1, MAX_PROVIDER_RETRIES + 1):
         try:
-            response = provider.complete(prompt)
+            response = provider.complete(attempt_prompt)
             last_response = response
             parse_agent_response(response.text)
             return response
@@ -850,6 +852,10 @@ def _complete_with_retries(provider: ModelProvider, prompt: str) -> ModelRespons
             )
             if not retryable or attempt >= MAX_PROVIDER_RETRIES:
                 break
+            if isinstance(exc, MalformedProviderOutput):
+                # Feed the parse failure back so the retry has a chance to
+                # self-correct instead of reproducing the same bad output.
+                attempt_prompt = _prompt_with_correction(prompt, exc, last_response)
     if last_error is not None:
         if isinstance(last_error, MalformedProviderOutput) and last_response is not None:
             return ModelResponse(
@@ -857,7 +863,7 @@ def _complete_with_retries(provider: ModelProvider, prompt: str) -> ModelRespons
                     {
                         "status": "blocked",
                         "summary": (
-                            "malformed provider output after "
+                            f"{MALFORMED_PROVIDER_OUTPUT_MARKER} after "
                             f"{MAX_PROVIDER_RETRIES} attempts: {last_error}"
                         ),
                         "blockers": [str(last_error)],
@@ -872,6 +878,27 @@ def _complete_with_retries(provider: ModelProvider, prompt: str) -> ModelRespons
             )
         raise last_error
     raise RuntimeError("provider completion failed without an error")
+
+
+def _prompt_with_correction(
+    prompt: str,
+    exc: MalformedProviderOutput,
+    last_response: ModelResponse | None,
+) -> str:
+    bad_output = _truncate(last_response.text, 800) if last_response is not None else "<empty>"
+    return "\n".join(
+        [
+            prompt,
+            "",
+            "Your previous response could not be parsed:",
+            f"Error: {exc}",
+            "Previous response:",
+            bad_output,
+            "",
+            "Reply again with exactly one raw JSON object matching the protocol "
+            "above. Do not wrap it in Markdown or add any other text.",
+        ]
+    )
 
 
 def _is_transient_provider_error(exc: Exception) -> bool:

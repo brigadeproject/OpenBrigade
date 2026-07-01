@@ -6,6 +6,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+SUPPORTED_MODEL_PROVIDERS = {
+    "ollama",
+    "litellm",
+    "openai",
+    "openai-codex",
+    "anthropic",
+    "gemini",
+}
+SUPPORTED_AUTH_MODES = {"api_key", "oauth"}
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -215,6 +225,37 @@ def load_settings(
         default_provider = "ollama"
     if default_provider == "fake":
         default_provider = "ollama"
+    if default_provider not in SUPPORTED_MODEL_PROVIDERS:
+        raise ValueError(
+            f"unsupported default model provider '{default_provider}'; choose one of "
+            f"{', '.join(sorted(SUPPORTED_MODEL_PROVIDERS))}"
+        )
+    openai_auth_mode = (
+        _env("BRIGADE_OPENAI_AUTH_MODE", dotenv, config.get("openai_auth_mode", "api_key"))
+        or "api_key"
+    )
+    openai_codex_auth_mode = (
+        _env(
+            "BRIGADE_OPENAI_CODEX_AUTH_MODE",
+            dotenv,
+            config.get("openai_codex_auth_mode", config.get("openai_auth_mode", "api_key")),
+        )
+        or "api_key"
+    )
+    gemini_auth_mode = (
+        _env("BRIGADE_GEMINI_AUTH_MODE", dotenv, config.get("gemini_auth_mode", "api_key"))
+        or "api_key"
+    )
+    for key, auth_mode in (
+        ("BRIGADE_OPENAI_AUTH_MODE", openai_auth_mode),
+        ("BRIGADE_OPENAI_CODEX_AUTH_MODE", openai_codex_auth_mode),
+        ("BRIGADE_GEMINI_AUTH_MODE", gemini_auth_mode),
+    ):
+        if auth_mode not in SUPPORTED_AUTH_MODES:
+            raise ValueError(
+                f"unsupported auth mode for {key}: {auth_mode}; choose one of "
+                f"{', '.join(sorted(SUPPORTED_AUTH_MODES))}"
+            )
 
     return Settings(
         config_path=config_file,
@@ -407,24 +448,9 @@ def load_settings(
             )
             or str(data_dir / "secrets")
         ),
-        openai_auth_mode=_env(
-            "BRIGADE_OPENAI_AUTH_MODE",
-            dotenv,
-            config.get("openai_auth_mode", "api_key"),
-        )
-        or "api_key",
-        openai_codex_auth_mode=_env(
-            "BRIGADE_OPENAI_CODEX_AUTH_MODE",
-            dotenv,
-            config.get("openai_codex_auth_mode", config.get("openai_auth_mode", "api_key")),
-        )
-        or "api_key",
-        gemini_auth_mode=_env(
-            "BRIGADE_GEMINI_AUTH_MODE",
-            dotenv,
-            config.get("gemini_auth_mode", "api_key"),
-        )
-        or "api_key",
+        openai_auth_mode=openai_auth_mode,
+        openai_codex_auth_mode=openai_codex_auth_mode,
+        gemini_auth_mode=gemini_auth_mode,
         telegram_bot_token=_env(
             "BRIGADE_TELEGRAM_BOT_TOKEN",
             dotenv,

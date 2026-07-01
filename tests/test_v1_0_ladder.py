@@ -442,6 +442,61 @@ def test_escalation_allows_request_human_when_ladder_exhausted(tmp_path):
     assert result["applied"][0]["type"] == "request_human"
 
 
+# --- Malformed-provider-output cascade guard --------------------------------------
+
+
+def test_malformed_output_failure_skips_analysis_and_reassigns_directly(tmp_path):
+    store = _store_with_team(tmp_path)
+    blocked = _blocked_assignment(store, failures=0)
+    blocked.register_failure(
+        "malformed provider output after 3 attempts: empty model response",
+        blockers=["empty model response"],
+    )
+    blocked.register_failure(
+        "malformed provider output after 3 attempts: empty model response",
+        blockers=["empty model response"],
+    )
+    blocked.register_failure(
+        "malformed provider output after 3 attempts: empty model response",
+        blockers=["empty model response"],
+    )
+    blocked.awaiting_human = False
+    store.update_assignment(blocked)
+
+    result = resolve_blockers(store)
+
+    assert [action["step"] for action in result["actions"]] == ["reassign"]
+    assert find_analysis_child(store.assignments(), blocked) is None
+
+
+def test_failure_analysis_assignment_never_spawns_its_own_analysis_child(tmp_path):
+    store = _store_with_team(tmp_path)
+    parent = _blocked_assignment(store, failures=2)
+    resolve_blockers(store)
+    analysis = find_analysis_child(store.assignments(), parent)
+    assert analysis is not None
+
+    analysis.transition_to(AssignmentStatus.ASSIGNED)
+    analysis.register_failure("still failing")
+    analysis.register_failure("still failing")
+    analysis.register_failure("still failing")
+    analysis.awaiting_human = False
+    store.update_assignment(analysis)
+
+    assert ladder_state(store, analysis) == "reassign"
+    assert create_failure_analysis(store, analysis) is None
+
+    result = resolve_blockers(store)
+
+    grandchildren = [
+        item
+        for item in store.assignments()
+        if item.parent_assignment_id == analysis.assignment_id
+    ]
+    assert grandchildren == []
+    assert [action["step"] for action in result["actions"]] == ["reassign"]
+
+
 def test_ladder_state_progression(tmp_path):
     store = _store_with_team(tmp_path)
     blocked = _blocked_assignment(store, failures=1)

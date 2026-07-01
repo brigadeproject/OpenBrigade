@@ -100,6 +100,13 @@ class Role(str, Enum):
 PROPOSAL_KINDS = frozenset({"efficiency", "tool_request", "rest_insight"})
 PROPOSAL_STATUSES = frozenset({"proposed", "approved", "rejected", "implemented", "expired"})
 
+# Marker embedded in the synthetic ``last_error`` a runner writes when a provider
+# never produces a parseable response after retrying. Downstream consumers (the
+# blocker-resolution ladder) key off this string to tell "the model can't format
+# a response" apart from a genuine work blocker, since diagnosing the former with
+# another agent turn is pointless and prone to the same failure.
+MALFORMED_PROVIDER_OUTPUT_MARKER = "malformed provider output"
+
 TERMINAL_STATUSES = {
     AssignmentStatus.COMPLETE,
     AssignmentStatus.FAILED,
