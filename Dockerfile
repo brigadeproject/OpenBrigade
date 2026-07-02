@@ -7,7 +7,7 @@ COPY web/public ./public
 RUN npm ci
 RUN npm run build
 
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 COPY pyproject.toml README.md ./

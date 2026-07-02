@@ -12,6 +12,9 @@ def utc_now_iso() -> str:
 
 
 def parse_utc_iso(value: str) -> datetime:
+    # Python 3.10 fromisoformat rejects the Z suffix; models commonly emit it.
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
