@@ -431,9 +431,36 @@ def _create_subtasks(context: ToolContext, arguments: dict[str, Any]) -> ToolRes
         return ToolResult(False, "subtasks must be a non-empty array")
     if len(raw_subtasks) > MAX_CREATE_SUBTASKS:
         return ToolResult(False, f"subtasks is limited to {MAX_CREATE_SUBTASKS} items")
-    guard = _delegation_guard(context, requested_children=len(raw_subtasks))
-    if guard is not None:
-        return guard
+    depth = _delegation_depth(context.store, context.assignment)
+    if depth >= MAX_DELEGATION_DEPTH:
+        return ToolResult(
+            False,
+            f"delegation depth limit reached for assignment {context.assignment.assignment_id}",
+            {"max_depth": MAX_DELEGATION_DEPTH, "depth": depth},
+        )
+    # Capacity is not an error: extra children simply queue behind the active
+    # ones. Accept up to the remaining slots and tell the planner what was
+    # trimmed instead of rejecting the whole batch (which used to block
+    # planners whose plan was already partially in motion).
+    existing_children = [
+        assignment.assignment_id
+        for assignment in context.store.assignments()
+        if assignment.parent_assignment_id == context.assignment.assignment_id
+    ]
+    remaining_capacity = MAX_CHILDREN_PER_ASSIGNMENT - len(existing_children)
+    if remaining_capacity <= 0:
+        return ToolResult(
+            True,
+            (
+                f"no capacity for new subtasks: {len(existing_children)} child "
+                f"assignments already exist ({', '.join(existing_children)}). "
+                "Treat the existing queued children as your plan in motion; "
+                "review or extend them rather than recreating the plan."
+            ),
+            {"existing_children": existing_children, "created": []},
+        )
+    trimmed_count = max(0, len(raw_subtasks) - remaining_capacity)
+    raw_subtasks = raw_subtasks[:remaining_capacity]
 
     known_agent_ids = {agent.agent_id for agent in context.store.agents()}
     normalized: list[dict[str, Any]] = []
@@ -517,10 +544,17 @@ def _create_subtasks(context: ToolContext, arguments: dict[str, Any]) -> ToolRes
             )
         ],
     )
+    output = f"created {len(created)} queued subtasks"
+    if trimmed_count:
+        output += (
+            f" ({trimmed_count} trimmed: child capacity of "
+            f"{MAX_CHILDREN_PER_ASSIGNMENT} reached; resubmit the rest after "
+            "existing children complete)"
+        )
     return ToolResult(
         True,
-        f"created {len(created)} queued subtasks",
-        {"created": created},
+        output,
+        {"created": created, "trimmed": trimmed_count},
     )
 
 

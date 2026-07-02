@@ -1017,6 +1017,12 @@ def deterministic_cycle(
         and not item.awaiting_human
         and not _has_future_checkpoint(item, now)
     }
+    blocked_ids_by_agent: dict[str, set[str]] = {}
+    for item in assignments:
+        if item.status == AssignmentStatus.BLOCKED:
+            blocked_ids_by_agent.setdefault(item.assigned_to, set()).add(
+                item.assignment_id
+            )
     queued_non_rest_agents: set[str] = {
         item.assigned_to for item in queued if item.kind != AssignmentKind.REST
     }
@@ -1036,8 +1042,18 @@ def deterministic_cycle(
             skip(item, SKIP_AGENT_BUSY)
             continue
         if item.assigned_to in blocked_agents:
-            skip(item, SKIP_AGENT_BLOCKED)
-            continue
+            # A blocked task must not starve its own diagnosis: the ladder's
+            # failure-analysis child may target the same agent (no separate
+            # chief), and the blocked task itself is inert until the analysis
+            # completes — so let that one assignment through.
+            diagnoses_own_blocker = (
+                item.kind == AssignmentKind.FAILURE_ANALYSIS
+                and item.parent_assignment_id
+                in blocked_ids_by_agent.get(item.assigned_to, set())
+            )
+            if not diagnoses_own_blocker:
+                skip(item, SKIP_AGENT_BLOCKED)
+                continue
         if item.kind == AssignmentKind.REST and item.assigned_to in queued_non_rest_agents:
             item.progress_summary = "rest deferred until queued mission work is dispatched"
             skip(item, SKIP_REST_DEFERRED)

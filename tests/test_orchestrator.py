@@ -17,7 +17,16 @@ from brigade.orchestrator import (
 from brigade.prompt_floors import build_crew_chief_floor, build_orchestrator_floor
 from brigade.providers import ModelResponse
 from brigade.runner import run_agent_once
-from brigade.schemas import Agent, Assignment, AssignmentStatus, Goal, Mission, Priority, Team
+from brigade.schemas import (
+    Agent,
+    Assignment,
+    AssignmentKind,
+    AssignmentStatus,
+    Goal,
+    Mission,
+    Priority,
+    Team,
+)
 from brigade.state import JsonStateStore
 from brigade.time import add_seconds_iso, utc_now_iso
 from brigade.tools import ToolContext, default_tool_registry
@@ -675,3 +684,33 @@ def test_parent_completion_records_synthesis_event(tmp_path):
     assert telemetry["latest_event"]["type"] == "parent_synthesis"
     assert telemetry["latest_event"]["parent_assignment_id"] == parent.assignment_id
     assert child.assignment_id in telemetry["latest_event"]["child_assignment_ids"]
+
+
+def test_blocked_agent_still_receives_its_own_failure_analysis():
+    blocked = Assignment(
+        assignment="Original stuck work",
+        assigned_to="abacus",
+        created_by="human",
+        source="direct_command",
+    )
+    blocked.transition_to(AssignmentStatus.ASSIGNED)
+    blocked.transition_to(AssignmentStatus.BLOCKED)
+    analysis = Assignment(
+        assignment="Failure analysis for the stuck work",
+        assigned_to="abacus",
+        created_by="orchestrator",
+        source="orchestrator_ladder",
+        kind=AssignmentKind.FAILURE_ANALYSIS,
+        parent_assignment_id=blocked.assignment_id,
+    )
+    unrelated = Assignment(
+        assignment="Unrelated queued work",
+        assigned_to="abacus",
+        created_by="human",
+        source="direct_command",
+    )
+
+    result = deterministic_cycle([blocked, analysis, unrelated])
+
+    assert [item.assignment_id for item in result.assigned] == [analysis.assignment_id]
+    assert unrelated in result.skipped

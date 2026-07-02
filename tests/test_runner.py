@@ -231,3 +231,75 @@ def test_tool_observations_are_truncated_in_prompt(tmp_path):
     followup_prompt = provider.prompts[1]
     assert "<truncated>" in followup_prompt
     assert "x" * 5000 not in followup_prompt
+
+
+def test_planning_completion_without_task_creation_is_rejected(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    helper = Agent(agent_id="worker", display_name="Worker", workspace_path="workspace-worker")
+    assignment = Assignment(
+        assignment="Build the next concrete task plan for the current mission.",
+        assigned_to="sage",
+        created_by="orchestrator",
+        source="orchestrator_idle_task_builder",
+    )
+    assignment.transition_to(status=assignment.status.ASSIGNED)
+    store.add_agent(agent)
+    store.add_agent(helper)
+    store.add_assignment(assignment)
+    write_heartbeat_assignment(agent, assignment, tmp_path)
+
+    prose_plan = json.dumps(
+        {"status": "complete", "summary": "Plan: 1) research 2) draft 3) file", "blockers": []}
+    )
+    subtask_call = json.dumps(
+        {
+            "status": "tool_call",
+            "tool": "create_subtasks",
+            "arguments": {
+                "subtasks": [{"agent_id": "worker", "assignment": "Research filing rules"}]
+            },
+            "summary": "queueing the planned work",
+        }
+    )
+    done = json.dumps(
+        {"status": "complete", "summary": "Plan queued as one subtask", "blockers": []}
+    )
+    provider = _SequencedProvider([prose_plan, subtask_call, done])
+
+    result = run_agent_once("sage", store, provider)
+
+    assert result.status == "complete"
+    assert "no tasks were created" in provider.prompts[1]
+    children = [
+        item
+        for item in store.assignments()
+        if item.parent_assignment_id == assignment.assignment_id
+    ]
+    assert len(children) == 1
+
+
+def test_persistent_prose_planning_is_downgraded(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    assignment = Assignment(
+        assignment="Build the next concrete task plan for the current mission.",
+        assigned_to="sage",
+        created_by="orchestrator",
+        source="orchestrator_mission_continuation",
+    )
+    assignment.transition_to(status=assignment.status.ASSIGNED)
+    store.add_agent(agent)
+    store.add_assignment(assignment)
+    write_heartbeat_assignment(agent, assignment, tmp_path)
+
+    prose_plan = json.dumps(
+        {"status": "complete", "summary": "Here is my detailed plan in prose.", "blockers": []}
+    )
+    provider = _SequencedProvider([prose_plan, prose_plan])
+
+    result = run_agent_once("sage", store, provider)
+
+    assert result.status != "complete"
+    assert "without creating any tasks" in result.summary
+    assert store.assignments() != []

@@ -462,3 +462,82 @@ def test_full_cycle_materializes_approved_efficiency_proposal(tmp_path):
     event_types = [event["type"] for event in first.reasoning_record["events"]]
     assert EVENT_RECURRENCE_MATERIALIZED in event_types
     assert first.outcome.mode == "worked"
+
+
+def test_create_subtasks_accepts_partial_batch_at_capacity(tmp_path):
+    store = _store(tmp_path)
+    parent_agent = Agent(agent_id="chief", display_name="Chief", workspace_path="workspace-chief")
+    worker = Agent(agent_id="worker", display_name="Worker", workspace_path="workspace-worker")
+    store.add_agent(parent_agent)
+    store.add_agent(worker)
+    parent = Assignment(
+        assignment="Plan the work",
+        assigned_to="chief",
+        created_by="orchestrator",
+        source="orchestrator_idle_task_builder",
+    )
+    store.add_assignment(parent)
+    for index in range(4):
+        store.add_assignment(
+            Assignment(
+                assignment=f"existing child {index}",
+                assigned_to="worker",
+                created_by="chief",
+                source="agent_delegate",
+                parent_assignment_id=parent.assignment_id,
+            )
+        )
+    registry = default_tool_registry()
+    context = ToolContext(agent=parent_agent, assignment=parent, store=store)
+
+    result = registry.execute(
+        "create_subtasks",
+        context,
+        {
+            "subtasks": [
+                {"agent_id": "worker", "assignment": "new child A"},
+                {"agent_id": "worker", "assignment": "new child B"},
+            ]
+        },
+    )
+
+    assert result.ok
+    assert "created 1 queued subtasks" in result.output
+    assert "1 trimmed" in result.output
+
+
+def test_create_subtasks_at_full_capacity_reports_children_instead_of_blocking(tmp_path):
+    store = _store(tmp_path)
+    parent_agent = Agent(agent_id="chief", display_name="Chief", workspace_path="workspace-chief")
+    worker = Agent(agent_id="worker", display_name="Worker", workspace_path="workspace-worker")
+    store.add_agent(parent_agent)
+    store.add_agent(worker)
+    parent = Assignment(
+        assignment="Plan the work",
+        assigned_to="chief",
+        created_by="orchestrator",
+        source="orchestrator_idle_task_builder",
+    )
+    store.add_assignment(parent)
+    for index in range(5):
+        store.add_assignment(
+            Assignment(
+                assignment=f"existing child {index}",
+                assigned_to="worker",
+                created_by="chief",
+                source="agent_delegate",
+                parent_assignment_id=parent.assignment_id,
+            )
+        )
+    registry = default_tool_registry()
+    context = ToolContext(agent=parent_agent, assignment=parent, store=store)
+
+    result = registry.execute(
+        "create_subtasks",
+        context,
+        {"subtasks": [{"agent_id": "worker", "assignment": "one more"}]},
+    )
+
+    assert result.ok
+    assert "no capacity" in result.output
+    assert "plan in motion" in result.output

@@ -44,6 +44,14 @@ LOCAL_INFERENCE_BACKPRESSURE_PREFIXES = (
 MAX_PROVIDER_RETRIES = 3
 MAX_AGENT_ITERATIONS = 6
 MAX_COMPLETION_VALIDATION_RETRIES = 2
+# Orchestrator-created planning assignments exist to decompose work into
+# child tasks; completing one without creating any tasks is the planning
+# equivalent of claiming a file that was never written.
+DECOMPOSITION_SOURCES = {
+    "orchestrator_idle_task_builder",
+    "orchestrator_mission_continuation",
+}
+DECOMPOSITION_TOOLS = {"create_subtasks", "delegate"}
 MAX_CONTEXT_FILE_CHARS = 4000
 # Tool outputs re-enter the next iteration's prompt; unbounded observations
 # (full web pages, large files) bloat the prompt enough to destabilize local
@@ -405,6 +413,7 @@ def _complete_assignment_with_tools(
     context = ToolContext(agent=agent, assignment=assignment, store=store)
     native_tools = _native_tool_specs(registry)
     completion_rejections = 0
+    dispatched_tools: set[str] = set()
     for _ in range(MAX_AGENT_ITERATIONS):
         prompt = build_assignment_prompt(
             agent,
@@ -417,6 +426,45 @@ def _complete_assignment_with_tools(
         responses.append(response)
         parsed = parse_agent_response(response.text)
         if parsed.status == "complete" and assignment.kind != AssignmentKind.REST:
+            if (
+                assignment.source in DECOMPOSITION_SOURCES
+                and not (DECOMPOSITION_TOOLS & dispatched_tools)
+            ):
+                completion_rejections += 1
+                LOGGER.warning(
+                    "agent_planning_claim_rejected",
+                    extra={
+                        "agent_id": agent.agent_id,
+                        "assignment_id": assignment.assignment_id,
+                        "rejections": completion_rejections,
+                    },
+                )
+                if completion_rejections >= MAX_COMPLETION_VALIDATION_RETRIES:
+                    downgraded = ParsedAgentResponse(
+                        status="working",
+                        summary=(
+                            "completion rejected: planning assignment finished "
+                            "without creating any tasks (no create_subtasks or "
+                            f"delegate calls). Original claim: {parsed.summary}"
+                        ),
+                        blockers=[],
+                    )
+                    return responses, downgraded, observations
+                observations.append(
+                    {
+                        "tool": "completion_validation",
+                        "ok": False,
+                        "output": (
+                            "completion rejected: this is a planning/decomposition "
+                            "assignment, but no tasks were created. A plan that "
+                            "exists only as prose does not give agents work. Call "
+                            "create_subtasks (or delegate) to queue the planned "
+                            "steps, or report blocked if you cannot."
+                        ),
+                        "metadata": {"required_tools": sorted(DECOMPOSITION_TOOLS)},
+                    }
+                )
+                continue
             missing = _missing_claimed_files(parsed.summary, context.workspace, store)
             if missing:
                 completion_rejections += 1
@@ -483,6 +531,8 @@ def _complete_assignment_with_tools(
                 "ok": result.ok,
             },
         )
+        if result.ok and parsed.tool_name:
+            dispatched_tools.add(parsed.tool_name)
         observation = result.to_observation(parsed.tool_name or "unknown")
         observation["output"] = _truncate(str(observation["output"]), MAX_OBSERVATION_CHARS)
         observations.append(observation)
