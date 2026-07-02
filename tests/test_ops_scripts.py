@@ -103,8 +103,8 @@ def test_stress_concurrency_script_exposes_defaults_and_invariant_checks() -> No
 def test_brigade_live_uploads_host_knowledge_files_into_container() -> None:
     script = _read_script("brigade-live.sh")
 
-    assert "DOCKER_EXEC=(docker exec)" in script
-    assert "DOCKER_EXEC+=(-it)" in script
+    assert "DOCKER_EXEC=(docker exec -i)" in script
+    assert "DOCKER_EXEC+=(-t)" in script
     assert 'exec "${DOCKER_EXEC[@]}" "$CONTAINER" brigade "$@"' in script
     assert '${1:-}" == "knowledge"' in script
     assert '"${2:-}" == "upload"' in script
