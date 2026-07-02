@@ -550,3 +550,30 @@ def test_crew_chief_floor_lists_member_specialties(tmp_path):
     by_agent = {row["agent"]: row for row in floor["agent_load"]}
     assert by_agent["ada"]["specialties"] == ["python"]
     assert "specialties match" in CREW_CHIEF_SYSTEM_PROMPT
+
+
+def test_idle_synthesis_refires_after_previous_plan_archives(tmp_path, monkeypatch):
+    store = JsonStateStore(tmp_path / "state.json")
+    store.set_mission(Mission("Run the prototype", [], []))
+    store.add_agent(Agent("sage", "SAGE", "workspace-sage", role="crew_chief"))
+    store.upsert_team(Team("alpha", "Alpha", crew_chief_id="sage"))
+
+    first = build_idle_agent_assignments(store)
+    assert len(first) == 1
+
+    # Complete and archive the planning task; within the same bucket the
+    # history dedupe acts as a cooldown.
+    done = first[0]
+    done.transition_to(AssignmentStatus.ASSIGNED)
+    done.mark_complete("plan queued")
+    store.archive_assignment(done, executive_summary="plan queued")
+    assert build_idle_agent_assignments(store) == []
+
+    # A new bucket must re-fire the planner instead of being suppressed by
+    # the archived key forever.
+    monkeypatch.setattr(
+        "brigade.orchestrator._idle_replan_bucket", lambda: "2099-01-01T00"
+    )
+    refired = build_idle_agent_assignments(store)
+    assert len(refired) == 1
+    assert refired[0].assigned_to == "sage"

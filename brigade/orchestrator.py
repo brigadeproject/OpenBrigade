@@ -915,6 +915,20 @@ def _mission_continuation_assignment_text(*, team_of_one: bool = False) -> str:
     )
 
 
+def _idle_replan_bucket() -> str:
+    """Hour bucket appended to proactive idempotency keys.
+
+    ``add_assignment`` dedupes keys against the full assignment history, so a
+    fully deterministic key fires exactly once per mission — after the first
+    planning task archives, idle agents can never receive proactive work
+    again. The bucket bounds that dedupe window: within the same hour a
+    completed key still suppresses re-creation (cooldown against re-plan
+    churn), while the occupied-agent and active-work checks prevent overlap
+    across buckets.
+    """
+    return utc_now().strftime("%Y-%m-%dT%H")
+
+
 def _mission_continuation_idempotency_key(
     *,
     mission_statement: str,
@@ -936,7 +950,7 @@ def _mission_continuation_idempotency_key(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    return f"orchestrator-proactive:v1:{digest}"
+    return f"orchestrator-proactive:v1:{digest}:{_idle_replan_bucket()}"
 
 
 def _idempotency_seen(store: StateStore, idempotency_key: str) -> bool:
@@ -1151,7 +1165,10 @@ def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
             target = route_to_chief(store, agent_id=agent.agent_id)
             if target is None:
                 target = agent
-            key = f"orchestrator-idle-goal:{target.agent_id}:{goal.statement}"
+            key = (
+                f"orchestrator-idle-goal:{target.agent_id}:{goal.statement}"
+                f":{_idle_replan_bucket()}"
+            )
             if key in active_keys:
                 continue
             if target.agent_id == agent.agent_id:
@@ -1179,7 +1196,10 @@ def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
             if _goal_engagement_mode(chief_goal) == GoalEngagementMode.ON_CALL.value:
                 continue
             target = agent
-            key = f"orchestrator-idle-mission:{agent.agent_id}:{mission.statement}"
+            key = (
+                f"orchestrator-idle-mission:{agent.agent_id}:{mission.statement}"
+                f":{_idle_replan_bucket()}"
+            )
             if key in active_keys:
                 continue
             assignment_text = (
