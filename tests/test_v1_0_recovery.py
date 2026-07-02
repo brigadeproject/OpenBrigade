@@ -389,3 +389,56 @@ def test_rest_protocol_tells_agent_to_create_missing_paths():
     text = rest_assignment_text("2026-01-01").lower()
     assert "never block on a missing workspace path" in text
     assert "write_file" in text
+
+
+def test_ollama_provider_declares_tools_and_translates_tool_calls(monkeypatch):
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=0):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResp(
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "write_file",
+                                "arguments": {"path": "notes.md", "content": "hi"},
+                            }
+                        }
+                    ],
+                },
+                "prompt_eval_count": 5,
+                "eval_count": 7,
+            }
+        )
+
+    monkeypatch.setattr("brigade.providers.urllib.request.urlopen", fake_urlopen)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "write_file", "description": "", "parameters": {}},
+        }
+    ]
+    response = OllamaProvider(model="gpt-oss:20b").complete("hello", tools=tools)
+
+    assert captured["body"]["tools"] == tools
+    parsed = json.loads(response.text)
+    assert parsed["status"] == "tool_call"
+    assert parsed["tool"] == "write_file"
+    assert parsed["arguments"] == {"path": "notes.md", "content": "hi"}
+
+
+def test_ollama_provider_omits_tools_key_when_not_passed(monkeypatch):
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=0):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResp({"message": {"content": "plain answer"}})
+
+    monkeypatch.setattr("brigade.providers.urllib.request.urlopen", fake_urlopen)
+    response = OllamaProvider(model="qwen2.5-coder:7b").complete("hello")
+
+    assert "tools" not in captured["body"]
+    assert response.text == "plain answer"

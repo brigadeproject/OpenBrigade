@@ -399,6 +399,7 @@ def _complete_assignment_with_tools(
     responses: list[ModelResponse] = []
     observations: list[dict[str, Any]] = []
     context = ToolContext(agent=agent, assignment=assignment, store=store)
+    native_tools = _native_tool_specs(registry)
     completion_rejections = 0
     for _ in range(MAX_AGENT_ITERATIONS):
         prompt = build_assignment_prompt(
@@ -408,7 +409,7 @@ def _complete_assignment_with_tools(
             registry,
             observations=observations,
         )
-        response = _complete_with_retries(provider, prompt)
+        response = _complete_with_retries(provider, prompt, tools=native_tools)
         responses.append(response)
         parsed = parse_agent_response(response.text)
         if parsed.status == "complete" and assignment.kind != AssignmentKind.REST:
@@ -937,13 +938,51 @@ def _handle_heartbeat_validation_failure(
     )
 
 
-def _complete_with_retries(provider: ModelProvider, prompt: str) -> ModelResponse:
+def _native_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
+    """Convert registry specs to the OpenAI/Ollama function-tool format."""
+    specs = []
+    for spec in registry.specs():
+        properties = {
+            name: {"description": description}
+            for name, description in spec.argument_schema.items()
+        }
+        required = [
+            name
+            for name, description in spec.argument_schema.items()
+            if "optional" not in str(description).lower()
+        ]
+        specs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                    },
+                },
+            }
+        )
+    return specs
+
+
+def _complete_with_retries(
+    provider: ModelProvider,
+    prompt: str,
+    tools: list[dict[str, Any]] | None = None,
+) -> ModelResponse:
     last_error: Exception | None = None
     last_response: ModelResponse | None = None
+    use_tools = bool(tools) and getattr(provider, "supports_native_tools", False)
     attempt_prompt = prompt
     for attempt in range(1, MAX_PROVIDER_RETRIES + 1):
         try:
-            response = provider.complete(attempt_prompt)
+            if use_tools:
+                response = provider.complete(attempt_prompt, tools=tools)
+            else:
+                response = provider.complete(attempt_prompt)
             last_response = response
             parse_agent_response(response.text)
             return response

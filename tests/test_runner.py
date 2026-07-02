@@ -192,3 +192,18 @@ def test_non_complete_status_with_missing_file_claims_is_annotated(tmp_path):
     assert result.status != "complete"
     assert "files mentioned but not found in workspace" in result.summary
     assert "Submission_Package.md" in result.summary
+
+
+def test_native_tool_specs_conversion():
+    from brigade.runner import _native_tool_specs
+    from brigade.tools import default_tool_registry
+
+    specs = _native_tool_specs(default_tool_registry())
+    by_name = {spec["function"]["name"]: spec for spec in specs}
+    assert "write_file" in by_name
+    write_file = by_name["write_file"]["function"]
+    assert write_file["parameters"]["type"] == "object"
+    assert "path" in write_file["parameters"]["properties"]
+    assert "path" in write_file["parameters"]["required"]
+    assert "content" in write_file["parameters"]["required"]
+    assert "append" not in write_file["parameters"]["required"]

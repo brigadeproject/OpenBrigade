@@ -90,6 +90,7 @@ class ModelOption:
 
 class OllamaProvider:
     route_type = "local"
+    supports_native_tools = True
 
     def __init__(
         self,
@@ -99,17 +100,26 @@ class OllamaProvider:
         self.base_url = base_url.rstrip("/")
         self.model = model
 
-    def complete(self, prompt: str) -> ModelResponse:
+    def complete(
+        self, prompt: str, tools: list[dict[str, Any]] | None = None
+    ) -> ModelResponse:
         # Use /api/chat (not the legacy /api/generate): chat returns the
         # assistant's answer in message.content separately from any reasoning,
         # so "thinking" models populate content instead of leaving it empty.
-        payload = json.dumps(
-            {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-            }
-        ).encode("utf-8")
+        #
+        # Declaring tools natively matters for models with a built-in tool-call
+        # syntax (e.g. gpt-oss): if the model emits that syntax while no tools
+        # are declared, Ollama's parser fails the whole request with HTTP 500
+        # "error parsing tool call". With tools declared, Ollama returns
+        # structured message.tool_calls instead.
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+        if tools:
+            body["tools"] = tools
+        payload = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/api/chat",
             data=payload,
@@ -139,7 +149,27 @@ class OllamaProvider:
 
         message = data.get("message")
         text = str((message or {}).get("content", "") or "")
-        if not text.strip():
+        tool_calls = (message or {}).get("tool_calls") or []
+        if tool_calls:
+            # Translate the native tool call into the brigade agent response
+            # protocol so the runner's parser handles it uniformly.
+            function = tool_calls[0].get("function") or {}
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError:
+                    arguments = {"raw": arguments}
+            tool_name = str(function.get("name") or "")
+            text = json.dumps(
+                {
+                    "status": "tool_call",
+                    "tool": tool_name,
+                    "arguments": arguments,
+                    "summary": text.strip()[:300] or f"native tool call: {tool_name}",
+                }
+            )
+        elif not text.strip():
             # A reasoning-only model can return content="" (everything went to
             # message.thinking). Fail loudly so this surfaces as a provider/config
             # error (alert + deferral) instead of masquerading as a task blocker.
