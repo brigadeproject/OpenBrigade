@@ -207,3 +207,27 @@ def test_native_tool_specs_conversion():
     assert "path" in write_file["parameters"]["required"]
     assert "content" in write_file["parameters"]["required"]
     assert "append" not in write_file["parameters"]["required"]
+
+
+def test_tool_observations_are_truncated_in_prompt(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    _make_agent_with_assignment(tmp_path, store)
+    (tmp_path / "workspace-sage" / "big.md").write_text("x" * 11_000, encoding="utf-8")
+
+    tool_call = json.dumps(
+        {
+            "status": "tool_call",
+            "tool": "read_file",
+            "arguments": {"path": "big.md"},
+            "summary": "read the big file",
+        }
+    )
+    done = json.dumps({"status": "complete", "summary": "reviewed the data", "blockers": []})
+    provider = _SequencedProvider([tool_call, done])
+
+    result = run_agent_once("sage", store, provider)
+
+    assert result.status == "complete"
+    followup_prompt = provider.prompts[1]
+    assert "<truncated>" in followup_prompt
+    assert "x" * 5000 not in followup_prompt

@@ -45,6 +45,10 @@ MAX_PROVIDER_RETRIES = 3
 MAX_AGENT_ITERATIONS = 6
 MAX_COMPLETION_VALIDATION_RETRIES = 2
 MAX_CONTEXT_FILE_CHARS = 4000
+# Tool outputs re-enter the next iteration's prompt; unbounded observations
+# (full web pages, large files) bloat the prompt enough to destabilize local
+# models, so cap each one like workspace context files.
+MAX_OBSERVATION_CHARS = 4000
 MAX_KNOWLEDGE_SNIPPETS = 3
 TRANSIENT_ERROR_HINTS = (
     "timeout",
@@ -479,7 +483,9 @@ def _complete_assignment_with_tools(
                 "ok": result.ok,
             },
         )
-        observations.append(result.to_observation(parsed.tool_name or "unknown"))
+        observation = result.to_observation(parsed.tool_name or "unknown")
+        observation["output"] = _truncate(str(observation["output"]), MAX_OBSERVATION_CHARS)
+        observations.append(observation)
     exhausted = ParsedAgentResponse(
         status="working",
         summary=f"tool iteration budget exhausted after {MAX_AGENT_ITERATIONS} iterations",
