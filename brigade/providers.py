@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -112,10 +113,16 @@ class OllamaProvider:
         # are declared, Ollama's parser fails the whole request with HTTP 500
         # "error parsing tool call". With tools declared, Ollama returns
         # structured message.tool_calls instead.
+        # Ollama defaults to a 4096-token context, which brigade's assignment
+        # prompts routinely exceed; overflow either errors (llama-server) or
+        # silently degrades into empty assistant messages. Request a real
+        # window explicitly.
+        num_ctx = int(os.environ.get("BRIGADE_OLLAMA_NUM_CTX", "16384"))
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
+            "options": {"num_ctx": num_ctx},
         }
         if tools:
             body["tools"] = tools

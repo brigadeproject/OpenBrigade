@@ -442,3 +442,30 @@ def test_ollama_provider_omits_tools_key_when_not_passed(monkeypatch):
 
     assert "tools" not in captured["body"]
     assert response.text == "plain answer"
+
+
+def test_ollama_provider_requests_expanded_context(monkeypatch):
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=0):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResp({"message": {"content": "ok"}})
+
+    monkeypatch.setattr("brigade.providers.urllib.request.urlopen", fake_urlopen)
+    OllamaProvider(model="qwen2.5-coder:7b").complete("hello")
+
+    assert captured["body"]["options"]["num_ctx"] == 16384
+
+
+def test_ollama_provider_context_size_env_override(monkeypatch):
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=0):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResp({"message": {"content": "ok"}})
+
+    monkeypatch.setattr("brigade.providers.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setenv("BRIGADE_OLLAMA_NUM_CTX", "8192")
+    OllamaProvider(model="qwen2.5-coder:7b").complete("hello")
+
+    assert captured["body"]["options"]["num_ctx"] == 8192
