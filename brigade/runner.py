@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -42,6 +43,7 @@ LOCAL_INFERENCE_BACKPRESSURE_PREFIXES = (
 )
 MAX_PROVIDER_RETRIES = 3
 MAX_AGENT_ITERATIONS = 6
+MAX_COMPLETION_VALIDATION_RETRIES = 2
 MAX_CONTEXT_FILE_CHARS = 4000
 MAX_KNOWLEDGE_SNIPPETS = 3
 TRANSIENT_ERROR_HINTS = (
@@ -397,6 +399,7 @@ def _complete_assignment_with_tools(
     responses: list[ModelResponse] = []
     observations: list[dict[str, Any]] = []
     context = ToolContext(agent=agent, assignment=assignment, store=store)
+    completion_rejections = 0
     for _ in range(MAX_AGENT_ITERATIONS):
         prompt = build_assignment_prompt(
             agent,
@@ -408,7 +411,58 @@ def _complete_assignment_with_tools(
         response = _complete_with_retries(provider, prompt)
         responses.append(response)
         parsed = parse_agent_response(response.text)
+        if parsed.status == "complete" and assignment.kind != AssignmentKind.REST:
+            missing = _missing_claimed_files(parsed.summary, context.workspace, store)
+            if missing:
+                completion_rejections += 1
+                LOGGER.warning(
+                    "agent_completion_claim_rejected",
+                    extra={
+                        "agent_id": agent.agent_id,
+                        "assignment_id": assignment.assignment_id,
+                        "missing_files": missing,
+                        "rejections": completion_rejections,
+                    },
+                )
+                if completion_rejections >= MAX_COMPLETION_VALIDATION_RETRIES:
+                    downgraded = ParsedAgentResponse(
+                        status="working",
+                        summary=(
+                            "completion rejected: summary claims files that do not "
+                            f"exist in the workspace ({', '.join(missing)}). "
+                            f"Original claim: {parsed.summary}"
+                        ),
+                        blockers=[],
+                    )
+                    return responses, downgraded, observations
+                observations.append(
+                    {
+                        "tool": "completion_validation",
+                        "ok": False,
+                        "output": (
+                            "completion rejected: these files from your summary do "
+                            f"not exist in your workspace: {', '.join(missing)}. "
+                            "Create them with write_file before completing, or "
+                            "correct the summary to describe only work that actually "
+                            "happened."
+                        ),
+                        "metadata": {"missing_files": missing},
+                    }
+                )
+                continue
         if parsed.status != "tool_call":
+            if parsed.status in ("working", "blocked", "awaiting_human") and parsed.summary:
+                unverified = _missing_claimed_files(
+                    parsed.summary, context.workspace, store
+                )
+                if unverified:
+                    parsed = replace(
+                        parsed,
+                        summary=(
+                            f"{parsed.summary} [validator: files mentioned but not "
+                            f"found in workspace: {', '.join(unverified)}]"
+                        ),
+                    )
             return responses, parsed, observations
         result = registry.execute(
             parsed.tool_name or "",
@@ -431,6 +485,52 @@ def _complete_assignment_with_tools(
         blockers=[],
     )
     return responses, exhausted, observations
+
+
+_FILE_CLAIM_RE = re.compile(
+    r"(?<![\w/])((?:/[\w.\-]+|[\w.\-]+)(?:/[\w.\-]+)*"
+    r"\.(?:md|markdown|txt|json|csv|tsv|py|js|ts|html|htm|pdf|ya?ml|toml|sh|sql|"
+    r"xml|docx|xlsx|pptx|png|jpe?g|svg))\b",
+    re.IGNORECASE,
+)
+
+
+def _claimed_file_paths(summary: str) -> list[str]:
+    """Extract workspace-file paths an agent claims in a completion summary."""
+    text = re.sub(r"\bhttps?://\S+|\bwww\.\S+", " ", summary)
+    claims: list[str] = []
+    for match in _FILE_CLAIM_RE.findall(text):
+        candidate = match.strip(".")
+        if candidate and candidate not in claims:
+            claims.append(candidate)
+    return claims
+
+
+def _missing_claimed_files(
+    summary: str,
+    workspace: Path,
+    store: StateStore,
+) -> list[str]:
+    """Return claimed file paths that do not exist in any plausible location."""
+    missing: list[str] = []
+    for claim in _claimed_file_paths(summary):
+        path = Path(claim)
+        candidates: list[Path] = []
+        if path.is_absolute():
+            candidates.append(path)
+            # A container-absolute path like /data/... may live under a
+            # differently mounted data_dir.
+            if len(path.parts) > 2:
+                candidates.append(store.data_dir.joinpath(*path.parts[2:]))
+        else:
+            candidates.append(workspace / path)
+            candidates.append(store.data_dir / path)
+        try:
+            if not any(candidate.exists() for candidate in candidates):
+                missing.append(claim)
+        except OSError:
+            missing.append(claim)
+    return missing
 
 
 def build_assignment_prompt(
@@ -465,6 +565,8 @@ def build_assignment_prompt(
             '"summary":"why this tool is needed"}',
             "Use complete only when the assignment is actually done. Use working when "
             "progress was made but more cycles are needed.",
+            "Any file you mention in a complete summary must actually exist in your "
+            "workspace; create files with write_file before claiming them.",
             "Use expected_next_activity_at on working responses when this task is "
             "intentionally waiting until a future UTC timestamp.",
             "Use blocked or awaiting_human when you need outside intervention.",
