@@ -96,10 +96,10 @@ Turn the above into automated tests so a fix stays fixed and a model swap is mea
 
 Qwen3:14b (dense, **not** 3.5) avoids *both* local root causes — it's not gpt-oss's Harmony channel format, and it's not the Qwen3.5 wrong-pipeline mis-wiring. At ~9GB Q4 it fits the 16GB card in MACINTYRE with context headroom (embeddings are on the other GPU).
 
-- [ ] **5.1 — Pull it:** `ollama pull qwen3:14b`
-- [ ] **5.2 — `ollama show qwen3:14b`** — confirm `tools` capability and note the context length.
-- [ ] **5.3 — `ollama ps` after load** — confirm `size_vram` ≈ model size (no CPU spillover / swapping). Spillover means multi-second first-call latency.
-- [ ] **5.4 — Run the Phase 4 test set** against it. Compare score to gpt-oss and Ornith.
+- [x] **5.1 — Pull it:** `ollama pull qwen3:14b` *(Done 2026-07-02.)*
+- [x] **5.2 — `ollama show qwen3:14b`** — confirm `tools` capability and note the context length. *(Capabilities: completion, tools, thinking. Context length 40960. Q4_K_M, 14.8B.)*
+- [x] **5.3 — `ollama ps` after load** — confirm `size_vram` ≈ model size. *(12.0GB total, 12.0GB VRAM — 100% resident on the 16GB card, no spillover.)*
+- [ ] **5.4 — Run the Phase 4 test set** against it. Compare score to gpt-oss and Ornith. *(Quick-6 set done 2026-07-02: qwen3 6/6 with native schema-perfect tool_calls — see findings scoreboard. Full 20-task set pends Phase 4 build.)*
 - [ ] **5.5 — Decide primary vs. fallback** from the numbers, not vibes. Candidate everyday roles: briefing, rumination, writing, research.
 - [ ] **5.6 — Toggle thinking mode off** (`think: false`) for latency-sensitive everyday tasks if the reasoning delay hurts; leave on for research/rumination where it helps.
 

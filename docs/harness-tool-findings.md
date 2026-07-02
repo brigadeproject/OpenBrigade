@@ -111,12 +111,15 @@ Every root cause above lives in the format/parser boundary — the exact layer t
 | gpt-oss:20b | v1 (20 tasks) | — | pre-fix baseline, then post-Phase-1 |
 | Ornith-1.0-9B | v1 | — | current agent model |
 | qwen3:14b | v1 | — | once pulled (Phase 5) |
+| gpt-oss:20b | quick-6 (2026-07-02, post-fix) | 100% (6/6) | 3× native write_file (Harmony→tool_calls) + 3× protocol JSON; 13.8GB spills past 12GB-class VRAM budgets when co-resident |
+| Ornith-1.0-9B | quick-6 (2026-07-02) | 100% (6/6) | plain-text protocol JSON shape; 5.9GB incl. 16k ctx fully in VRAM; capability ceiling on complex multi-file tasks (loops without write_file) |
+| qwen3:14b | quick-6 (2026-07-02) | 100% (6/6) | native tool_calls with schema-perfect args (incl. typed `append: false`); thinking segregated; history round-trip clean; 12.0GB 100% VRAM on the 16GB card; warm latency 2.5–7.6s |
 
 ---
 
 ## Open questions / to re-verify
 
-- [ ] Is Finding 3 (Qwen3 Go-struct serialization) still live on v0.30.6, or patched? Verify via Phase 0 prompt dump once Qwen3:14b is pulled.
+- [x] Is Finding 3 (Qwen3 Go-struct serialization) still live on v0.30.6, or patched? **Behaviorally absent 2026-07-02:** qwen3:14b produced 3/3 native tool calls with schema-conformant, correctly-typed arguments via the `/api/chat` tools parameter, and the multi-turn history round-trip (assistant tool call + tool result + follow-up) answered with correct context — neither bug reproduces. (v0.30.6's qwen3 path emits no rendered-prompt dump, so verification is behavioral rather than byte-level.)
 - [ ] Has the Qwen3.5 wrong-pipeline routing (#14493) been fixed in a build ≥ our version? Re-check before ever considering qwen3.5.
 - [x] Does Ornith use a native `tool_calls` shape, Harmony, or XML? **Resolved 2026-07-02:** plain-text protocol JSON in `content` (sometimes native `tool_calls`); no Harmony, no XML. Does not share gpt-oss's failure mode; both shapes handled by the harness.
 - [ ] Learning-loop / effectiveness scoring for autonomous task selection remains an unresolved design problem (flagged separately from this reliability work).
