@@ -211,6 +211,9 @@ class _FakeRedis:
     def hdel(self, key, field):
         self.hashes.get(key, {}).pop(field, None)
 
+    def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
     def scan_iter(self, pattern):
         prefix = pattern.rstrip("*")
         return [key for key in self.values if key.startswith(prefix)]
@@ -238,6 +241,70 @@ def test_redis_runtime_client_claims_queue_and_inspects():
     assert payload["ok"] is True
     assert payload["active_claim_count"] == 1
     assert payload["active_claims"][0]["owner"] == "runner"
+
+
+class _CountingRedis(_FakeRedis):
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes = 0
+
+    def delete(self, key):
+        self.writes += 1
+        return super().delete(key)
+
+    def rpush(self, key, value):
+        self.writes += 1
+        return super().rpush(key, value)
+
+    def hset(self, key, field, value):
+        self.writes += 1
+        return super().hset(key, field, value)
+
+
+def test_reconcile_pending_assignments_is_noop_when_unchanged():
+    redis = _CountingRedis()
+    client = RedisRuntimeClient("redis://unused")
+    client._client = lambda: redis
+
+    queued = Assignment(
+        assignment="Draft launch plan",
+        assigned_to="sage",
+        created_by="human",
+        source="test",
+    )
+    other = Assignment(
+        assignment="Ship it",
+        assigned_to="atlas",
+        created_by="human",
+        source="test",
+    )
+    other.transition_to(AssignmentStatus.ASSIGNED)
+    assignments = [queued, other]
+
+    # First reconcile writes the queued assignment (only the QUEUED one).
+    client.reconcile_pending_assignments(assignments)
+    assert redis.writes > 0
+    assert redis.lists[client.PENDING_ASSIGNMENTS_KEY] == [queued.assignment_id]
+    assert set(redis.hashes[client.PENDING_ASSIGNMENT_RECORDS_KEY]) == {queued.assignment_id}
+
+    # Re-reconciling identical state must not issue any write commands.
+    redis.writes = 0
+    client.reconcile_pending_assignments(assignments)
+    assert redis.writes == 0
+
+    # A real change (new queued assignment) resumes writing.
+    added = Assignment(
+        assignment="Second task",
+        assigned_to="sage",
+        created_by="human",
+        source="test",
+    )
+    client.reconcile_pending_assignments(assignments + [added])
+    assert redis.writes > 0
+    assert redis.lists[client.PENDING_ASSIGNMENTS_KEY] == [
+        queued.assignment_id,
+        added.assignment_id,
+    ]
 
 
 class _FakePostgresCursor:

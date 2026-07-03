@@ -305,17 +305,32 @@ class RedisRuntimeClient:
         )
 
     def reconcile_pending_assignments(self, assignments: list[Assignment]) -> None:
+        desired_ids: list[str] = []
+        desired_records: dict[str, str] = {}
+        for assignment in assignments:
+            if assignment.status != AssignmentStatus.QUEUED:
+                continue
+            desired_ids.append(assignment.assignment_id)
+            desired_records[assignment.assignment_id] = json.dumps(
+                assignment.to_dict(), sort_keys=True
+            )
+
         def operation(client) -> None:
+            # No-op when Redis already matches the desired state, so idle
+            # reconcile ticks stop churning the AOF with delete+rebuild writes.
+            current_ids = list(client.lrange(self.PENDING_ASSIGNMENTS_KEY, 0, -1))
+            current_records = dict(client.hgetall(self.PENDING_ASSIGNMENT_RECORDS_KEY))
+            if current_ids == desired_ids and current_records == desired_records:
+                return
+
             client.delete(self.PENDING_ASSIGNMENTS_KEY)
             client.delete(self.PENDING_ASSIGNMENT_RECORDS_KEY)
-            for assignment in assignments:
-                if assignment.status != AssignmentStatus.QUEUED:
-                    continue
-                client.rpush(self.PENDING_ASSIGNMENTS_KEY, assignment.assignment_id)
+            for assignment_id in desired_ids:
+                client.rpush(self.PENDING_ASSIGNMENTS_KEY, assignment_id)
                 client.hset(
                     self.PENDING_ASSIGNMENT_RECORDS_KEY,
-                    assignment.assignment_id,
-                    json.dumps(assignment.to_dict(), sort_keys=True),
+                    assignment_id,
+                    desired_records[assignment_id],
                 )
 
         self._execute(operation)
