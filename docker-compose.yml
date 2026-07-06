@@ -22,6 +22,27 @@ services:
     volumes:
       - ./ops/ollama_bridge_proxy.py:/app/ops/ollama_bridge_proxy.py:ro
 
+  brigade_ollama_embeddings_proxy:
+    image: python:3.10-slim
+    container_name: brigade_ollama_embeddings_proxy
+    restart: unless-stopped
+    profiles:
+      - app
+    network_mode: host
+    command:
+      - python
+      - /app/ops/ollama_bridge_proxy.py
+      - --listen-host
+      - ${BRIGADE_OLLAMA_EMBEDDINGS_PROXY_LISTEN_HOST:-172.17.0.1}
+      - --listen-port
+      - ${BRIGADE_OLLAMA_EMBEDDINGS_PROXY_PORT:-11435}
+      - --target-host
+      - ${BRIGADE_OLLAMA_EMBEDDINGS_PROXY_TARGET_HOST:-127.0.0.1}
+      - --target-port
+      - ${BRIGADE_OLLAMA_EMBEDDINGS_PROXY_TARGET_PORT:-11435}
+    volumes:
+      - ./ops/ollama_bridge_proxy.py:/app/ops/ollama_bridge_proxy.py:ro
+
   brigade_orchestrator:
     build: .
     container_name: brigade_orchestrator
@@ -62,6 +83,7 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - brigade_ollama_proxy
+      - brigade_ollama_embeddings_proxy
       - brigade_postgres
       - brigade_redis
       - brigade_qdrant
