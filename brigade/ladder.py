@@ -91,13 +91,47 @@ def ladder_state(
         # the analysis is created here as a catch-up rather than deadlocking.
         child = find_analysis_child(assignments or store.assignments(), blocked)
         if child is None:
+            # A completed analysis child may already have been archived to
+            # history, where the live-assignment search cannot see it. Treat
+            # it as complete rather than owing a fresh analysis the
+            # idempotency ledger would suppress forever.
+            if _archived_analysis_completed(store, blocked):
+                return LADDER_STEP_REASSIGN
             return LADDER_STEP_ANALYSIS
         if child.status == AssignmentStatus.COMPLETE:
             return LADDER_STEP_REASSIGN
         return LADDER_WAITING_ANALYSIS
     if failures >= ANALYSIS_FAILURES:
-        return LADDER_STEP_RETRY if skip_analysis else LADDER_STEP_ANALYSIS
+        if skip_analysis:
+            return LADDER_STEP_RETRY
+        # Once the analysis child completes (live or archived), the ladder
+        # owes the blocked task an informed retry — otherwise nothing ever
+        # changes the failure count and the assignment wedges at this rung,
+        # pinning its agent indefinitely.
+        child = find_analysis_child(assignments or store.assignments(), blocked)
+        if child is None:
+            if _archived_analysis_completed(store, blocked):
+                return LADDER_STEP_RETRY
+            return LADDER_STEP_ANALYSIS
+        if child.status == AssignmentStatus.COMPLETE:
+            return LADDER_STEP_RETRY
+        return LADDER_WAITING_ANALYSIS
     return LADDER_STEP_RETRY
+
+
+def _archived_analysis_completed(store: StateStore, blocked: Assignment) -> bool:
+    """Whether a failure-analysis child of ``blocked`` completed and was
+    archived to assignment history (and is therefore invisible to
+    ``find_analysis_child``)."""
+    for entry in store.assignment_history():
+        record = entry.get("record") or {}
+        if (
+            record.get("parent_assignment_id") == blocked.assignment_id
+            and record.get("kind") == AssignmentKind.FAILURE_ANALYSIS.value
+            and entry.get("final_status") == AssignmentStatus.COMPLETE.value
+        ):
+            return True
+    return False
 
 
 def find_analysis_child(
@@ -164,6 +198,33 @@ def resolve_blockers(store: StateStore) -> dict[str, Any]:
                     ),
                 }
             )
+            # A suppressed step means this exact rung already fired at this
+            # failure count and the assignment is still blocked: the ladder
+            # cannot make progress on its own, and re-suppressing silently
+            # every cycle pins the agent forever (the Jul 4-6 deadlock).
+            # Park it for a human instead — that clears the agent's
+            # occupancy so queued work behind it can dispatch.
+            if step != LADDER_STEP_HUMAN:
+                wedge = escalate_human(
+                    store,
+                    blocked,
+                    reason=(
+                        f"ladder wedged: step '{step}' already applied at "
+                        f"{blocked.consecutive_failures} failures but the "
+                        "assignment is still blocked"
+                    ),
+                )
+                if wedge is not None:
+                    action, event = wedge
+                    actions.append(action)
+                    events.append(event)
+                    LOGGER.warning(
+                        "ladder_wedge_escalated",
+                        extra={
+                            "assignment_id": blocked.assignment_id,
+                            "suppressed_step": step,
+                        },
+                    )
             continue
         action, event = result
         actions.append(action)
@@ -359,10 +420,12 @@ def escalate_human(
     blocked: Assignment,
     *,
     source: str = LADDER_SOURCE,
+    reason: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """Step 4: mark awaiting_human and alert with the full ladder history.
 
-    This is the only step that interrupts the human.
+    This is the only step that interrupts the human. ``reason`` overrides the
+    default "ladder exhaustion" cause in the alert (e.g. a wedged ladder).
     """
     key = ladder_idempotency_key(
         blocked.assignment_id, LADDER_STEP_HUMAN, blocked.consecutive_failures
@@ -373,9 +436,12 @@ def escalate_human(
     blocked.updated_at = utc_now_iso()
     store.update_assignment(blocked)
     history = _ladder_history(store, blocked)
+    cause = reason or (
+        f"ladder exhaustion ({blocked.consecutive_failures} failures)"
+    )
     alert = (
-        f"assignment {blocked.assignment_id} escalated to human after ladder "
-        f"exhaustion ({blocked.consecutive_failures} failures). {history}"
+        f"assignment {blocked.assignment_id} escalated to human after "
+        f"{cause}. {history}"
     )
     store.add_alert(alert)
     action = {

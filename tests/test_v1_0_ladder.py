@@ -291,9 +291,13 @@ def test_step_suppressed_when_key_already_persisted(tmp_path):
 
     second = resolve_blockers(store)
 
-    assert second["actions"] == []
+    # The retry key is deduped, and a suppressed rung now parks the
+    # assignment for a human rather than silently wedging it blocked.
     assert [item["step"] for item in second["suppressed"]] == ["retry"]
-    assert store.find_assignment(blocked.assignment_id).status == AssignmentStatus.BLOCKED
+    assert [action["step"] for action in second["actions"]] == ["human"]
+    refreshed = store.find_assignment(blocked.assignment_id)
+    assert refreshed.status == AssignmentStatus.BLOCKED
+    assert refreshed.awaiting_human is True
 
 
 def test_repeated_cycles_do_not_duplicate_step_actions(tmp_path):
@@ -516,3 +520,67 @@ def test_ladder_state_progression(tmp_path):
     blocked.register_failure("error 5")
     blocked.awaiting_human = False
     assert ladder_state(store, blocked) == "human"
+
+
+# --- Archived analysis children and wedge escalation (Jul 4-6 deadlock) ----------
+
+
+def test_completed_live_analysis_at_two_failures_owes_informed_retry(tmp_path):
+    store = _store_with_team(tmp_path)
+    blocked = _blocked_assignment(store, failures=2)
+    resolve_blockers(store)  # creates the analysis child
+    _complete_analysis(store, blocked)
+
+    # Analysis is done but failures never advanced past 2: the ladder must
+    # owe a retry, not re-owe the analysis it already created.
+    assert ladder_state(store, blocked) == "retry"
+    result = resolve_blockers(store)
+    assert [action["step"] for action in result["actions"]] == ["retry"]
+    refreshed = store.find_assignment(blocked.assignment_id)
+    assert refreshed.status == AssignmentStatus.ASSIGNED
+
+
+def test_archived_analysis_child_still_advances_ladder(tmp_path):
+    store = _store_with_team(tmp_path)
+    blocked = _blocked_assignment(store, failures=2)
+    resolve_blockers(store)
+    child = _complete_analysis(store, blocked)
+
+    # The completed diagnosis gets archived to history — exactly what wedged
+    # production: the live-assignment search can no longer see it.
+    store.archive_assignment(child, "diagnosed: missing module")
+    assert find_analysis_child(store.assignments(), blocked) is None
+
+    assert ladder_state(store, blocked) == "retry"
+
+    blocked.register_failure("error 3: still failing")
+    blocked.awaiting_human = False
+    store.update_assignment(blocked)
+    assert ladder_state(store, blocked) == "reassign"
+
+
+def test_suppressed_step_escalates_to_human_instead_of_wedging(tmp_path):
+    store = _store_with_team(tmp_path)
+    blocked = _blocked_assignment(store, failures=1)
+    first = resolve_blockers(store)  # applies retry at failures=1
+    record_orchestration_events(
+        store,
+        source="orchestrator_ladder",
+        decision_summary="ladder pass",
+        events=first["events"],
+    )
+
+    # The retry ran but the assignment came back blocked at the same failure
+    # count, so the owed step is idempotency-suppressed: without the wedge
+    # breaker this would re-suppress silently every cycle forever.
+    refreshed = store.find_assignment(blocked.assignment_id)
+    refreshed.transition_to(AssignmentStatus.BLOCKED)
+    store.update_assignment(refreshed)
+
+    result = resolve_blockers(store)
+
+    assert [item["step"] for item in result["suppressed"]] == ["retry"]
+    assert [action["step"] for action in result["actions"]] == ["human"]
+    parked = store.find_assignment(blocked.assignment_id)
+    assert parked.awaiting_human is True
+    assert any("ladder wedged" in alert for alert in store.alerts())
