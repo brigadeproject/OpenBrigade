@@ -25,6 +25,7 @@ from brigade.schemas import (
     Assignment,
     AssignmentKind,
     AssignmentStatus,
+    ChatMessage,
     Goal,
     GoalEngagementMode,
     Priority,
@@ -2408,27 +2409,68 @@ def recover_hung_tasks(store: StateStore, config: OrchestrationConfig) -> dict[s
     return {"enabled": True, "actions": actions, "events": events}
 
 
+# The GUI chat channel the operator actually watches. Proactive orchestrator
+# notifications land here so an escalation is visible without external
+# connector configuration.
+OPERATOR_CHAT_CHANNEL = "orchestrator"
+
+
 def _deliver_operator_notification(
-    config: OrchestrationConfig, text: str
+    store: StateStore, config: OrchestrationConfig, text: str
 ) -> dict[str, Any]:
+    """Deliver an operator notification on every available channel.
+
+    The orchestrator chat always receives the message — escalations must be
+    visible in the surface the operator already reads, not only in a passive
+    alerts table. Telegram is attempted additionally when configured.
+    """
+    channels: list[dict[str, Any]] = []
+    try:
+        store.add_message(
+            ChatMessage(
+                channel=OPERATOR_CHAT_CHANNEL,
+                sender="orchestrator",
+                recipient="operator",
+                content=text,
+                metadata={"kind": "operator_notification"},
+            )
+        )
+        channels.append({"channel": "chat", "status": "sent"})
+    except Exception as exc:  # pragma: no cover - defensive
+        channels.append({"channel": "chat", "status": "failed", "reason": str(exc)})
+
     bot_token = config.telegram_bot_token
     chat_id = config.operator_telegram_chat_id
     if not bot_token or not chat_id:
-        return {
-            "channel": "none",
-            "status": "skipped",
-            "reason": "operator telegram not configured",
-        }
-    try:
-        from brigade.connectors import send_telegram_message
+        channels.append(
+            {
+                "channel": "telegram",
+                "status": "skipped",
+                "reason": "operator telegram not configured",
+            }
+        )
+    else:
+        try:
+            from brigade.connectors import send_telegram_message
 
-        result = send_telegram_message(bot_token, chat_id=chat_id, text=text)
-    except Exception as exc:  # pragma: no cover - defensive
-        return {"channel": "telegram", "status": "failed", "reason": str(exc)}
+            result = send_telegram_message(bot_token, chat_id=chat_id, text=text)
+            channels.append(
+                {
+                    "channel": "telegram",
+                    "status": getattr(result, "status", "unknown"),
+                    "reason": getattr(result, "reason", None),
+                }
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            channels.append(
+                {"channel": "telegram", "status": "failed", "reason": str(exc)}
+            )
+
+    sent = [entry["channel"] for entry in channels if entry["status"] == "sent"]
     return {
-        "channel": "telegram",
-        "status": getattr(result, "status", "unknown"),
-        "reason": getattr(result, "reason", None),
+        "channel": "+".join(sent) if sent else "none",
+        "status": "sent" if sent else "failed",
+        "channels": channels,
     }
 
 
@@ -2459,7 +2501,7 @@ def _notify_operator_escalations(
             f"{assignment.assignment_id} (agent {assignment.assigned_to}) is awaiting "
             f"human attention. Reason: {reason}"
         )
-        delivery = _deliver_operator_notification(config, text)
+        delivery = _deliver_operator_notification(store, config, text)
         notified.append(
             {"assignment_id": assignment.assignment_id, "delivery": delivery}
         )
@@ -2629,6 +2671,12 @@ def run_full_cycle(
     sub_results["starvation"] = starvation
     if starvation["alert"]:
         store.add_alert(starvation["alert"])
+        # A stalled queue is an operator incident: say so in the chat (and
+        # Telegram when configured), not only the alerts table. The
+        # every-N-cycles alert cadence keeps this to ~one message per hour.
+        starvation["delivery"] = _deliver_operator_notification(
+            store, config, starvation["alert"]
+        )
         LOGGER.warning(
             "dispatch_starvation_detected",
             extra={

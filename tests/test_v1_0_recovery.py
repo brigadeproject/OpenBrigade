@@ -306,11 +306,44 @@ def test_notify_operator_dedupes_on_prior_record(tmp_path, monkeypatch):
     assert sent == []
 
 
-def test_notify_operator_skips_when_unconfigured(tmp_path):
+def test_notify_operator_posts_to_orchestrator_chat_without_telegram(tmp_path):
+    store = _store(tmp_path)
+    blocked = _blocked(store, awaiting_human=True)
+
+    result = _notify_operator_escalations(store, OrchestrationConfig())
+
+    # No Telegram configured: the orchestrator chat is still notified, so the
+    # escalation is visible in the surface the operator actually watches.
+    delivery = result["notified"][0]["delivery"]
+    assert delivery["status"] == "sent"
+    assert delivery["channel"] == "chat"
+    by_channel = {entry["channel"]: entry for entry in delivery["channels"]}
+    assert by_channel["chat"]["status"] == "sent"
+    assert by_channel["telegram"]["status"] == "skipped"
+    chat = store.messages("orchestrator")
+    assert len(chat) == 1
+    assert chat[0].sender == "orchestrator"
+    assert blocked.assignment_id in chat[0].content
+    assert chat[0].metadata["kind"] == "operator_notification"
+
+
+def test_notify_operator_sends_chat_and_telegram_when_configured(tmp_path, monkeypatch):
     store = _store(tmp_path)
     _blocked(store, awaiting_human=True)
-    result = _notify_operator_escalations(store, OrchestrationConfig())
-    assert result["notified"][0]["delivery"]["status"] == "skipped"
+    monkeypatch.setattr(
+        "brigade.connectors.send_telegram_message",
+        lambda *a, **k: ConnectorResult("telegram", "sent"),
+    )
+    config = OrchestrationConfig(
+        telegram_bot_token="botto", operator_telegram_chat_id="42"
+    )
+
+    result = _notify_operator_escalations(store, config)
+
+    delivery = result["notified"][0]["delivery"]
+    assert delivery["channel"] == "chat+telegram"
+    assert delivery["status"] == "sent"
+    assert len(store.messages("orchestrator")) == 1
 
 
 # --- JSON extraction robustness (model-output tolerance) -------------------------
@@ -469,3 +502,41 @@ def test_ollama_provider_context_size_env_override(monkeypatch):
     OllamaProvider(model="qwen2.5-coder:7b").complete("hello")
 
     assert captured["body"]["options"]["num_ctx"] == 8192
+
+
+def test_starvation_alert_reaches_orchestrator_chat(tmp_path):
+    from brigade.orchestrator import run_full_cycle
+    from brigade.schemas import Mission
+
+    store = _store(tmp_path)
+    store.set_mission(Mission("Run the prototype", [], []))
+    # ada pinned by a blocked (non-awaiting-human) assignment, with queued
+    # work behind it: the starved-dispatch shape of the Jul 4-6 deadlock.
+    _blocked(store, awaiting_human=False)
+    queued = Assignment(
+        assignment="Follow-up work stuck behind the blocked task",
+        assigned_to="ada",
+        created_by="human",
+        source="direct_command",
+    )
+    store.add_assignment(queued)
+
+    config = OrchestrationConfig(
+        proactive_mode="off",
+        blocker_resolution_enabled=False,
+        dispatch_starvation_alert_cycles=1,
+    )
+    result = run_full_cycle(store, None, config)
+
+    starvation = result.sub_results["starvation"]
+    assert starvation["starved"] is True
+    assert starvation["alert"] is not None
+    assert starvation["delivery"]["channels"][0]["channel"] == "chat"
+    assert starvation["delivery"]["channels"][0]["status"] == "sent"
+    chat = store.messages("orchestrator")
+    assert any(
+        "dispatch starvation" in message.content
+        and message.metadata.get("kind") == "operator_notification"
+        for message in chat
+    )
+    assert any("dispatch starvation" in alert for alert in store.alerts())
