@@ -689,3 +689,67 @@ def test_create_subtasks_reuses_duplicate_for_dependency_chain(tmp_path):
         item for item in store.assignments() if item.assigned_to == "worker"
     ]
     assert len(worker_backlog) == 2
+
+
+# --- team-shared workspace (shared/ prefix) ---------------------------------------
+
+
+def test_shared_prefix_round_trips_between_agents(tmp_path):
+    store = _store(tmp_path)
+    registry = default_tool_registry()
+    ada = _context(store, "ada")
+    sage = _context(store, "sage")
+    ensure_agent_workspace(ada.agent, store.data_dir)
+    ensure_agent_workspace(sage.agent, store.data_dir)
+
+    written = registry.execute(
+        "write_file",
+        ada,
+        {"path": "shared/governance_model.md", "content": "# Governance"},
+    )
+    assert written.ok
+    assert "shared/governance_model.md" in written.output
+    assert (tmp_path / "shared-workspace" / "governance_model.md").exists()
+
+    # A different agent reads the same file through the shared prefix.
+    read = registry.execute("read_file", sage, {"path": "shared/governance_model.md"})
+    assert read.ok
+    assert read.output == "# Governance"
+
+    listed = registry.execute("list_files", sage, {"path": "shared/"})
+    assert listed.ok
+    assert "shared/governance_model.md" in listed.output
+
+
+def test_shared_workspace_prefix_alias_and_privacy(tmp_path):
+    store = _store(tmp_path)
+    registry = default_tool_registry()
+    ada = _context(store, "ada")
+    sage = _context(store, "sage")
+    ensure_agent_workspace(ada.agent, store.data_dir)
+    ensure_agent_workspace(sage.agent, store.data_dir)
+
+    # shared-workspace/ is accepted as an alias for shared/.
+    registry.execute(
+        "write_file", ada, {"path": "shared-workspace/notes.md", "content": "n"}
+    )
+    read = registry.execute("read_file", sage, {"path": "shared/notes.md"})
+    assert read.output == "n"
+
+    # Private workspaces stay private: sage cannot see ada's own files.
+    registry.execute("write_file", ada, {"path": "private.md", "content": "secret"})
+    read_private = registry.execute("read_file", sage, {"path": "private.md"})
+    assert read_private.metadata["exists"] is False
+
+
+def test_shared_prefix_cannot_escape_shared_root(tmp_path):
+    store = _store(tmp_path)
+    registry = default_tool_registry()
+    ada = _context(store, "ada")
+    ensure_agent_workspace(ada.agent, store.data_dir)
+
+    result = registry.execute(
+        "read_file", ada, {"path": "shared/../workspace-sage/HEARTBEAT.md"}
+    )
+    assert not result.ok
+    assert "escapes" in result.output

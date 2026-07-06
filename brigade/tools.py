@@ -79,25 +79,47 @@ def default_tool_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="list_files",
-            description="List files under the assigned agent workspace.",
-            argument_schema={"path": "optional relative workspace path"},
+            description=(
+                "List files under your private workspace, or under the "
+                "team-shared workspace when the path starts with shared/."
+            ),
+            argument_schema={
+                "path": (
+                    "optional relative path; prefix shared/ for the "
+                    "team-shared workspace"
+                )
+            },
         ),
         _list_files,
     )
     registry.register(
         ToolSpec(
             name="read_file",
-            description="Read a UTF-8 text file from the assigned agent workspace.",
-            argument_schema={"path": "relative workspace file path"},
+            description=(
+                "Read a UTF-8 text file from your private workspace, or from "
+                "the team-shared workspace when the path starts with shared/."
+            ),
+            argument_schema={
+                "path": (
+                    "relative file path; prefix shared/ for the team-shared "
+                    "workspace"
+                )
+            },
         ),
         _read_file,
     )
     registry.register(
         ToolSpec(
             name="write_file",
-            description="Write or append UTF-8 text inside the assigned agent workspace.",
+            description=(
+                "Write or append UTF-8 text in your private workspace, or in "
+                "the team-shared workspace when the path starts with shared/."
+            ),
             argument_schema={
-                "path": "relative workspace file path",
+                "path": (
+                    "relative file path; prefix shared/ for the team-shared "
+                    "workspace"
+                ),
                 "content": "text to write",
                 "append": "optional boolean, defaults false",
             },
@@ -246,9 +268,43 @@ def _safe_workspace_path(workspace: Path, raw_path: str | None) -> Path:
     return path
 
 
+# The team-shared workspace: every agent reads and writes it through the
+# ``shared/`` path prefix, while workspace-<agent> stays private. This is the
+# artifact-handoff surface between agents — a dependency's outputs are only
+# visible to the dependent task if they land here.
+SHARED_WORKSPACE_DIRNAME = "shared-workspace"
+_SHARED_PATH_PREFIXES = ("shared", SHARED_WORKSPACE_DIRNAME)
+
+
+def _tool_path(context: ToolContext, raw_path: str | None) -> tuple[Path, Path, str]:
+    """Resolve a tool path to (root, path, display_prefix).
+
+    ``shared/...`` (or ``shared-workspace/...``) routes into the team-shared
+    workspace, jailed there; anything else is jailed in the agent's private
+    workspace. ``display_prefix`` reconstructs agent-facing paths.
+    """
+    relative = Path(raw_path or ".")
+    if (
+        not relative.is_absolute()
+        and relative.parts
+        and relative.parts[0] in _SHARED_PATH_PREFIXES
+    ):
+        root = context.store.data_dir / SHARED_WORKSPACE_DIRNAME
+        root.mkdir(parents=True, exist_ok=True)
+        remainder = (
+            str(Path(*relative.parts[1:])) if len(relative.parts) > 1 else "."
+        )
+        return root.resolve(), _safe_workspace_path(root, remainder), "shared/"
+    return (
+        context.workspace.resolve(),
+        _safe_workspace_path(context.workspace, raw_path),
+        "",
+    )
+
+
 def _list_files(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     raw_path = _arg_text(arguments, "path", ".") or "."
-    root = _safe_workspace_path(context.workspace, raw_path)
+    workspace_root, root, prefix = _tool_path(context, raw_path)
     if not root.exists():
         # A missing path in the agent's own workspace is empty scratch space, not an
         # error: report it empty so the agent creates what it needs instead of
@@ -266,9 +322,9 @@ def _list_files(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
             },
         )
     if root.is_file():
-        return ToolResult(True, str(root.relative_to(context.workspace)))
+        return ToolResult(True, prefix + str(root.relative_to(workspace_root)))
     files = [
-        str(path.relative_to(context.workspace))
+        prefix + str(path.relative_to(workspace_root))
         for path in sorted(root.rglob("*"))
         if path.is_file()
     ][:100]
@@ -277,7 +333,7 @@ def _list_files(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
 
 def _read_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     raw_path = _required_text(arguments, "path")
-    path = _safe_workspace_path(context.workspace, raw_path)
+    _, path, _ = _tool_path(context, raw_path)
     if not path.exists() or not path.is_file():
         # Missing workspace file == empty, not an error: lets the agent proceed and
         # create it with write_file rather than treating it as a blocker.
@@ -296,7 +352,9 @@ def _read_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
 
 
 def _write_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-    path = _safe_workspace_path(context.workspace, _required_text(arguments, "path"))
+    workspace_root, path, prefix = _tool_path(
+        context, _required_text(arguments, "path")
+    )
     content = _required_text(arguments, "content")
     path.parent.mkdir(parents=True, exist_ok=True)
     if bool(arguments.get("append")):
@@ -306,7 +364,8 @@ def _write_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         path.write_text(content, encoding="utf-8")
     return ToolResult(
         True,
-        f"wrote {len(content)} characters to {path.relative_to(context.workspace)}",
+        f"wrote {len(content)} characters to "
+        f"{prefix + str(path.relative_to(workspace_root))}",
     )
 
 

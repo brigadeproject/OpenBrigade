@@ -582,6 +582,12 @@ def _missing_claimed_files(
         else:
             candidates.append(workspace / path)
             candidates.append(store.data_dir / path)
+            # shared/<...> is the agent-facing alias for the team-shared
+            # workspace (tools.SHARED_WORKSPACE_DIRNAME).
+            if path.parts and path.parts[0] in ("shared", "shared-workspace"):
+                candidates.append(
+                    store.data_dir.joinpath("shared-workspace", *path.parts[1:])
+                )
         try:
             if not any(candidate.exists() for candidate in candidates):
                 missing.append(claim)

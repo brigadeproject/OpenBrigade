@@ -303,3 +303,23 @@ def test_persistent_prose_planning_is_downgraded(tmp_path):
     assert result.status != "complete"
     assert "without creating any tasks" in result.summary
     assert store.assignments() != []
+
+
+def test_missing_claimed_files_resolves_shared_workspace(tmp_path):
+    from brigade.runner import _missing_claimed_files
+    from brigade.state import JsonStateStore
+
+    store = JsonStateStore(tmp_path / "state.json")
+    workspace = tmp_path / "workspace-ada"
+    workspace.mkdir()
+    shared = tmp_path / "shared-workspace"
+    shared.mkdir()
+    (shared / "governance_model.md").write_text("# gov", encoding="utf-8")
+
+    summary = (
+        "Wrote shared/governance_model.md and shared/missing_thing.md for the team."
+    )
+    missing = _missing_claimed_files(summary, workspace, store)
+
+    assert "shared/governance_model.md" not in missing
+    assert "shared/missing_thing.md" in missing
