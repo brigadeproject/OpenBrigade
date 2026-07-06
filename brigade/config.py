@@ -41,6 +41,7 @@ class Settings:
     rest_idle_cycles_threshold: int = 6
     rest_min_interval_seconds: int = 86_400
     blocker_resolution_enabled: bool = True
+    dispatch_starvation_alert_cycles: int = 4
     recurrence_detection_threshold: int = 3
     recurrence_lookback_days: int = 14
     postgres_dsn: str | None = None
@@ -358,6 +359,11 @@ def load_settings(
             "BRIGADE_BLOCKER_RESOLUTION_ENABLED",
             dotenv,
             config.get("blocker_resolution_enabled", True),
+        ),
+        dispatch_starvation_alert_cycles=_env_int(
+            "BRIGADE_DISPATCH_STARVATION_ALERT_CYCLES",
+            dotenv,
+            config.get("dispatch_starvation_alert_cycles", 4),
         ),
         recurrence_detection_threshold=_env_int(
             "BRIGADE_RECURRENCE_DETECTION_THRESHOLD",

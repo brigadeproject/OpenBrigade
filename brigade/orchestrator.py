@@ -128,6 +128,7 @@ class OrchestrationConfig:
     rest_idle_cycles_threshold: int = 6
     rest_min_interval_seconds: int = 86_400
     blocker_resolution_enabled: bool = True
+    dispatch_starvation_alert_cycles: int = 4
     recurrence_detection_threshold: int = 3
     recurrence_lookback_days: int = 14
     hung_task_seconds: int = 1800
@@ -155,6 +156,7 @@ class OrchestrationConfig:
             rest_idle_cycles_threshold=settings.rest_idle_cycles_threshold,
             rest_min_interval_seconds=settings.rest_min_interval_seconds,
             blocker_resolution_enabled=settings.blocker_resolution_enabled,
+            dispatch_starvation_alert_cycles=settings.dispatch_starvation_alert_cycles,
             recurrence_detection_threshold=settings.recurrence_detection_threshold,
             recurrence_lookback_days=settings.recurrence_lookback_days,
             hung_task_seconds=settings.hung_task_seconds,
@@ -226,6 +228,7 @@ class OrchestrationConfig:
             "rest_window_end_utc": self.rest_window_end_utc,
             "rest_idle_cycles_threshold": self.rest_idle_cycles_threshold,
             "blocker_resolution_enabled": self.blocker_resolution_enabled,
+            "dispatch_starvation_alert_cycles": self.dispatch_starvation_alert_cycles,
             "recurrence_detection_threshold": self.recurrence_detection_threshold,
             "recurrence_lookback_days": self.recurrence_lookback_days,
             "hung_task_seconds": self.hung_task_seconds,
@@ -951,6 +954,79 @@ def _mission_continuation_idempotency_key(
         ).encode("utf-8")
     ).hexdigest()
     return f"orchestrator-proactive:v1:{digest}:{_idle_replan_bucket()}"
+
+
+# Skip reasons that indicate the queue is stuck rather than agents simply
+# being busy with real work: pinned by a blocked assignment, waiting on
+# dependencies that cannot dispatch, or targeting a nonexistent agent.
+STARVATION_SKIP_REASONS = frozenset(
+    {SKIP_AGENT_BLOCKED, SKIP_DEPENDENCIES_UNMET, SKIP_UNKNOWN_AGENT}
+)
+
+
+def _cycle_record_starved(record: dict[str, Any]) -> bool | None:
+    """Whether a persisted reasoning record describes a starved dispatch.
+
+    Returns None for records that are not orchestrator cycles (idle builder,
+    delegation events, ...) so the streak walk skips over them.
+    """
+    if record.get("source") != "orchestrator_cycle":
+        return None
+    if record.get("assigned"):
+        return False
+    reasons = record.get("skip_reasons")
+    if not isinstance(reasons, dict) or not reasons:
+        return False
+    return any(reason in STARVATION_SKIP_REASONS for reason in reasons.values())
+
+
+def evaluate_dispatch_starvation(
+    previous_reasoning: list[dict[str, Any]],
+    dispatch: CycleResult,
+    *,
+    threshold: int,
+) -> dict[str, Any]:
+    """Detect N consecutive cycles that assigned nothing while queued work was
+    stuck behind blocked agents, unmet dependencies, or unknown agents.
+
+    The streak is derived statelessly from the persisted reasoning records, so
+    it survives daemon restarts. Returns the streak plus an ``alert`` message
+    when the threshold is crossed (re-raised every ``threshold`` cycles while
+    the starvation persists). The 2026-07-04..06 ladder wedge starved dispatch
+    for ~44 hours and produced no signal — this is that signal.
+    """
+    stuck_reasons = sorted(
+        {
+            reason
+            for reason in dispatch.skip_reasons.values()
+            if reason in STARVATION_SKIP_REASONS
+        }
+    )
+    starved_now = not dispatch.assigned and bool(stuck_reasons)
+    if not starved_now:
+        return {"starved": False, "streak": 0, "alert": None}
+    streak = 1
+    for record in reversed(previous_reasoning):
+        state = _cycle_record_starved(record)
+        if state is None:
+            continue
+        if not state:
+            break
+        streak += 1
+    alert = None
+    if threshold > 0 and streak >= threshold and (streak - threshold) % threshold == 0:
+        stuck_count = sum(
+            1
+            for reason in dispatch.skip_reasons.values()
+            if reason in STARVATION_SKIP_REASONS
+        )
+        alert = (
+            f"dispatch starvation: {streak} consecutive cycles assigned no work "
+            f"while {stuck_count} queued assignment(s) were stuck "
+            f"({', '.join(stuck_reasons)}). The queue is not draining - check "
+            "blocked agents and dependency chains."
+        )
+    return {"starved": True, "streak": streak, "alert": alert}
 
 
 def _idempotency_seen(store: StateStore, idempotency_key: str) -> bool:
@@ -2541,6 +2617,25 @@ def run_full_cycle(
         assignment_history=store.assignment_history(),
     )
     _persist_dispatch_mutations(store, assignments, dispatch, original_assignments)
+
+    # Step 8.5: starvation watchdog — N consecutive zero-assignment cycles
+    # with stuck queued work is an operator-visible incident, not business as
+    # usual (the Jul 4-6 ladder wedge ran 44h before anyone noticed).
+    starvation = evaluate_dispatch_starvation(
+        previous_reasoning,
+        dispatch,
+        threshold=config.dispatch_starvation_alert_cycles,
+    )
+    sub_results["starvation"] = starvation
+    if starvation["alert"]:
+        store.add_alert(starvation["alert"])
+        LOGGER.warning(
+            "dispatch_starvation_detected",
+            extra={
+                "streak": starvation["streak"],
+                "threshold": config.dispatch_starvation_alert_cycles,
+            },
+        )
 
     # Step 2/11: agent states with idle-cycle tracking.
     agent_states = derive_agent_states(agents, assignments, existing=existing_states)

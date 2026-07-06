@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from brigade.orchestrator import (
+    CycleResult,
     ProactiveContinuationConfig,
     apply_orchestrator_actions,
     build_cycle_reasoning_record,
@@ -10,6 +11,7 @@ from brigade.orchestrator import (
     classify_cycle_outcome,
     derive_agent_states,
     deterministic_cycle,
+    evaluate_dispatch_starvation,
     evaluate_mission_continuation,
     evaluate_orchestrator_floor,
     run_orchestrator_escalation,
@@ -714,3 +716,112 @@ def test_blocked_agent_still_receives_its_own_failure_analysis():
 
     assert [item.assignment_id for item in result.assigned] == [analysis.assignment_id]
     assert unrelated in result.skipped
+
+
+# --- Dispatch starvation watchdog (Jul 4-6: 44h stall with no signal) -------------
+
+
+def _starved_cycle_record(**overrides):
+    record = {
+        "source": "orchestrator_cycle",
+        "assigned": [],
+        "skipped": ["task-1", "task-2"],
+        "skip_reasons": {"task-1": "agent_blocked", "task-2": "dependencies_unmet"},
+    }
+    record.update(overrides)
+    return record
+
+
+def _starved_dispatch() -> CycleResult:
+    return CycleResult(
+        assigned=[],
+        skipped=[],
+        alerts=[],
+        skip_reasons={"task-1": "agent_blocked", "task-2": "dependencies_unmet"},
+    )
+
+
+def test_starvation_streak_counts_consecutive_starved_cycles():
+    history = [_starved_cycle_record() for _ in range(3)]
+
+    result = evaluate_dispatch_starvation(history, _starved_dispatch(), threshold=4)
+
+    assert result["starved"] is True
+    assert result["streak"] == 4
+    assert result["alert"] is not None
+    assert "4 consecutive cycles" in result["alert"]
+    assert "agent_blocked" in result["alert"]
+
+
+def test_starvation_alert_waits_for_threshold_and_realerts_periodically():
+    dispatch = _starved_dispatch()
+
+    below = evaluate_dispatch_starvation(
+        [_starved_cycle_record() for _ in range(2)], dispatch, threshold=4
+    )
+    assert below["streak"] == 3
+    assert below["alert"] is None
+
+    at_double = evaluate_dispatch_starvation(
+        [_starved_cycle_record() for _ in range(7)], dispatch, threshold=4
+    )
+    assert at_double["streak"] == 8
+    assert at_double["alert"] is not None
+
+    between = evaluate_dispatch_starvation(
+        [_starved_cycle_record() for _ in range(5)], dispatch, threshold=4
+    )
+    assert between["streak"] == 6
+    assert between["alert"] is None
+
+
+def test_starvation_streak_broken_by_assigning_cycle():
+    history = [
+        _starved_cycle_record(),
+        _starved_cycle_record(assigned=["task-9"]),  # progress happened here
+        _starved_cycle_record(),
+    ]
+
+    result = evaluate_dispatch_starvation(history, _starved_dispatch(), threshold=4)
+
+    assert result["streak"] == 2  # current cycle + the most recent starved record
+
+
+def test_starvation_walk_skips_non_cycle_records():
+    history = [
+        _starved_cycle_record(),
+        {"source": "orchestrator_idle_task_builder", "queued_assignments": ["x"]},
+        {"source": "agent_delegate", "events": []},
+        _starved_cycle_record(),
+    ]
+
+    result = evaluate_dispatch_starvation(history, _starved_dispatch(), threshold=3)
+
+    assert result["streak"] == 3
+    assert result["alert"] is not None
+
+
+def test_busy_agents_are_not_starvation():
+    busy_dispatch = CycleResult(
+        assigned=[],
+        skipped=[],
+        alerts=[],
+        skip_reasons={"task-1": "agent_busy", "task-2": "rest_deferred"},
+    )
+    history = [_starved_cycle_record() for _ in range(10)]
+
+    result = evaluate_dispatch_starvation(history, busy_dispatch, threshold=2)
+
+    assert result["starved"] is False
+    assert result["streak"] == 0
+    assert result["alert"] is None
+
+
+def test_empty_queue_is_not_starvation():
+    quiet = CycleResult(assigned=[], skipped=[], alerts=[], skip_reasons={})
+    history = [_starved_cycle_record() for _ in range(10)]
+
+    result = evaluate_dispatch_starvation(history, quiet, threshold=2)
+
+    assert result["starved"] is False
+    assert result["alert"] is None
