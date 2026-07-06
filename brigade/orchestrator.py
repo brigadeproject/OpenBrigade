@@ -2480,15 +2480,18 @@ def _notify_operator_escalations(
     """Send one outbound operator notification per awaiting-human assignment.
 
     Covers every path that parks work for a human (ladder escalation, hung-task
-    escalation, goal-misalignment interrupt). De-duped via an idempotency event so
-    each assignment notifies the operator at most once.
+    escalation, goal-misalignment interrupt). De-duped via an idempotency event
+    so each assignment notifies the operator at most once — but only a delivery
+    that actually reached a channel burns the key; a skipped or failed delivery
+    is retried next cycle instead of silently counting as notified (v1 keys
+    recorded "notified" escalations that no channel ever carried).
     """
     notified: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     for assignment in store.assignments():
         if not assignment.awaiting_human:
             continue
-        key = f"operator-notify:v1:{assignment.assignment_id}"
+        key = f"operator-notify:v2:{assignment.assignment_id}"
         if _idempotency_seen(store, key):
             continue
         reason = (
@@ -2505,6 +2508,10 @@ def _notify_operator_escalations(
         notified.append(
             {"assignment_id": assignment.assignment_id, "delivery": delivery}
         )
+        if delivery["status"] != "sent":
+            # Nothing reached the operator: leave the idempotency key
+            # unrecorded so the next cycle retries the notification.
+            continue
         events.append(
             orchestration_event(
                 "operator_escalation_notified",

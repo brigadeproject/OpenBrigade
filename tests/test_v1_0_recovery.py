@@ -292,7 +292,7 @@ def test_notify_operator_dedupes_on_prior_record(tmp_path, monkeypatch):
     store = _store(tmp_path)
     blocked = _blocked(store, awaiting_human=True)
     store.add_orchestrator_reasoning(
-        {"note": f"operator-notify:v1:{blocked.assignment_id}"}
+        {"note": f"operator-notify:v2:{blocked.assignment_id}"}
     )
     sent: list = []
     monkeypatch.setattr(
@@ -540,3 +540,25 @@ def test_starvation_alert_reaches_orchestrator_chat(tmp_path):
         for message in chat
     )
     assert any("dispatch starvation" in alert for alert in store.alerts())
+
+
+def test_notify_operator_retries_when_no_channel_delivered(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    _blocked(store, awaiting_human=True)
+
+    # Both channels down: chat write raises, telegram unconfigured.
+    def broken_add_message(message):
+        raise RuntimeError("chat store unavailable")
+
+    monkeypatch.setattr(store, "add_message", broken_add_message)
+    first = _notify_operator_escalations(store, OrchestrationConfig())
+    assert first["notified"][0]["delivery"]["status"] == "failed"
+    # The failed delivery must not record the idempotency event.
+    assert first["events"] == []
+
+    # Channel recovers: the very next cycle delivers instead of staying
+    # silently "notified" forever (the v1 behavior that dropped escalations).
+    monkeypatch.undo()
+    second = _notify_operator_escalations(store, OrchestrationConfig())
+    assert second["notified"][0]["delivery"]["status"] == "sent"
+    assert len(store.messages("orchestrator")) == 1
