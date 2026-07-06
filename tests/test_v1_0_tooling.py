@@ -541,3 +541,151 @@ def test_create_subtasks_at_full_capacity_reports_children_instead_of_blocking(t
     assert result.ok
     assert "no capacity" in result.output
     assert "plan in motion" in result.output
+
+
+# --- Backlog dedup for delegated work (Jul 4 duplicate-task pileup) ---------------
+
+
+def _delegation_fixture(store):
+    chief = Agent(agent_id="chief", display_name="Chief", workspace_path="workspace-chief")
+    worker = Agent(agent_id="worker", display_name="Worker", workspace_path="workspace-worker")
+    store.add_agent(chief)
+    store.add_agent(worker)
+    parent = Assignment(
+        assignment="Plan the non-profit launch",
+        assigned_to="chief",
+        created_by="orchestrator",
+        source="orchestrator_idle_task_builder",
+    )
+    store.add_assignment(parent)
+    return chief, parent
+
+
+def test_delegate_skips_near_identical_queued_work(tmp_path):
+    store = _store(tmp_path)
+    chief, parent = _delegation_fixture(store)
+    existing = Assignment(
+        assignment=(
+            "Prepare all necessary documentation for the Rhode Island 501(c)(3) "
+            "non-profit, including articles of incorporation, bylaws, and initial filings."
+        ),
+        assigned_to="worker",
+        created_by="chief",
+        source="agent_delegate",
+    )
+    store.add_assignment(existing)
+    registry = default_tool_registry()
+    context = ToolContext(agent=chief, assignment=parent, store=store)
+
+    # The production duplicate: same work, lightly reworded.
+    result = registry.execute(
+        "delegate",
+        context,
+        {
+            "agent_id": "worker",
+            "assignment": (
+                "Prepare all legal documentation required for establishing the Rhode "
+                "Island 501(c)(3) non-profit, including articles of incorporation, "
+                "bylaws, and initial filings."
+            ),
+        },
+    )
+
+    assert result.ok
+    assert result.metadata["deduplicated"] is True
+    assert result.metadata["assignment_id"] == existing.assignment_id
+    worker_backlog = [
+        item for item in store.assignments() if item.assigned_to == "worker"
+    ]
+    assert len(worker_backlog) == 1
+
+
+def test_delegate_still_creates_genuinely_different_work(tmp_path):
+    store = _store(tmp_path)
+    chief, parent = _delegation_fixture(store)
+    store.add_assignment(
+        Assignment(
+            assignment=(
+                "Prepare all necessary documentation for the Rhode Island 501(c)(3) "
+                "non-profit, including articles of incorporation, bylaws, and initial filings."
+            ),
+            assigned_to="worker",
+            created_by="chief",
+            source="agent_delegate",
+        )
+    )
+    registry = default_tool_registry()
+    context = ToolContext(agent=chief, assignment=parent, store=store)
+
+    result = registry.execute(
+        "delegate",
+        context,
+        {
+            "agent_id": "worker",
+            "assignment": (
+                "Design a technical architecture specification for the Sovereignty "
+                "Server system, including hardware requirements and deployment protocols."
+            ),
+        },
+    )
+
+    assert result.ok
+    assert not (result.metadata or {}).get("deduplicated")
+    worker_backlog = [
+        item for item in store.assignments() if item.assigned_to == "worker"
+    ]
+    assert len(worker_backlog) == 2
+
+
+def test_create_subtasks_reuses_duplicate_for_dependency_chain(tmp_path):
+    store = _store(tmp_path)
+    chief, parent = _delegation_fixture(store)
+    existing = Assignment(
+        assignment=(
+            "Research Rhode Island 501(c)(3) non-profit formation requirements, "
+            "including articles of incorporation, bylaws, and governance rules."
+        ),
+        assigned_to="worker",
+        created_by="chief",
+        source="agent_delegate",
+    )
+    store.add_assignment(existing)
+    registry = default_tool_registry()
+    context = ToolContext(agent=chief, assignment=parent, store=store)
+
+    result = registry.execute(
+        "create_subtasks",
+        context,
+        {
+            "subtasks": [
+                {
+                    "agent_id": "worker",
+                    "assignment": (
+                        "Research Rhode Island's 501(c)(3) non-profit formation "
+                        "requirements, including articles of incorporation, bylaws, "
+                        "and state governance rules."
+                    ),
+                },
+                {
+                    "agent_id": "worker",
+                    "assignment": (
+                        "Draft organizational bylaws and a governance structure from "
+                        "the research findings, ensuring compliance with regulations."
+                    ),
+                    "depends_on_previous": True,
+                },
+            ]
+        },
+    )
+
+    assert result.ok
+    entries = result.metadata["created"]
+    assert entries[0]["deduplicated"] is True
+    assert entries[0]["assignment_id"] == existing.assignment_id
+    # The second subtask is new and depends on the reused assignment, not a copy.
+    assert entries[1].get("deduplicated") is None
+    assert entries[1]["dependency_ids"] == [existing.assignment_id]
+    worker_backlog = [
+        item for item in store.assignments() if item.assigned_to == "worker"
+    ]
+    assert len(worker_backlog) == 2

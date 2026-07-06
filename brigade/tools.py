@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import urllib.error
 import urllib.request
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from brigade.schemas import Agent, Assignment, Priority
+from brigade.schemas import Agent, Assignment, AssignmentStatus, Priority
 from brigade.store import StateStore
 
 
@@ -356,6 +357,55 @@ def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     )
 
 
+# Delegated tasks carry no idempotency key, so a planner re-run cheerfully
+# re-delegates the same work: during the Jul 4 observation window one agent
+# queued four near-identical copies of a task behind a pinned teammate.
+# Near-duplicate detection is token overlap (Jaccard) over the assignment
+# text against the target agent's undone backlog.
+_BACKLOG_DEDUP_THRESHOLD = 0.6
+_BACKLOG_DEDUP_STOPWORDS = frozenset(
+    "and the for with that this into from your each are was all".split()
+)
+_UNDONE_STATUSES = frozenset(
+    {
+        AssignmentStatus.QUEUED,
+        AssignmentStatus.ASSIGNED,
+        AssignmentStatus.WORKING,
+        AssignmentStatus.BLOCKED,
+    }
+)
+
+
+def _dedup_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 2 and token not in _BACKLOG_DEDUP_STOPWORDS
+    }
+
+
+def _find_backlog_duplicate(
+    store: StateStore, target_agent_id: str, text: str
+) -> Assignment | None:
+    """An undone assignment for ``target_agent_id`` whose text is
+    near-identical to ``text``, or None."""
+    tokens = _dedup_tokens(text)
+    if not tokens:
+        return None
+    for item in store.assignments():
+        if item.assigned_to != target_agent_id:
+            continue
+        if item.status not in _UNDONE_STATUSES:
+            continue
+        other = _dedup_tokens(item.assignment)
+        if not other:
+            continue
+        overlap = len(tokens & other) / len(tokens | other)
+        if overlap >= _BACKLOG_DEDUP_THRESHOLD:
+            return item
+    return None
+
+
 def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     from brigade.orchestrator import orchestration_event, record_orchestration_events
 
@@ -373,8 +423,25 @@ def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         priority = _priority_from_arguments(arguments)
     except ValueError as exc:
         return ToolResult(False, str(exc))
+    assignment_text = _required_text(arguments, "assignment")
+    duplicate = _find_backlog_duplicate(context.store, target_agent_id, assignment_text)
+    if duplicate is not None:
+        return ToolResult(
+            True,
+            (
+                f"skipped duplicate delegation: assignment "
+                f"{duplicate.assignment_id} already covers near-identical work "
+                f"for {target_agent_id} (status: {duplicate.status.value}). "
+                "Treat that assignment as your delegation in motion."
+            ),
+            {
+                "assignment_id": duplicate.assignment_id,
+                "status": duplicate.status.value,
+                "deduplicated": True,
+            },
+        )
     assignment = Assignment(
-        assignment=_required_text(arguments, "assignment"),
+        assignment=assignment_text,
         assigned_to=target_agent_id,
         created_by=context.agent.agent_id,
         source="agent_delegate",
@@ -493,6 +560,24 @@ def _create_subtasks(context: ToolContext, arguments: dict[str, Any]) -> ToolRes
             if item["depends_on_previous"] and previous_assignment_id
             else []
         )
+        duplicate = _find_backlog_duplicate(
+            context.store, str(item["agent_id"]), str(item["assignment"])
+        )
+        if duplicate is not None:
+            # Reuse the existing assignment: it anchors the dependency chain
+            # for subsequent subtasks instead of queueing a near-identical
+            # copy behind it.
+            previous_assignment_id = duplicate.assignment_id
+            created.append(
+                {
+                    "assignment_id": duplicate.assignment_id,
+                    "agent_id": item["agent_id"],
+                    "dependency_ids": list(duplicate.dependency_ids),
+                    "status": duplicate.status.value,
+                    "deduplicated": True,
+                }
+            )
+            continue
         assignment = Assignment(
             assignment=str(item["assignment"]),
             assigned_to=str(item["agent_id"]),
