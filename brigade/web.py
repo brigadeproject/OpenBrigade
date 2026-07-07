@@ -14,9 +14,12 @@ from brigade.auth import AuthResult, issue_token, verify_token
 from brigade.config import Settings, load_settings
 from brigade.connectors import (
     ConnectorRateLimiter,
+    ExternalIdentityAlreadyDecidedError,
     HttpPost,
     RedisConnectorRateLimiter,
+    UnknownExternalIdentityError,
     connector_audit_record,
+    decide_external_identity,
     google_chat_reply_sender,
     parse_allowlist,
     parse_google_chat_event,
@@ -43,6 +46,8 @@ from brigade.schemas import (
 from brigade.services import (
     OPS_ROOM_ROOMS,
     AssignmentActionError,
+    ProposalAlreadyDecidedError,
+    UnknownProposalError,
     build_chat_payload,
     build_cockpit_payload,
     build_hierarchy_payload,
@@ -50,6 +55,7 @@ from brigade.services import (
     build_orchestration_payload,
     build_settings_payload,
     cancel_assignment,
+    decide_proposal,
     delegate_from_crew_chief,
     get_runtime_overrides,
     lookup_assignment,
@@ -320,6 +326,83 @@ def create_app(
     async def orchestration(current: AuthResult = auth_dependency) -> dict[str, object]:
         require("status:read", current)
         return build_orchestration_payload(store)
+
+    @app.get("/api/proposals")
+    async def proposals(
+        kind: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+        current: AuthResult = auth_dependency,
+    ) -> list[dict[str, object]]:
+        require("proposal:read", current)
+        records = store.proposals(kind=kind, status=status)
+        if limit is not None and limit > 0:
+            records = records[-limit:]
+        return records
+
+    @app.post("/api/proposals/{proposal_id}/decision")
+    async def decide_proposal_route(
+        proposal_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("proposal:write", current)
+        decision = str(payload.get("decision") or "").strip()
+        try:
+            return decide_proposal(
+                store,
+                proposal_id=proposal_id,
+                decision=decision,
+                decided_by=user.username if user else "web",
+                reason=payload.get("reason"),
+            )
+        except UnknownProposalError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ProposalAlreadyDecidedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/connectors/approvals")
+    async def connector_approvals(
+        provider: str | None = None,
+        status: str | None = None,
+        current: AuthResult = auth_dependency,
+    ) -> list[dict[str, object]]:
+        require("admin", current)
+        return store.external_identities(provider=provider, status=status)
+
+    @app.post("/api/connectors/approvals/decision")
+    async def decide_connector_approval(
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("admin", current)
+        provider = str(payload.get("provider") or "").strip()
+        external_user_id = str(payload.get("external_user_id") or "").strip()
+        decision = str(payload.get("decision") or "").strip()
+        reason = payload.get("reason")
+        if not provider or not external_user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="provider and external_user_id are required",
+            )
+        try:
+            return decide_external_identity(
+                store,
+                provider=provider,
+                external_user_id=external_user_id,
+                decision=decision,
+                decided_by=user.username if user else "web",
+                username=str(payload.get("username") or "").strip() or None,
+                reason=reason,
+            )
+        except UnknownExternalIdentityError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ExternalIdentityAlreadyDecidedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/models")
     async def models(current: AuthResult = auth_dependency) -> dict[str, object]:

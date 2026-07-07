@@ -462,6 +462,64 @@ def google_chat_reply_sender() -> OutboundSender:
     return send
 
 
+class UnknownExternalIdentityError(ValueError):
+    """The referenced external identity has never contacted the system."""
+
+
+class ExternalIdentityAlreadyDecidedError(ValueError):
+    """The referenced external identity has already left the ``pending`` state."""
+
+
+def decide_external_identity(
+    store: StateStore,
+    *,
+    provider: str,
+    external_user_id: str,
+    decision: str,
+    decided_by: str,
+    username: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Decide a *pending* identity request, refusing unknown or decided records.
+
+    The lower-level ``approve_external_identity`` / ``reject_external_identity``
+    helpers stay permissive on purpose (the CLI uses them to pre-approve
+    identities before first contact); interactive surfaces such as the web
+    workbench go through this guard so stale views cannot silently overwrite an
+    earlier decision or fabricate identities.
+    """
+    if decision not in {"approved", "rejected"}:
+        raise ValueError("decision must be approved or rejected")
+    existing = store.external_identity(provider, external_user_id)
+    if existing is None:
+        raise UnknownExternalIdentityError(
+            f"unknown external identity: {provider}/{external_user_id}"
+        )
+    status = existing.get("status")
+    if status != "pending":
+        raise ExternalIdentityAlreadyDecidedError(
+            f"external identity {provider}/{external_user_id} is already {status}"
+        )
+    if decision == "approved":
+        if not username:
+            raise ValueError("username is required")
+        return approve_external_identity(
+            store,
+            provider=provider,
+            external_user_id=external_user_id,
+            username=username,
+            decided_by=decided_by,
+            reason=reason,
+        )
+    return reject_external_identity(
+        store,
+        provider=provider,
+        external_user_id=external_user_id,
+        decided_by=decided_by,
+        reason=reason,
+    )
+
+
 def approve_external_identity(
     store: StateStore,
     *,

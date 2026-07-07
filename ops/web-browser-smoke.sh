@@ -90,19 +90,25 @@ if [[ -n "${BRIGADE_TOKEN:-}" ]]; then
 else
   dump_dom "$BASE_URL/?view=cockpit" "1440,1000" "$OUT_DIR/cockpit-dom.html"
   dump_dom "$BASE_URL/?view=ops" "1440,1000" "$OUT_DIR/ops-dom.html"
+  dump_dom "$BASE_URL/?view=proposals" "1440,1000" "$OUT_DIR/proposals-dom.html"
 
   take_screenshot "$BASE_URL/?view=cockpit" "1440,1000" "$OUT_DIR/cockpit-desktop.png"
   take_screenshot "$BASE_URL/?view=ops" "1440,1000" "$OUT_DIR/ops-desktop.png"
+  take_screenshot "$BASE_URL/?view=proposals" "1440,1000" "$OUT_DIR/proposals-desktop.png"
   take_screenshot "$BASE_URL/?view=cockpit" "390,844" "$OUT_DIR/cockpit-mobile.png"
 fi
 
 assert_contains "OpenBrigade" "$OUT_DIR/cockpit-dom.html"
 assert_contains "Cockpit" "$OUT_DIR/cockpit-dom.html"
-assert_contains "Models Available" "$OUT_DIR/cockpit-dom.html"
+# "Models Available" moved to the Telemetry tab; assert cockpit-only panels.
+assert_contains "Task Queue" "$OUT_DIR/cockpit-dom.html"
+assert_contains "Talk to Orchestrator" "$OUT_DIR/cockpit-dom.html"
 assert_contains "Ops Room" "$OUT_DIR/ops-dom.html"
+assert_contains "Approval Workbench" "$OUT_DIR/proposals-dom.html"
 
 assert_image_nonblank "$OUT_DIR/cockpit-desktop.png"
 assert_image_nonblank "$OUT_DIR/ops-desktop.png"
+assert_image_nonblank "$OUT_DIR/proposals-desktop.png"
 assert_image_nonblank "$OUT_DIR/cockpit-mobile.png"
 
 echo "web browser smoke passed: $OUT_DIR"

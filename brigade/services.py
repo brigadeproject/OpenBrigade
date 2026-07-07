@@ -15,7 +15,6 @@ from brigade.orchestrator import (
     apply_orchestrator_actions,
     build_orchestration_telemetry,
     orchestration_event,
-    parse_orchestrator_response,
     record_orchestration_events,
 )
 from brigade.prompt_floors import (
@@ -711,6 +710,14 @@ def _resolve_chat_proposal(
     }
 
 
+class UnknownProposalError(ValueError):
+    """The referenced proposal does not exist."""
+
+
+class ProposalAlreadyDecidedError(ValueError):
+    """The referenced proposal has already left the ``proposed`` state."""
+
+
 def decide_proposal(
     store: StateStore,
     *,
@@ -723,9 +730,11 @@ def decide_proposal(
         raise ValueError(f"unsupported proposal decision: {decision}")
     proposal = store.find_proposal(proposal_id)
     if proposal is None:
-        raise ValueError(f"unknown proposal: {proposal_id}")
+        raise UnknownProposalError(f"unknown proposal: {proposal_id}")
     if proposal.get("status") != "proposed":
-        raise ValueError(f"proposal {proposal_id} is already {proposal.get('status')}")
+        raise ProposalAlreadyDecidedError(
+            f"proposal {proposal_id} is already {proposal.get('status')}"
+        )
     proposal["status"] = decision
     proposal["decided_by"] = decided_by
     proposal["decided_at"] = utc_now_iso()

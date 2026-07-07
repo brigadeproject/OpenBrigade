@@ -151,11 +151,15 @@ try {
   await captureView(cdp, "/?view=cockpit", "1440,1000", "cockpit-dom.html", "cockpit-desktop.png", [
     "OpenBrigade",
     "Cockpit",
-    "Models Available",
+    "Task Queue",
   ]);
   await captureView(cdp, "/?view=ops", "1440,1000", "ops-dom.html", "ops-desktop.png", [
     "OpenBrigade",
     "Ops Room",
+  ]);
+  await captureView(cdp, "/?view=proposals", "1440,1000", "proposals-dom.html", "proposals-desktop.png", [
+    "OpenBrigade",
+    "Approval Workbench",
   ]);
   await captureView(cdp, "/?view=cockpit", "390,844", null, "cockpit-mobile.png", [
     "OpenBrigade",

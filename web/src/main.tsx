@@ -19,6 +19,25 @@ const OPS_ROOM_FALLBACK_ROOMS: OpsRoomRoom[] = [
   },
 ];
 
+const TAB_VIEWS = [
+  { id: "cockpit", label: "Cockpit" },
+  { id: "brigade", label: "Brigade" },
+  { id: "proposals", label: "Proposals" },
+  { id: "telemetry", label: "Telemetry" },
+] as const;
+
+type AppView = (typeof TAB_VIEWS)[number]["id"] | "manual";
+
+function coerceView(value: string | null): AppView | null {
+  if (value === "ops") {
+    return "brigade";
+  }
+  if (value === "manual") {
+    return "manual";
+  }
+  return TAB_VIEWS.some((tab) => tab.id === value) ? (value as AppView) : null;
+}
+
 type User = {
   username: string;
   role: "owner" | "operator" | "observer";
@@ -281,6 +300,34 @@ type ChatPayload = {
   agents: unknown[];
 };
 
+type ProposalRecord = {
+  proposal_id: string;
+  kind: "efficiency" | "tool_request" | "rest_insight" | string;
+  status: "proposed" | "approved" | "rejected" | "implemented" | "expired" | string;
+  title: string;
+  agent_id?: string | null;
+  team_id?: string | null;
+  details: Record<string, unknown>;
+  idempotency_key?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  decided_by?: string | null;
+  decided_at?: string | null;
+};
+
+type ConnectorApprovalRecord = {
+  provider: string;
+  external_user_id: string;
+  username?: string | null;
+  status: "pending" | "approved" | "rejected" | string;
+  reason?: string | null;
+  redacted_metadata?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+  decided_at?: string | null;
+  decided_by?: string | null;
+};
+
 type OrchestratorMarkdownResult = {
   status: string;
   response_message_id: string | null;
@@ -326,31 +373,9 @@ class ApiError extends Error {
   }
 }
 
-function initialView(): "cockpit" | "brigade" | "telemetry" | "manual" {
+function initialView(): AppView {
   const requested = new URLSearchParams(window.location.search).get("view");
-  if (requested === "brigade" || requested === "ops") {
-    return "brigade";
-  }
-  if (requested === "telemetry") {
-    return "telemetry";
-  }
-  if (requested === "manual") {
-    return "manual";
-  }
-  if (requested === "cockpit") {
-    return "cockpit";
-  }
-  const saved = localStorage.getItem("brigade_view");
-  if (saved === "brigade" || saved === "ops") {
-    return "brigade";
-  }
-  if (saved === "telemetry") {
-    return "telemetry";
-  }
-  if (saved === "manual") {
-    return "manual";
-  }
-  return "cockpit";
+  return coerceView(requested) ?? coerceView(localStorage.getItem("brigade_view")) ?? "cockpit";
 }
 
 function App() {
@@ -361,6 +386,8 @@ function App() {
   const [settings, setSettings] = useState<SettingsPayload | null>(null);
   const [models, setModels] = useState<ModelInventory | null>(null);
   const [snapshot, setSnapshot] = useState<OpsRoomSnapshot | null>(null);
+  const [proposals, setProposals] = useState<ProposalRecord[]>([]);
+  const [connectorApprovals, setConnectorApprovals] = useState<ConnectorApprovalRecord[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [agentModelSelections, setAgentModelSelections] = useState<Record<string, ModelRoute>>({});
   const [orchestratorModel, setOrchestratorModel] = useState<ModelRoute | null>(null);
@@ -368,7 +395,7 @@ function App() {
   const [streamStatus, setStreamStatus] = useState("connecting");
   const [authClock, setAuthClock] = useState(Date.now());
   const [activePanel, setActivePanel] = useState<"tasks" | "chat" | "goals">("tasks");
-  const [view, setView] = useState<"cockpit" | "brigade" | "telemetry" | "manual">(() => initialView());
+  const [view, setView] = useState<AppView>(() => initialView());
   const [taskDialogOpen, setTaskDialogOpen] = useState(false);
   const [taskDialogDraft, setTaskDialogDraft] = useState<TaskDialogDraft | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -453,6 +480,33 @@ function App() {
     }
   }, [api, selectedAgentId]);
 
+  const loadProposals = useCallback(async () => {
+    // The proposal log is append-only; fetch every actionable record but only a
+    // bounded window of decided history instead of the whole table.
+    const [pending, recent] = await Promise.all([
+      api<ProposalRecord[]>("/api/proposals?status=proposed"),
+      api<ProposalRecord[]>(`/api/proposals?limit=${PROPOSAL_HISTORY_LIMIT}`),
+    ]);
+    const merged = new Map<string, ProposalRecord>();
+    for (const record of [...pending, ...recent]) {
+      merged.set(record.proposal_id, record);
+    }
+    setProposals(Array.from(merged.values()));
+  }, [api]);
+
+  const loadConnectorApprovals = useCallback(async () => {
+    try {
+      const next = await api<ConnectorApprovalRecord[]>("/api/connectors/approvals");
+      setConnectorApprovals(next);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 403) {
+        setConnectorApprovals([]);
+        return;
+      }
+      throw error;
+    }
+  }, [api]);
+
   const refreshAll = useCallback(async () => {
     if (tokenExpired) {
       setAuth(null);
@@ -464,8 +518,27 @@ function App() {
     if (!authResult) {
       return;
     }
-    await Promise.all([loadCockpit(), loadSettings(), loadModels(), loadSnapshot()]);
-  }, [loadAuth, loadCockpit, loadModels, loadSettings, loadSnapshot, tokenExpired]);
+    // Gate the admin-only feed on the fresh auth payload (state-derived can()
+    // is one render behind here) instead of paying a guaranteed 403 per refresh.
+    const isAdmin = (authResult.permissions || []).includes("admin");
+    await Promise.all([
+      loadCockpit(),
+      loadSettings(),
+      loadModels(),
+      loadSnapshot(),
+      loadProposals(),
+      isAdmin ? loadConnectorApprovals() : Promise.resolve(setConnectorApprovals([])),
+    ]);
+  }, [
+    loadAuth,
+    loadCockpit,
+    loadConnectorApprovals,
+    loadModels,
+    loadProposals,
+    loadSettings,
+    loadSnapshot,
+    tokenExpired,
+  ]);
 
   useEffect(() => {
     localStorage.setItem("brigade_token", token);
@@ -714,6 +787,16 @@ function App() {
             onSettingsChange={setSettings}
             setStatus={setStatus}
           />
+        ) : view === "proposals" ? (
+          <ProposalsView
+            proposals={proposals}
+            connectorApprovals={connectorApprovals}
+            canDecideProposals={can("proposal:write")}
+            canManageConnectors={can("admin")}
+            api={api}
+            onRefresh={refreshAll}
+            setStatus={setStatus}
+          />
         ) : view === "manual" ? (
           <ManualOrchestrationView
             assignments={snapshot?.assignments || cockpit?.tasks?.all || []}
@@ -886,8 +969,8 @@ function TabStrip({
   onRefresh,
   warnings,
 }: {
-  view: "cockpit" | "brigade" | "telemetry" | "manual";
-  onSelect: (view: "cockpit" | "brigade" | "telemetry" | "manual") => void;
+  view: AppView;
+  onSelect: (view: AppView) => void;
   token: string;
   onTokenChange: (token: string) => void;
   onRefresh: () => void;
@@ -895,27 +978,16 @@ function TabStrip({
 }) {
   return (
     <div className="ob-tabstrip">
-      <button
-        type="button"
-        className={`ob-tab ${view === "cockpit" ? "active" : ""}`}
-        onClick={() => onSelect("cockpit")}
-      >
-        Cockpit
-      </button>
-      <button
-        type="button"
-        className={`ob-tab ${view === "brigade" ? "active" : ""}`}
-        onClick={() => onSelect("brigade")}
-      >
-        Brigade
-      </button>
-      <button
-        type="button"
-        className={`ob-tab ${view === "telemetry" ? "active" : ""}`}
-        onClick={() => onSelect("telemetry")}
-      >
-        Telemetry
-      </button>
+      {TAB_VIEWS.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          className={`ob-tab ${view === tab.id ? "active" : ""}`}
+          onClick={() => onSelect(tab.id)}
+        >
+          {tab.label}
+        </button>
+      ))}
       <span className="ob-tab disabled" aria-disabled="true">Knowledge Base</span>
       <span className="ob-tab-add" aria-hidden="true">+</span>
       <div className="ob-tab-right">
@@ -1393,6 +1465,547 @@ function TelemetryView({
       </div>
     </section>
   );
+}
+
+const PROPOSAL_HISTORY_LIMIT = 200;
+
+// Baseline filter values; values seen in live records are merged in by
+// filterOptions so new backend kinds/statuses stay reachable without a
+// frontend release.
+const PROPOSAL_KINDS = ["efficiency", "tool_request", "rest_insight"];
+const PROPOSAL_STATUSES = ["proposed", "approved", "rejected", "implemented", "expired"];
+const CONNECTOR_STATUSES = ["pending", "approved", "rejected"];
+
+function filterOptions(known: string[], seen: (string | null | undefined)[]) {
+  const extras = Array.from(new Set(seen))
+    .filter((value): value is string => Boolean(value) && !known.includes(value as string))
+    .sort();
+  return ["all", ...known, ...extras];
+}
+
+function ProposalsView({
+  proposals,
+  connectorApprovals,
+  canDecideProposals,
+  canManageConnectors,
+  api,
+  onRefresh,
+  setStatus,
+}: {
+  proposals: ProposalRecord[];
+  connectorApprovals: ConnectorApprovalRecord[];
+  canDecideProposals: boolean;
+  canManageConnectors: boolean;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  onRefresh: () => Promise<void>;
+  setStatus: (status: string) => void;
+}) {
+  const [section, setSection] = useState<"proposals" | "connectors">("proposals");
+  const [proposalKind, setProposalKind] = useState("all");
+  const [proposalStatus, setProposalStatus] = useState("proposed");
+  const [connectorProvider, setConnectorProvider] = useState("all");
+  const [connectorStatus, setConnectorStatus] = useState("pending");
+  const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null);
+  const [selectedConnectorKey, setSelectedConnectorKey] = useState<string | null>(null);
+  const [proposalReason, setProposalReason] = useState("");
+  const [connectorReason, setConnectorReason] = useState("");
+  const [connectorUsername, setConnectorUsername] = useState("");
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  const proposalKindOptions = useMemo(
+    () => filterOptions(PROPOSAL_KINDS, proposals.map((proposal) => proposal.kind)),
+    [proposals],
+  );
+  const proposalStatusOptions = useMemo(
+    () => filterOptions(PROPOSAL_STATUSES, proposals.map((proposal) => proposal.status)),
+    [proposals],
+  );
+  const connectorStatusOptions = useMemo(
+    () => filterOptions(CONNECTOR_STATUSES, connectorApprovals.map((record) => record.status)),
+    [connectorApprovals],
+  );
+  const connectorProviders = useMemo(
+    () => filterOptions([], connectorApprovals.map((record) => record.provider)),
+    [connectorApprovals],
+  );
+
+  const filteredProposals = useMemo(() => {
+    return proposals
+      .filter((proposal) => proposalKind === "all" || proposal.kind === proposalKind)
+      .filter((proposal) => proposalStatus === "all" || proposal.status === proposalStatus)
+      .sort(compareApprovalRecords);
+  }, [proposalKind, proposalStatus, proposals]);
+
+  const filteredConnectors = useMemo(() => {
+    return connectorApprovals
+      .filter((record) => connectorProvider === "all" || record.provider === connectorProvider)
+      .filter((record) => connectorStatus === "all" || record.status === connectorStatus)
+      .sort(compareApprovalRecords);
+  }, [connectorApprovals, connectorProvider, connectorStatus]);
+
+  // Only the user's explicit click is kept in state; when the clicked record
+  // leaves the filtered list the first row becomes the selection at render time.
+  const selectedProposal =
+    filteredProposals.find((proposal) => proposal.proposal_id === selectedProposalId) ??
+    filteredProposals[0] ??
+    null;
+  const selectedConnector =
+    filteredConnectors.find((record) => connectorKey(record) === selectedConnectorKey) ??
+    filteredConnectors[0] ??
+    null;
+  const effectiveProposalId = selectedProposal?.proposal_id ?? null;
+  const effectiveConnectorKey = selectedConnector ? connectorKey(selectedConnector) : null;
+
+  useEffect(() => {
+    setProposalReason("");
+  }, [effectiveProposalId]);
+
+  // Keyed on the stable identity key, not the record object: refreshes replace
+  // the array objects and must not wipe a half-typed username/reason.
+  useEffect(() => {
+    setConnectorReason("");
+    setConnectorUsername(selectedConnector?.username || "");
+  }, [effectiveConnectorKey]);
+
+  const runDecision = async (busy: string, request: () => Promise<string>) => {
+    setBusyKey(busy);
+    try {
+      const message = await request();
+      setStatus(message);
+      try {
+        await onRefresh();
+      } catch (refreshError) {
+        // The decision persisted; don't let a refresh hiccup report it as failed.
+        setStatus(`${message} (refresh failed: ${errorMessage(refreshError)})`);
+      }
+    } catch (error) {
+      setStatus(errorMessage(error));
+      if (error instanceof ApiError && (error.status === 404 || error.status === 409)) {
+        // The record changed under us; reload so stale rows stop offering actions.
+        void onRefresh().catch(() => undefined);
+      }
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const decideProposalRecord = (proposal: ProposalRecord, decision: "approved" | "rejected") =>
+    runDecision(`proposal:${proposal.proposal_id}:${decision}`, async () => {
+      const result = await api<ProposalRecord>(
+        `/api/proposals/${encodeURIComponent(proposal.proposal_id)}/decision`,
+        {
+          method: "POST",
+          json: { decision, reason: proposalReason.trim() || undefined },
+        },
+      );
+      return `Proposal ${result.proposal_id.slice(0, 8)} ${result.status}`;
+    });
+
+  const decideConnectorRecord = (
+    record: ConnectorApprovalRecord,
+    decision: "approved" | "rejected",
+  ) => {
+    if (decision === "approved" && !connectorUsername.trim()) {
+      setStatus("Username is required to approve a connector identity");
+      return;
+    }
+    return runDecision(`connector:${connectorKey(record)}:${decision}`, async () => {
+      const result = await api<ConnectorApprovalRecord>("/api/connectors/approvals/decision", {
+        method: "POST",
+        json: {
+          provider: record.provider,
+          external_user_id: record.external_user_id,
+          decision,
+          username: decision === "approved" ? connectorUsername.trim() : undefined,
+          reason: connectorReason.trim() || undefined,
+        },
+      });
+      return `${result.provider} identity ${result.external_user_id} ${result.status}`;
+    });
+  };
+
+  const pendingProposals = proposals.filter((proposal) => proposal.status === "proposed").length;
+  const pendingConnectors = connectorApprovals.filter((record) => record.status === "pending").length;
+
+  return (
+    <section className="ob-proposals">
+      <div className="ob-proposals-head">
+        <div>
+          <span className="ob-panel-title">Approval Workbench</span>
+          <div className="ob-proposals-counts">
+            <span className="ob-badge warn">{pendingProposals} proposals</span>
+            <span className="ob-badge warn">{pendingConnectors} identities</span>
+          </div>
+        </div>
+        <div className="segmented ob-proposals-switch">
+          <button
+            type="button"
+            className={section === "proposals" ? "active" : ""}
+            onClick={() => setSection("proposals")}
+          >
+            Agent Proposals
+          </button>
+          <button
+            type="button"
+            className={section === "connectors" ? "active" : ""}
+            onClick={() => setSection("connectors")}
+          >
+            Connector Approvals
+          </button>
+        </div>
+      </div>
+
+      {section === "proposals" ? (
+        <ApprovalSection
+          listTitle="Agent Proposals"
+          detailTitle="Proposal Detail"
+          emptyList="No matching proposals."
+          emptyDetail="No proposal selected."
+          filters={
+            <>
+              <select value={proposalStatus} onChange={(event) => setProposalStatus(event.target.value)}>
+                {proposalStatusOptions.map((status) => (
+                  <option key={status} value={status}>{status}</option>
+                ))}
+              </select>
+              <select value={proposalKind} onChange={(event) => setProposalKind(event.target.value)}>
+                {proposalKindOptions.map((kind) => (
+                  <option key={kind} value={kind}>{kind.replace(/_/g, " ")}</option>
+                ))}
+              </select>
+            </>
+          }
+          rows={filteredProposals.map((proposal) => ({
+            key: proposal.proposal_id,
+            mono: proposal.proposal_id.slice(0, 8),
+            status: proposal.status,
+            title: proposal.title,
+            meta: `${proposal.kind.replace(/_/g, " ")} · ${proposal.agent_id || "unassigned"}`,
+          }))}
+          selectedKey={effectiveProposalId}
+          onSelectKey={setSelectedProposalId}
+          selectedStatus={selectedProposal?.status ?? null}
+          detail={
+            selectedProposal && (
+              <div className="ob-proposals-detail">
+                <h2>{selectedProposal.title}</h2>
+                <div className="ob-proposals-meta-grid">
+                  <span>ID</span><span className="ob-mono-id">{selectedProposal.proposal_id}</span>
+                  <span>Kind</span><span>{selectedProposal.kind}</span>
+                  <span>Agent</span><span>{selectedProposal.agent_id || "-"}</span>
+                  <span>Team</span><span>{selectedProposal.team_id || "-"}</span>
+                  <span>Created</span><span>{formatTime(selectedProposal.created_at)}</span>
+                  <span>Updated</span><span>{formatTime(selectedProposal.updated_at)}</span>
+                  <span>Idempotency</span><span className="ob-mono-id">{selectedProposal.idempotency_key || "-"}</span>
+                  <span>Decision</span>
+                  <span>
+                    {selectedProposal.decided_by
+                      ? `${selectedProposal.decided_by} · ${formatTime(selectedProposal.decided_at)}`
+                      : "-"}
+                  </span>
+                </div>
+                <ApprovalEffect record={selectedProposal} />
+                <JsonDetails title="Details" value={selectedProposal.details} />
+                <DecisionActions
+                  decidable={selectedProposal.status === "proposed"}
+                  busyKey={busyKey}
+                  keyBase={`proposal:${selectedProposal.proposal_id}`}
+                  canDecide={canDecideProposals}
+                  permission="proposal:write"
+                  permissionAction="proposal decisions are disabled"
+                  onDecide={(decision) => void decideProposalRecord(selectedProposal, decision)}
+                >
+                  <textarea
+                    value={proposalReason}
+                    disabled={selectedProposal.status !== "proposed" || busyKey !== null}
+                    onChange={(event) => setProposalReason(event.target.value)}
+                    placeholder="Decision reason"
+                  />
+                </DecisionActions>
+              </div>
+            )
+          }
+        />
+      ) : (
+        <ApprovalSection
+          listTitle="Connector Identities"
+          detailTitle="Identity Detail"
+          emptyList="No matching connector identities."
+          emptyDetail="No connector identity selected."
+          notice={
+            !canManageConnectors && (
+              <PermissionNotice allowed={canManageConnectors} permission="admin" action="connector approvals are hidden" />
+            )
+          }
+          filters={
+            <>
+              <select value={connectorStatus} onChange={(event) => setConnectorStatus(event.target.value)}>
+                {connectorStatusOptions.map((status) => (
+                  <option key={status} value={status}>{status}</option>
+                ))}
+              </select>
+              <select value={connectorProvider} onChange={(event) => setConnectorProvider(event.target.value)}>
+                {connectorProviders.map((provider) => (
+                  <option key={provider} value={provider}>{provider}</option>
+                ))}
+              </select>
+            </>
+          }
+          rows={filteredConnectors.map((record) => ({
+            key: connectorKey(record),
+            mono: record.provider,
+            status: record.status,
+            title: record.external_user_id,
+            meta: record.username || "unmapped user",
+          }))}
+          selectedKey={effectiveConnectorKey}
+          onSelectKey={setSelectedConnectorKey}
+          selectedStatus={selectedConnector?.status ?? null}
+          detail={
+            selectedConnector && (
+              <div className="ob-proposals-detail">
+                <h2>{selectedConnector.external_user_id}</h2>
+                <div className="ob-proposals-meta-grid">
+                  <span>Provider</span><span>{selectedConnector.provider}</span>
+                  <span>External ID</span><span className="ob-mono-id">{selectedConnector.external_user_id}</span>
+                  <span>Username</span><span>{selectedConnector.username || "-"}</span>
+                  <span>Reason</span><span>{selectedConnector.reason || "-"}</span>
+                  <span>Created</span><span>{formatTime(selectedConnector.created_at)}</span>
+                  <span>Updated</span><span>{formatTime(selectedConnector.updated_at)}</span>
+                  <span>Decision</span>
+                  <span>
+                    {selectedConnector.decided_by
+                      ? `${selectedConnector.decided_by} · ${formatTime(selectedConnector.decided_at)}`
+                      : "-"}
+                  </span>
+                </div>
+                <JsonDetails title="Redacted Metadata" value={selectedConnector.redacted_metadata || {}} />
+                <DecisionActions
+                  decidable={selectedConnector.status === "pending"}
+                  busyKey={busyKey}
+                  keyBase={`connector:${connectorKey(selectedConnector)}`}
+                  canDecide={canManageConnectors}
+                  permission="admin"
+                  permissionAction="connector approval decisions are disabled"
+                  onDecide={(decision) => void decideConnectorRecord(selectedConnector, decision)}
+                >
+                  <input
+                    value={connectorUsername}
+                    disabled={selectedConnector.status !== "pending" || busyKey !== null}
+                    onChange={(event) => setConnectorUsername(event.target.value)}
+                    placeholder="Local username"
+                  />
+                  <textarea
+                    value={connectorReason}
+                    disabled={selectedConnector.status !== "pending" || busyKey !== null}
+                    onChange={(event) => setConnectorReason(event.target.value)}
+                    placeholder="Decision reason"
+                  />
+                </DecisionActions>
+              </div>
+            )
+          }
+        />
+      )}
+    </section>
+  );
+}
+
+type ApprovalRow = {
+  key: string;
+  mono: string;
+  status: string;
+  title: string;
+  meta: string;
+};
+
+function ApprovalSection({
+  listTitle,
+  detailTitle,
+  filters,
+  rows,
+  selectedKey,
+  onSelectKey,
+  selectedStatus,
+  emptyList,
+  emptyDetail,
+  notice,
+  detail,
+}: {
+  listTitle: string;
+  detailTitle: string;
+  filters: React.ReactNode;
+  rows: ApprovalRow[];
+  selectedKey: string | null;
+  onSelectKey: (key: string) => void;
+  selectedStatus: string | null;
+  emptyList: string;
+  emptyDetail: string;
+  notice?: React.ReactNode;
+  detail: React.ReactNode;
+}) {
+  return (
+    <div className="ob-proposals-grid">
+      <div className="ob-panel ob-proposals-list-panel">
+        <div className="ob-panel-head">
+          <span className="ob-panel-title">{listTitle}</span>
+          <span className="ob-badge">{rows.length}</span>
+        </div>
+        {notice}
+        <div className="ob-proposals-filters">{filters}</div>
+        <div className="ob-proposals-list">
+          {rows.length === 0 && <p className="muted ob-proposals-empty">{emptyList}</p>}
+          {rows.map((row) => (
+            <button
+              key={row.key}
+              type="button"
+              className={`ob-proposal-row ${row.key === selectedKey ? "selected" : ""}`}
+              onClick={() => onSelectKey(row.key)}
+            >
+              <span className="ob-proposal-row-top">
+                <span className="ob-mono-id">{row.mono}</span>
+                <span className={`ob-badge ${approvalStatusTone(row.status)}`}>
+                  {row.status.toUpperCase()}
+                </span>
+              </span>
+              <span className="ob-proposal-row-title">{row.title}</span>
+              <span className="ob-proposal-row-meta">{row.meta}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="ob-panel ob-proposals-detail-panel">
+        <div className="ob-panel-head">
+          <span className="ob-panel-title">{detailTitle}</span>
+          {selectedStatus && (
+            <span className={`ob-badge ${approvalStatusTone(selectedStatus)}`}>
+              {selectedStatus.toUpperCase()}
+            </span>
+          )}
+        </div>
+        {detail || <p className="muted ob-proposals-empty">{emptyDetail}</p>}
+      </div>
+    </div>
+  );
+}
+
+function DecisionActions({
+  decidable,
+  busyKey,
+  keyBase,
+  canDecide,
+  permission,
+  permissionAction,
+  onDecide,
+  children,
+}: {
+  decidable: boolean;
+  busyKey: string | null;
+  keyBase: string;
+  canDecide: boolean;
+  permission: string;
+  permissionAction: string;
+  onDecide: (decision: "approved" | "rejected") => void;
+  children?: React.ReactNode;
+}) {
+  const disabled = !canDecide || !decidable || busyKey !== null;
+  return (
+    <div className="ob-proposals-actions">
+      {children}
+      <div className="button-row">
+        <button
+          type="button"
+          className="ob-mo-btn primary"
+          disabled={disabled}
+          onClick={() => onDecide("approved")}
+        >
+          {busyKey === `${keyBase}:approved` ? "Approving..." : "Approve"}
+        </button>
+        <button
+          type="button"
+          className="ob-mo-btn danger"
+          disabled={disabled}
+          onClick={() => onDecide("rejected")}
+        >
+          {busyKey === `${keyBase}:rejected` ? "Rejecting..." : "Reject"}
+        </button>
+      </div>
+      <PermissionNotice allowed={canDecide} permission={permission} action={permissionAction} />
+    </div>
+  );
+}
+
+function ApprovalEffect({ record }: { record: ProposalRecord }) {
+  const effects = record.details?.approval_effects;
+  if (effects && typeof effects === "object" && Object.keys(effects).length > 0) {
+    return <JsonDetails title="Approval Effects" value={effects as Record<string, unknown>} />;
+  }
+  if (record.status !== "proposed") {
+    // Decided records without materialized effects have nothing to preview.
+    return null;
+  }
+  return <p className="permission-note">{proposalApprovalPreview(record)}</p>;
+}
+
+function JsonDetails({ title, value }: { title: string; value: Record<string, unknown> }) {
+  return (
+    <div className="ob-json-details">
+      <span>{title}</span>
+      <pre>{JSON.stringify(value || {}, null, 2)}</pre>
+    </div>
+  );
+}
+
+function compareApprovalRecords<T extends { status?: string; created_at?: string; updated_at?: string }>(a: T, b: T) {
+  const status = approvalRank(a.status) - approvalRank(b.status);
+  if (status !== 0) {
+    return status;
+  }
+  return String(b.created_at || b.updated_at || "").localeCompare(String(a.created_at || a.updated_at || ""));
+}
+
+function approvalRank(status?: string) {
+  if (status === "proposed" || status === "pending") {
+    return 0;
+  }
+  if (status === "approved") {
+    return 1;
+  }
+  if (status === "rejected") {
+    return 2;
+  }
+  return 3;
+}
+
+function approvalStatusTone(status?: string) {
+  if (status === "proposed" || status === "pending") {
+    return "warn";
+  }
+  if (status === "approved" || status === "implemented") {
+    return "ok";
+  }
+  if (status === "rejected" || status === "expired") {
+    return "bad";
+  }
+  return "subtle";
+}
+
+function proposalApprovalPreview(record: ProposalRecord) {
+  if (record.kind === "tool_request") {
+    return "Approval creates or reuses a tool_build task for the routed owner.";
+  }
+  if (record.kind === "efficiency") {
+    return "Approval creates or reuses a recurrence template.";
+  }
+  if (record.kind === "rest_insight") {
+    return "Approval records the decision without materialized side effects.";
+  }
+  return "Approval records the decision through the proposal service.";
+}
+
+function connectorKey(record: ConnectorApprovalRecord) {
+  return `${record.provider}::${record.external_user_id}`;
 }
 
 const MO_PRIORITIES = ["low", "normal", "high", "critical"];
