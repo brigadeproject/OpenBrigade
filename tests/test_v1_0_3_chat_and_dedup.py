@@ -56,7 +56,9 @@ def test_chat_reply_attaches_guidance_and_requeues_escalated_assignment(tmp_path
     assert len(guidance) == 1
     assert guidance[0]["operator"] == "alice"
     assert "founder plus two independent directors" in guidance[0]["operator_message"]
-    assert guidance[0]["agent_reply"] == "Understood, resuming with that structure."
+    # Only the operator's words are guidance — the agent's chat reply is its own
+    # speculation and must not be re-injected as instructions.
+    assert "agent_reply" not in guidance[0]
     # The channel gets a visible note so the operator can see the effect.
     notes = [
         message

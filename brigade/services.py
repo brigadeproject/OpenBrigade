@@ -381,7 +381,6 @@ def send_user_chat(
         conversation_id=conversation_id,
         operator=sender,
         operator_message=content,
-        agent_reply=response_text,
     )
     return {
         "status": "complete",
@@ -401,6 +400,9 @@ def send_user_chat(
 # A chat reply IS the operator acting, so it must reach the task: the exchange is
 # attached as operator_guidance (which rides into the agent's next prompt via the
 # assignment floor) and the assignment is taken off the awaiting-human shelf.
+# Only the operator's words are attached — injecting the agent's own chat reply
+# turned its speculation into instructions (a researcher told itself to fixate
+# on HEARTBEAT.md and looped until it re-escalated, observed 2026-07-08).
 # Without this the conversation is a dead end — the operator answers, the agent
 # replies politely in chat, and the task stays blocked forever (observed with
 # assignment 3175d5b4 on 2026-07-08).
@@ -414,7 +416,6 @@ def _resume_escalations_with_chat_guidance(
     conversation_id: str,
     operator: str,
     operator_message: str,
-    agent_reply: str,
 ) -> list[dict[str, Any]]:
     resumed: list[dict[str, Any]] = []
     for assignment in store.assignments():
@@ -425,7 +426,6 @@ def _resume_escalations_with_chat_guidance(
             "operator": operator,
             "conversation_id": conversation_id,
             "operator_message": operator_message[:4000],
-            "agent_reply": agent_reply[:4000],
         }
         assignment.operator_guidance = [
             *assignment.operator_guidance[-(MAX_OPERATOR_GUIDANCE_ENTRIES - 1):],
