@@ -456,10 +456,10 @@ function App() {
     const next = await api<CockpitPayload>("/api/cockpit");
     setCockpit(next);
     setStatus("Cockpit loaded");
-    if (!selectedAgentId && next.agents[0]) {
-      setSelectedAgentId(next.agents[0].agent_id);
+    if (next.agents[0]) {
+      setSelectedAgentId((current) => current || next.agents[0].agent_id);
     }
-  }, [api, selectedAgentId]);
+  }, [api]);
 
   const loadSettings = useCallback(async () => {
     const next = await api<SettingsPayload>("/api/settings/effective");
@@ -475,10 +475,10 @@ function App() {
   const loadSnapshot = useCallback(async () => {
     const next = await api<OpsRoomSnapshot>("/api/ops-room");
     setSnapshot(next);
-    if (!selectedAgentId && next.agents[0]) {
-      setSelectedAgentId(next.agents[0].agent_id);
+    if (next.agents[0]) {
+      setSelectedAgentId((current) => current || next.agents[0].agent_id);
     }
-  }, [api, selectedAgentId]);
+  }, [api]);
 
   const loadProposals = useCallback(async () => {
     // The proposal log is append-only; fetch every actionable record but only a
@@ -616,8 +616,11 @@ function App() {
             }
             const next = JSON.parse(data) as OpsRoomSnapshot;
             setSnapshot(next);
-            if (!selectedAgentId && next.agents[0]) {
-              setSelectedAgentId(next.agents[0].agent_id);
+            if (next.agents[0]) {
+              // Functional update: this stream loop lives for the tab's whole
+              // lifetime, so a captured selectedAgentId is permanently stale —
+              // the plain guard reset the operator's selection on every event.
+              setSelectedAgentId((current) => current || next.agents[0].agent_id);
             }
           }
         }
@@ -644,7 +647,7 @@ function App() {
         window.clearTimeout(reconnectTimer);
       }
     };
-  }, [selectedAgentId, token, tokenExpired]);
+  }, [token, tokenExpired]);
 
   const selectedAgent = useMemo(
     () => allAgents(cockpit, snapshot).find((agent) => agent.agent_id === selectedAgentId) || null,
@@ -2010,6 +2013,19 @@ function connectorKey(record: ConnectorApprovalRecord) {
 
 const MO_PRIORITIES = ["low", "normal", "high", "critical"];
 
+// Orchestrator chat panel height (px): operator-resizable via the drag handle,
+// persisted in localStorage under brigade_chat_height.
+const DEFAULT_CHAT_HEIGHT = 300;
+const MIN_CHAT_HEIGHT = 180;
+const MAX_CHAT_HEIGHT = 820;
+
+function clampChatHeight(value: number) {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_CHAT_HEIGHT;
+  }
+  return Math.min(MAX_CHAT_HEIGHT, Math.max(MIN_CHAT_HEIGHT, Math.round(value)));
+}
+
 function moStatusGroup(status: string): "running" | "blocked" | "queued" | "done" {
   if (status === "working" || status === "assigned") return "running";
   if (status === "blocked") return "blocked";
@@ -2668,6 +2684,25 @@ function CockpitView({
   const workingAgents = agents.filter(
     (agent) => agent.status === "working" || agent.status === "assigned",
   );
+  const [chatHeight, setChatHeight] = useState(() => clampChatHeight(
+    Number(localStorage.getItem("brigade_chat_height")) || DEFAULT_CHAT_HEIGHT,
+  ));
+
+  function startChatResize(event: React.PointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = chatHeight;
+    // Dragging the handle up grows the panel (it sits above the chat).
+    const heightAt = (clientY: number) => clampChatHeight(startHeight + (startY - clientY));
+    const onMove = (move: PointerEvent) => setChatHeight(heightAt(move.clientY));
+    const onUp = (up: PointerEvent) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      localStorage.setItem("brigade_chat_height", String(heightAt(up.clientY)));
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
 
   return (
     <section className="cockpit ob-cockpit">
@@ -2715,10 +2750,22 @@ function CockpitView({
             onSelectAgent={(id) => onSelectAgent(id, "tasks")}
           />
           <div className="ob-panel ob-chat-section">
+            <div
+              className="ob-chat-resize"
+              onPointerDown={startChatResize}
+              onDoubleClick={() => {
+                setChatHeight(DEFAULT_CHAT_HEIGHT);
+                localStorage.setItem("brigade_chat_height", String(DEFAULT_CHAT_HEIGHT));
+              }}
+              title="Drag to resize the chat — double-click to reset"
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="Resize orchestrator chat"
+            />
             <div className="ob-panel-head">
               <span className="ob-panel-title">Talk to Orchestrator</span>
             </div>
-            <div className="ob-chat-host">
+            <div className="ob-chat-host" style={{ height: chatHeight }}>
               <OrchestratorChat
                 canChat={can("chat:write")}
                 api={api}
@@ -4297,7 +4344,7 @@ function OrchestratorChat({
         onChange={onRouteChange}
       />
       <div className="chat-feed" ref={feedRef}>
-        {messages.slice(-8).map((item) => (
+        {messages.slice(-100).map((item) => (
           <ChatMessageRow
             key={item.message_id}
             message={item}
@@ -4760,7 +4807,7 @@ function AgentChatPanel({
       <p className="model-route-note">Agent model: {routeLabel}</p>
       <div className="chat-feed" ref={feedRef}>
         {messages.length === 0 && <p className="muted">No messages for this agent.</p>}
-        {messages.slice(-12).map((item) => (
+        {messages.slice(-100).map((item) => (
           <ChatMessageRow key={item.message_id} message={item} perspective={selectedAgentId} />
         ))}
       </div>
@@ -5177,9 +5224,25 @@ function statusClass(value: string) {
 
 function useAutoScroll<T extends HTMLElement>(dependencies: React.DependencyList) {
   const ref = useRef<T | null>(null);
+  // Pin to the newest message only while the user is already at (or near) the
+  // bottom; someone scrolled up reading history must not get yanked back down
+  // by a background refresh.
+  const pinnedRef = useRef(true);
   useEffect(() => {
     const element = ref.current;
-    if (element) {
+    if (!element) {
+      return;
+    }
+    const onScroll = () => {
+      pinnedRef.current =
+        element.scrollHeight - element.scrollTop - element.clientHeight < 60;
+    };
+    element.addEventListener("scroll", onScroll);
+    return () => element.removeEventListener("scroll", onScroll);
+  }, []);
+  useEffect(() => {
+    const element = ref.current;
+    if (element && pinnedRef.current) {
       element.scrollTop = element.scrollHeight;
     }
   }, dependencies);

@@ -1275,6 +1275,10 @@ a {
   padding: 15px;
   background: var(--c-panel);
   box-shadow: inset 0 1px 0 var(--c-bevel-hi);
+  /* A verbose agent state must not squeeze the tasks/chat/goals panel below
+     into a sliver: cap the inspector and let IT scroll instead. */
+  max-height: 38vh;
+  overflow: auto;
 }
 
 .inspector.empty {
@@ -2606,6 +2610,24 @@ button.danger:disabled {
   border-top: 1px solid var(--c-divider);
 }
 
+/* Drag handle above the chat: pull up to grow the panel, double-click to
+   reset. Height itself comes from inline style (state + localStorage). */
+.ob-chat-resize {
+  height: 7px;
+  margin: -1px 0;
+  cursor: ns-resize;
+  touch-action: none;
+  border-top: 1px solid var(--c-divider);
+  background:
+    radial-gradient(circle, var(--c-text-dim) 1px, transparent 1.5px) center / 8px 4px repeat-x;
+  background-clip: content-box;
+  padding: 2px 40%;
+}
+
+.ob-chat-resize:hover {
+  background-color: var(--c-inset);
+}
+
 .ob-chat-host {
   height: 300px;
   display: flex;
@@ -2643,13 +2665,29 @@ button.danger:disabled {
   flex: none;
 }
 
-/* Feed fills the panel; few messages hug the bottom (align-content:end),
-   many messages scroll with newest at the bottom. */
+/* Feed fills the panel; few messages hug the bottom, many messages scroll with
+   newest at the bottom. Bottom-hugging uses flex + margin-top:auto on the first
+   row — NOT align-content:end, which makes overflow above the scrollport
+   unreachable (the feed "couldn't scroll" up to older messages). */
 .ob-agent-chat .chat-feed {
   flex: 1;
   min-height: 0;
   max-height: none;
-  align-content: end;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.ob-agent-chat .chat-feed > :first-child {
+  margin-top: auto;
+}
+
+.ob-agent-chat .chat-feed .message-row {
+  width: 100%;
+}
+
+.ob-agent-chat .chat-feed .message-row.from-selected {
+  align-self: flex-end;
 }
 
 .ob-agent-chat .chat-compose {
