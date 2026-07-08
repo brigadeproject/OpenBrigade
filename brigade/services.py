@@ -269,6 +269,7 @@ def send_user_chat(
     provider: ModelProvider,
     channel: str | None = None,
     idempotency_key: str | None = None,
+    resume_escalations: bool = False,
 ) -> dict[str, Any]:
     agent = next((item for item in store.agents() if item.agent_id == agent_id), None)
     if agent is None:
@@ -375,13 +376,15 @@ def send_user_chat(
             "user": sender,
         }
     )
-    resumed = _resume_escalations_with_chat_guidance(
-        store,
-        agent_id=agent_id,
-        conversation_id=conversation_id,
-        operator=sender,
-        operator_message=content,
-    )
+    resumed: list[dict[str, Any]] = []
+    if resume_escalations:
+        resumed = _resume_escalations_with_chat_guidance(
+            store,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            operator=sender,
+            operator_message=content,
+        )
     return {
         "status": "complete",
         "conversation_id": conversation_id,
@@ -397,9 +400,11 @@ def send_user_chat(
 
 
 # An escalated assignment parks with awaiting_human=True until an operator acts.
-# A chat reply IS the operator acting, so it must reach the task: the exchange is
+# A chat reply with resume_escalations=True IS the operator acting: the message is
 # attached as operator_guidance (which rides into the agent's next prompt via the
 # assignment floor) and the assignment is taken off the awaiting-human shelf.
+# The flag is opt-in because operators often need to interrogate the agent first
+# ("what's blocking you?") — a diagnostic question must not burn the escalation.
 # Only the operator's words are attached — injecting the agent's own chat reply
 # turned its speculation into instructions (a researcher told itself to fixate
 # on HEARTBEAT.md and looped until it re-escalated, observed 2026-07-08).

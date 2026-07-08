@@ -4754,7 +4754,14 @@ function AgentChatPanel({
 }) {
   const [message, setMessage] = useState("");
   const [pending, setPending] = useState(false);
+  const [resumeEscalations, setResumeEscalations] = useState(false);
   const selectedAgent = snapshot?.agents.find((agent) => agent.agent_id === selectedAgentId) || null;
+  const escalated = (snapshot?.assignments || []).filter(
+    (item) => item.assigned_to === selectedAgentId && item.awaiting_human && !item.archived,
+  );
+  useEffect(() => {
+    setResumeEscalations(false);
+  }, [selectedAgentId]);
   const messages = (snapshot?.messages || []).filter(
     (item) => item.sender === selectedAgentId || item.recipient === selectedAgentId,
   );
@@ -4782,11 +4789,17 @@ function AgentChatPanel({
           agent_id: selectedAgentId,
           content: message,
           idempotency_key: randomId("web-chat"),
+          resume_escalations: resumeEscalations && escalated.length > 0,
           ...modelRoutePayload(modelRoute),
         },
       });
       setMessage("");
-      setStatus("Chat reply saved");
+      setResumeEscalations(false);
+      setStatus(
+        resumeEscalations && escalated.length > 0
+          ? `Chat reply saved — resuming ${escalated.length} escalated task(s)`
+          : "Chat reply saved",
+      );
       await onDone();
     } finally {
       setPending(false);
@@ -4811,6 +4824,22 @@ function AgentChatPanel({
           <ChatMessageRow key={item.message_id} message={item} perspective={selectedAgentId} />
         ))}
       </div>
+      {escalated.length > 0 && (
+        <div className="ob-escalation-bar">
+          <span className="ob-escalation-note">
+            ⚠ {escalated.length} escalated task{escalated.length > 1 ? "s" : ""} awaiting you
+          </span>
+          <label className="ob-escalation-toggle" title="When checked, this reply is attached to the escalated task(s) as operator guidance and they are re-queued. Leave unchecked to just talk.">
+            <input
+              type="checkbox"
+              checked={resumeEscalations}
+              disabled={!canChat || pending}
+              onChange={(event) => setResumeEscalations(event.target.checked)}
+            />
+            Resume {escalated.length > 1 ? "them" : "it"} with this reply
+          </label>
+        </div>
+      )}
       <div className="chat-compose">
         <textarea
           value={message}

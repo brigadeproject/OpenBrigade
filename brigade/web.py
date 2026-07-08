@@ -885,6 +885,7 @@ def create_app(
             provider=provider,
             channel=payload.get("channel"),
             idempotency_key=payload.get("idempotency_key") or f"web:{uuid4()}",
+            resume_escalations=bool(payload.get("resume_escalations")),
         )
 
     @app.post("/api/chat/ask-orchestrator")

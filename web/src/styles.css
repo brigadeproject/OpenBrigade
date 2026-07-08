@@ -2610,6 +2610,48 @@ button.danger:disabled {
   border-top: 1px solid var(--c-divider);
 }
 
+/* Escalation bar above the agent-chat composer: shows parked awaiting-human
+   tasks and the opt-in "resume with this reply" toggle. Unchecked chat is
+   diagnostic only — it must never burn the escalation. */
+.ob-escalation-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 5px 9px;
+  border-radius: 5px;
+  background: rgba(224, 162, 59, 0.12);
+  box-shadow: var(--bevel-in);
+  font-size: 11px;
+}
+
+.ob-escalation-note {
+  color: var(--c-warn);
+  font-weight: 700;
+}
+
+.ob-escalation-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+/* Global input rules stretch form fields to fill; keep the checkbox literal. */
+.ob-escalation-toggle input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  box-shadow: none;
+  accent-color: var(--c-warn);
+}
+
 /* Drag handle above the chat: pull up to grow the panel, double-click to
    reset. Height itself comes from inline style (state + localStorage). */
 .ob-chat-resize {

@@ -41,6 +41,7 @@ def test_chat_reply_attaches_guidance_and_requeues_escalated_assignment(tmp_path
         agent_id="sage",
         content="Keep the board lean: founder plus two independent directors.",
         provider=TestProvider(text="Understood, resuming with that structure."),
+        resume_escalations=True,
     )
 
     assert result["status"] == "complete"
@@ -74,6 +75,32 @@ def test_chat_reply_attaches_guidance_and_requeues_escalated_assignment(tmp_path
         Agent("sage", "SAGE", "workspace-sage", "planner"), refreshed, store
     )
     assert "founder plus two independent directors" in prompt
+
+
+def test_chat_without_resume_flag_leaves_escalation_parked(tmp_path):
+    """A diagnostic question ("what's blocking you?") must not burn the escalation."""
+    store = JsonStateStore(tmp_path / "state.json")
+    user = User(username="alice", role=Role.OPERATOR)
+    store.add_user(user)
+    store.add_agent(Agent("sage", "SAGE", "workspace-sage", "planner"))
+    escalated = _escalated_assignment()
+    store.add_assignment(escalated)
+
+    result = send_user_chat(
+        store,
+        AuthResult(ok=True, method="test", user=user),
+        user=user,
+        agent_id="sage",
+        content="What exactly is holding you up?",
+        provider=TestProvider(text="I'm waiting on the board size decision."),
+    )
+
+    assert result["assignments_resumed"] == []
+    refreshed = store.find_assignment(escalated.assignment_id)
+    assert refreshed is not None
+    assert refreshed.status == AssignmentStatus.BLOCKED
+    assert refreshed.awaiting_human is True
+    assert refreshed.operator_guidance == []
 
 
 def test_chat_without_escalation_leaves_assignments_alone(tmp_path):
@@ -125,6 +152,7 @@ def test_chat_guidance_is_capped(tmp_path):
         agent_id="sage",
         content="newest guidance",
         provider=TestProvider(text="ok"),
+        resume_escalations=True,
     )
 
     refreshed = store.find_assignment(escalated.assignment_id)
