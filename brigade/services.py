@@ -375,6 +375,14 @@ def send_user_chat(
             "user": sender,
         }
     )
+    resumed = _resume_escalations_with_chat_guidance(
+        store,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        operator=sender,
+        operator_message=content,
+        agent_reply=response_text,
+    )
     return {
         "status": "complete",
         "conversation_id": conversation_id,
@@ -385,7 +393,85 @@ def send_user_chat(
         "provider": response.provider,
         "model": response.model,
         "route_type": response.route_type,
+        "assignments_resumed": resumed,
     }
+
+
+# An escalated assignment parks with awaiting_human=True until an operator acts.
+# A chat reply IS the operator acting, so it must reach the task: the exchange is
+# attached as operator_guidance (which rides into the agent's next prompt via the
+# assignment floor) and the assignment is taken off the awaiting-human shelf.
+# Without this the conversation is a dead end — the operator answers, the agent
+# replies politely in chat, and the task stays blocked forever (observed with
+# assignment 3175d5b4 on 2026-07-08).
+MAX_OPERATOR_GUIDANCE_ENTRIES = 5
+
+
+def _resume_escalations_with_chat_guidance(
+    store: StateStore,
+    *,
+    agent_id: str,
+    conversation_id: str,
+    operator: str,
+    operator_message: str,
+    agent_reply: str,
+) -> list[dict[str, Any]]:
+    resumed: list[dict[str, Any]] = []
+    for assignment in store.assignments():
+        if assignment.assigned_to != agent_id or not assignment.awaiting_human:
+            continue
+        guidance = {
+            "at": utc_now_iso(),
+            "operator": operator,
+            "conversation_id": conversation_id,
+            "operator_message": operator_message[:4000],
+            "agent_reply": agent_reply[:4000],
+        }
+        assignment.operator_guidance = [
+            *assignment.operator_guidance[-(MAX_OPERATOR_GUIDANCE_ENTRIES - 1):],
+            guidance,
+        ]
+        store.update_assignment(assignment)
+        if assignment.status == AssignmentStatus.BLOCKED:
+            reissue_assignment(store, assignment.assignment_id, by=operator)
+        else:
+            assignment.awaiting_human = False
+            assignment.updated_at = utc_now_iso()
+            store.update_assignment(assignment)
+        resumed.append(
+            {
+                "assignment_id": assignment.assignment_id,
+                "status": (
+                    store.find_assignment(assignment.assignment_id) or assignment
+                ).status.value,
+            }
+        )
+        store.add_message(
+            ChatMessage(
+                channel=conversation_id,
+                sender="orchestrator",
+                recipient=agent_id,
+                content=(
+                    f"Operator reply applied: assignment {assignment.assignment_id} "
+                    f"was re-queued for {agent_id} with this conversation attached "
+                    "as guidance."
+                ),
+                metadata={
+                    "kind": "chat_guidance_applied",
+                    "conversation_id": conversation_id,
+                    "assignment_id": assignment.assignment_id,
+                },
+            )
+        )
+        LOGGER.info(
+            "chat_guidance_applied",
+            extra={
+                "assignment_id": assignment.assignment_id,
+                "agent_id": agent_id,
+                "operator": operator,
+            },
+        )
+    return resumed
 
 
 _CHAT_CONFIRM_PHRASES = frozenset(

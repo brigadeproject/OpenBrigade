@@ -215,6 +215,7 @@ class Assignment:
     idempotency_key: str | None = None
     room_id: str | None = None
     reissued_from_assignment_id: str | None = None
+    operator_guidance: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         _require_text(self.assignment, "assignment")
@@ -437,6 +438,7 @@ def assignment_from_dict(item: dict[str, Any]) -> Assignment:
         idempotency_key=item.get("idempotency_key"),
         room_id=item.get("room_id"),
         reissued_from_assignment_id=item.get("reissued_from_assignment_id"),
+        operator_guidance=item.get("operator_guidance", []),
     )
 
 

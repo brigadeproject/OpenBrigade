@@ -465,6 +465,50 @@ def _find_backlog_duplicate(
     return None
 
 
+# Backlog dedup alone lets the same work run repeatedly: once the first copy
+# COMPLETES it leaves the backlog, and the next planner pass re-delegates it
+# (Jul 8: shared/operational_roles.md was "created" by three separate
+# completions in one night). Completed history inside this window counts as a
+# duplicate too — the delegator is told the deliverable already exists.
+_COMPLETED_DEDUP_WINDOW_SECONDS = 24 * 3600
+
+
+def _find_completed_duplicate(
+    store: StateStore, target_agent_id: str, text: str
+) -> dict[str, Any] | None:
+    """A recently COMPLETED archived assignment (any owner's history for
+    ``target_agent_id``) whose text is near-identical to ``text``, or None."""
+    from brigade.time import parse_utc_iso, utc_now
+
+    tokens = _dedup_tokens(text)
+    if not tokens:
+        return None
+    now = utc_now()
+    for item in reversed(store.assignment_history()):
+        if item.get("final_status") != AssignmentStatus.COMPLETE.value:
+            continue
+        record = item.get("record") or {}
+        if record.get("assigned_to") != target_agent_id:
+            continue
+        archived_at = item.get("archived_at")
+        if archived_at:
+            try:
+                age = (now - parse_utc_iso(str(archived_at))).total_seconds()
+            except ValueError:
+                age = None
+            if age is not None and age > _COMPLETED_DEDUP_WINDOW_SECONDS:
+                # History is ordered by archived_at; everything earlier is
+                # older still.
+                break
+        other = _dedup_tokens(str(record.get("assignment") or ""))
+        if not other:
+            continue
+        overlap = len(tokens & other) / len(tokens | other)
+        if overlap >= _BACKLOG_DEDUP_THRESHOLD:
+            return item
+    return None
+
+
 def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     from brigade.orchestrator import orchestration_event, record_orchestration_events
 
@@ -497,6 +541,27 @@ def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
                 "assignment_id": duplicate.assignment_id,
                 "status": duplicate.status.value,
                 "deduplicated": True,
+            },
+        )
+    completed = _find_completed_duplicate(context.store, target_agent_id, assignment_text)
+    if completed is not None:
+        summary = completed.get("executive_summary") or "no summary recorded"
+        return ToolResult(
+            True,
+            (
+                f"skipped duplicate delegation: assignment "
+                f"{completed.get('assignment_id')} already COMPLETED near-identical "
+                f"work for {target_agent_id} at {completed.get('archived_at')}. "
+                f"Its result: {summary} "
+                "Check the existing deliverable (e.g. with read_file/list_files) "
+                "before delegating again; only re-delegate with a materially "
+                "different assignment if the deliverable is missing or inadequate."
+            ),
+            {
+                "assignment_id": completed.get("assignment_id"),
+                "status": AssignmentStatus.COMPLETE.value,
+                "deduplicated": True,
+                "already_completed": True,
             },
         )
     assignment = Assignment(
@@ -634,6 +699,24 @@ def _create_subtasks(context: ToolContext, arguments: dict[str, Any]) -> ToolRes
                     "dependency_ids": list(duplicate.dependency_ids),
                     "status": duplicate.status.value,
                     "deduplicated": True,
+                }
+            )
+            continue
+        completed = _find_completed_duplicate(
+            context.store, str(item["agent_id"]), str(item["assignment"])
+        )
+        if completed is not None:
+            # Already done: anchor the chain on the archived assignment
+            # (dependency lookups resolve archived ids via history).
+            previous_assignment_id = str(completed.get("assignment_id"))
+            created.append(
+                {
+                    "assignment_id": completed.get("assignment_id"),
+                    "agent_id": item["agent_id"],
+                    "dependency_ids": [],
+                    "status": AssignmentStatus.COMPLETE.value,
+                    "deduplicated": True,
+                    "already_completed": True,
                 }
             )
             continue
