@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from brigade.schemas import Agent, Assignment, AssignmentStatus, Priority
+from brigade.schemas import Agent, Assignment, AssignmentKind, AssignmentStatus, Priority
 from brigade.store import StateStore
 
 
@@ -443,18 +443,32 @@ def _dedup_tokens(text: str) -> set[str]:
     }
 
 
+# Public names for the duplicate-detection machinery so the orchestrator's
+# reconciliation sweep shares one similarity definition with delegation dedup.
+dedup_tokens = _dedup_tokens
+BACKLOG_DEDUP_THRESHOLD = _BACKLOG_DEDUP_THRESHOLD
+UNDONE_STATUSES = _UNDONE_STATUSES
+
+
 def _find_backlog_duplicate(
     store: StateStore, target_agent_id: str, text: str
 ) -> Assignment | None:
-    """An undone assignment for ``target_agent_id`` whose text is
-    near-identical to ``text``, or None."""
+    """A live undone assignment (any agent's queue) whose text is
+    near-identical to ``text``, or None.
+
+    Cross-agent on purpose: two agents planning the same mission
+    independently produce parallel near-identical ladders (observed Jul 9:
+    Stage-2/Stage-3 tasks duplicated across infrastructure and designer).
+    Rest and failure-analysis tasks are templated text, near-identical
+    across agents by construction, so they never count as duplicates.
+    """
     tokens = _dedup_tokens(text)
     if not tokens:
         return None
     for item in store.assignments():
-        if item.assigned_to != target_agent_id:
-            continue
         if item.status not in _UNDONE_STATUSES:
+            continue
+        if item.kind in {AssignmentKind.REST, AssignmentKind.FAILURE_ANALYSIS}:
             continue
         other = _dedup_tokens(item.assignment)
         if not other:
@@ -534,7 +548,8 @@ def _delegate(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
             (
                 f"skipped duplicate delegation: assignment "
                 f"{duplicate.assignment_id} already covers near-identical work "
-                f"for {target_agent_id} (status: {duplicate.status.value}). "
+                f"(owned by {duplicate.assigned_to}, status: "
+                f"{duplicate.status.value}). "
                 "Treat that assignment as your delegation in motion."
             ),
             {

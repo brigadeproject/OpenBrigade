@@ -135,6 +135,7 @@ class OrchestrationConfig:
     hung_task_seconds: int = 1800
     auto_recover_enabled: bool = True
     max_auto_reissue: int = 2
+    duplicate_reconciliation_enabled: bool = True
     telegram_bot_token: str | None = None
     operator_telegram_chat_id: str | None = None
 
@@ -163,6 +164,7 @@ class OrchestrationConfig:
             hung_task_seconds=settings.hung_task_seconds,
             auto_recover_enabled=settings.auto_recover_enabled,
             max_auto_reissue=settings.max_auto_reissue,
+            duplicate_reconciliation_enabled=settings.duplicate_reconciliation_enabled,
             telegram_bot_token=settings.telegram_bot_token,
             operator_telegram_chat_id=settings.operator_telegram_chat_id,
         )
@@ -235,6 +237,7 @@ class OrchestrationConfig:
             "hung_task_seconds": self.hung_task_seconds,
             "auto_recover_enabled": self.auto_recover_enabled,
             "max_auto_reissue": self.max_auto_reissue,
+            "duplicate_reconciliation_enabled": self.duplicate_reconciliation_enabled,
             "operator_notify_configured": bool(
                 self.telegram_bot_token and self.operator_telegram_chat_id
             ),
@@ -2579,6 +2582,16 @@ def run_full_cycle(
     # flows into the same cycle's ladder and dispatch.
     collect("hung_recovery", recover_hung_tasks(store, config))
 
+    # Step 2.6: collapse near-duplicate live assignments before dead-dependency
+    # remediation so a dead root is never reissued when a surviving duplicate
+    # could absorb its dependents.
+    collect("duplicate_reconciliation", _run_duplicate_reconciliation_step(store, config))
+
+    # Step 2.7: dead-dependency remediation before dispatch so an auto-reissue
+    # dispatches this same cycle, and before step 3.5 so freshly parked
+    # dependents notify the operator this same cycle.
+    collect("dead_dependencies", _run_dead_dependency_step(store, config))
+
     # Step 3: blocker-resolution ladder runs before any fresh dispatch.
     ladder_result: dict[str, Any] = {
         "enabled": config.blocker_resolution_enabled,
@@ -2750,6 +2763,23 @@ def _run_ladder_step(store: StateStore, config: OrchestrationConfig) -> dict[str
 
     del config
     return resolve_blockers(store)
+
+
+def _run_duplicate_reconciliation_step(
+    store: StateStore, config: OrchestrationConfig
+) -> dict[str, Any]:
+    # Imported here: brigade.reconcile imports orchestrator helpers lazily too.
+    from brigade.reconcile import reconcile_duplicate_assignments
+
+    return reconcile_duplicate_assignments(store, config)
+
+
+def _run_dead_dependency_step(
+    store: StateStore, config: OrchestrationConfig
+) -> dict[str, Any]:
+    from brigade.reconcile import remediate_dead_dependencies
+
+    return remediate_dead_dependencies(store, config)
 
 
 def _run_intake_step(store: StateStore, config: OrchestrationConfig) -> dict[str, Any]:

@@ -36,6 +36,7 @@ from brigade.schemas import (
     Team,
     User,
     WorkMode,
+    assignment_from_dict,
     extract_json_object,
 )
 from brigade.store import StateStore
@@ -1603,6 +1604,108 @@ def lookup_assignment(store: StateStore, assignment_id: str) -> dict[str, Any] |
     return None
 
 
+def _build_reissue_copy(
+    original: Assignment,
+    *,
+    assigned_to: str | None = None,
+    by: str = "operator",
+    source: str = "manual_orchestration",
+    note: str | None = None,
+    created_by_role: str | None = "operator",
+    idempotency_key: str | None = None,
+    guidance: list[dict[str, Any]] | None = None,
+) -> Assignment:
+    """Build (but do not persist) a fresh QUEUED copy carrying reissue lineage."""
+    return Assignment(
+        assignment=original.assignment,
+        assigned_to=assigned_to or original.assigned_to,
+        created_by=by,
+        source=source,
+        priority=original.priority,
+        work_mode=original.work_mode,
+        kind=original.kind,
+        goal_statement=original.goal_statement,
+        assignment_rationale=(
+            f"Reissued from {original.assignment_id} by {by}"
+            + (f": {note}" if note else "")
+        ),
+        dependency_ids=list(original.dependency_ids or []),
+        parent_assignment_id=original.parent_assignment_id,
+        created_by_role=created_by_role,
+        reissued_from_assignment_id=original.assignment_id,
+        idempotency_key=idempotency_key,
+        operator_guidance=list(guidance or []),
+    )
+
+
+def _repoint_dependents(store: StateStore, old_id: str, new_id: str) -> list[str]:
+    """Rewrite every live dependent's dependency_ids from old_id to new_id."""
+    repointed: list[str] = []
+    for dependent in store.assignments():
+        if old_id in (dependent.dependency_ids or []):
+            remapped = [
+                new_id if dep == old_id else dep for dep in dependent.dependency_ids
+            ]
+            deduped: list[str] = []
+            for dep in remapped:
+                if dep not in deduped:
+                    deduped.append(dep)
+            dependent.dependency_ids = deduped
+            store.update_assignment(dependent)
+            repointed.append(dependent.assignment_id)
+    return repointed
+
+
+def reissue_archived_assignment(
+    store: StateStore,
+    history_entry: dict[str, Any],
+    *,
+    assigned_to: str | None = None,
+    by: str = "orchestrator",
+    source: str = "manual_orchestration",
+    note: str | None = None,
+    idempotency_key: str | None = None,
+    guidance: list[dict[str, Any]] | None = None,
+) -> Assignment:
+    """Reissue an already-archived (terminal) assignment as a fresh attempt.
+
+    Unlike ``reissue_assignment_as_new`` the original is not touched — it is
+    already terminal and archived. Dependents still pointing at the dead id are
+    re-pointed to the new attempt. ``history_entry`` is one item from
+    ``store.assignment_history()`` (its ``record`` holds the archived snapshot).
+    """
+    original = assignment_from_dict(history_entry.get("record") or history_entry)
+    copy = _build_reissue_copy(
+        original,
+        assigned_to=assigned_to,
+        by=by,
+        source=source,
+        note=note,
+        created_by_role=None,
+        idempotency_key=idempotency_key,
+        guidance=guidance,
+    )
+    persisted = store.add_assignment(copy)
+    if persisted.assignment_id != original.assignment_id:
+        _repoint_dependents(store, original.assignment_id, persisted.assignment_id)
+    _record_operator_event(
+        store,
+        action="auto_reissue_dead_dependency",
+        summary=(
+            f"{original.assignment_id} ({original.status.value}) auto-reissued as "
+            f"{persisted.assignment_id} to unblock its dependents."
+        ),
+        assignment_id=persisted.assignment_id,
+        agent_id=persisted.assigned_to,
+        by=by,
+        payload={
+            "reissued_from": original.assignment_id,
+            "original_status": original.status.value,
+        },
+    )
+    return persisted
+
+
 def reissue_assignment_as_new(
     store: StateStore,
     assignment_id: str,
@@ -1624,25 +1727,7 @@ def reissue_assignment_as_new(
         raise AssignmentActionError(
             f"assignment {assignment_id} is already {original.status.value}"
         )
-    new_assignment = Assignment(
-        assignment=original.assignment,
-        assigned_to=original.assigned_to,
-        created_by=by,
-        source="manual_orchestration",
-        priority=original.priority,
-        work_mode=original.work_mode,
-        kind=original.kind,
-        goal_statement=original.goal_statement,
-        assignment_rationale=(
-            f"Reissued from {original.assignment_id} by {by}"
-            + (f": {note}" if note else "")
-        ),
-        dependency_ids=list(original.dependency_ids or []),
-        parent_assignment_id=original.parent_assignment_id,
-        created_by_role="operator",
-        reissued_from_assignment_id=original.assignment_id,
-    )
-    persisted = store.add_assignment(new_assignment)
+    persisted = store.add_assignment(_build_reissue_copy(original, by=by, note=note))
     terminal = (
         AssignmentStatus.SUPERSEDED
         if original.status == AssignmentStatus.QUEUED
@@ -1651,15 +1736,7 @@ def reissue_assignment_as_new(
     original.transition_to(terminal)
     original.progress_summary = f"superseded by {persisted.assignment_id} (by {by})"
     store.archive_assignment(original, original.progress_summary)
-    repointed: list[str] = []
-    for dependent in store.assignments():
-        if assignment_id in (dependent.dependency_ids or []):
-            dependent.dependency_ids = [
-                persisted.assignment_id if dep == assignment_id else dep
-                for dep in dependent.dependency_ids
-            ]
-            store.update_assignment(dependent)
-            repointed.append(dependent.assignment_id)
+    repointed = _repoint_dependents(store, assignment_id, persisted.assignment_id)
     _record_operator_event(
         store,
         action="reissue",

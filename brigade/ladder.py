@@ -373,7 +373,7 @@ def reassign_blocked(
     analysis_summary = (
         analysis.progress_summary if analysis and analysis.progress_summary else None
     )
-    target = _reassignment_target(store, blocked, assignments)
+    target = reassignment_target(store, blocked, assignments)
     previous = blocked.assigned_to
     if target is not None:
         blocked.assigned_to = target.agent_id
@@ -490,7 +490,7 @@ def _failure_analysis_text(blocked: Assignment) -> str:
     )
 
 
-def _reassignment_target(
+def reassignment_target(
     store: StateStore,
     blocked: Assignment,
     assignments: list[Assignment],
@@ -581,3 +581,7 @@ def _rewrite_heartbeat(store: StateStore, assignment: Assignment) -> None:
 def _mission_statement(store: StateStore) -> str | None:
     mission = store.mission()
     return mission.statement if mission else None
+
+
+# Backwards-compatible private alias.
+_reassignment_target = reassignment_target

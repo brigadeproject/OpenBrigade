@@ -27,6 +27,7 @@ class Settings:
     hung_task_seconds: int = 1800
     auto_recover_enabled: bool = True
     max_auto_reissue: int = 2
+    duplicate_reconciliation_enabled: bool = True
     proactive_mode: str = "create"
     proactive_creation_enabled: bool = True
     max_proactive_proposals_per_cycle: int = 1
@@ -282,6 +283,11 @@ def load_settings(
             "BRIGADE_MAX_AUTO_REISSUE",
             dotenv,
             config.get("max_auto_reissue", 2),
+        ),
+        duplicate_reconciliation_enabled=_env_bool(
+            "BRIGADE_DUPLICATE_RECONCILIATION_ENABLED",
+            dotenv,
+            config.get("duplicate_reconciliation_enabled", True),
         ),
         proactive_mode=(
             _env("BRIGADE_PROACTIVE_MODE", dotenv, config.get("proactive_mode", "create"))
