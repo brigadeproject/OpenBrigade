@@ -612,10 +612,27 @@ def build_assignment_prompt(
         registry,
         observations=observations,
     )
+    # Guidance also rides inside the floor's serialized assignment, but small
+    # models miss it there — a directive from the human deserves its own
+    # plainly-worded section.
+    guidance_lines: list[str] = []
+    if assignment.operator_guidance:
+        guidance_lines.append(
+            "OPERATOR GUIDANCE (direct instruction from the human operator — "
+            "follow it):"
+        )
+        for entry in assignment.operator_guidance:
+            stamp = str(entry.get("at") or "")[:10]
+            operator = entry.get("operator") or "operator"
+            guidance_lines.append(
+                f"- [{stamp}] {operator}: {entry.get('operator_message') or ''}"
+            )
+        guidance_lines.append("")
     return "\n".join(
         [
             context["system_prompt"],
             "",
+            *guidance_lines,
             "OpenBrigade agent response protocol:",
             "Return only one JSON object. Do not wrap it in Markdown.",
             "For final or checkpoint status, use:",

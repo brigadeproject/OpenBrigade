@@ -2652,6 +2652,30 @@ button.danger:disabled {
   accent-color: var(--c-warn);
 }
 
+/* Directive bar: steer any live task from chat — same visual family as the
+   escalation bar, but neutral (a directive is routine, not a warning). */
+.ob-directive-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 5px 9px;
+  border-radius: 5px;
+  background: rgba(93, 138, 196, 0.12);
+  box-shadow: var(--bevel-in);
+  font-size: 11px;
+}
+
+.ob-directive-bar .ob-escalation-toggle input[type="checkbox"] {
+  accent-color: var(--c-accent, #5d8ac4);
+}
+
+.ob-directive-task {
+  flex: 1 1 220px;
+  min-width: 0;
+  font-size: 11px;
+}
+
 /* Drag handle above the chat: pull up to grow the panel, double-click to
    reset. Height itself comes from inline style (state + localStorage). */
 .ob-chat-resize {

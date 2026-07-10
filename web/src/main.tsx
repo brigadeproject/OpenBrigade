@@ -4755,12 +4755,27 @@ function AgentChatPanel({
   const [message, setMessage] = useState("");
   const [pending, setPending] = useState(false);
   const [resumeEscalations, setResumeEscalations] = useState(false);
+  const [directiveMode, setDirectiveMode] = useState(false);
+  const [directiveTaskId, setDirectiveTaskId] = useState("");
   const selectedAgent = snapshot?.agents.find((agent) => agent.agent_id === selectedAgentId) || null;
   const escalated = (snapshot?.assignments || []).filter(
     (item) => item.assigned_to === selectedAgentId && item.awaiting_human && !item.archived,
   );
+  const TERMINAL_TASK_STATUSES = ["complete", "failed", "abandoned", "superseded"];
+  const steerableTasks = (snapshot?.assignments || []).filter(
+    (item) =>
+      item.assigned_to === selectedAgentId &&
+      !item.archived &&
+      !TERMINAL_TASK_STATUSES.includes(item.status),
+  );
+  const defaultDirectiveTask =
+    steerableTasks.find((item) => item.status === "working" || item.status === "assigned") ||
+    steerableTasks[0] ||
+    null;
   useEffect(() => {
     setResumeEscalations(false);
+    setDirectiveMode(false);
+    setDirectiveTaskId("");
   }, [selectedAgentId]);
   const messages = (snapshot?.messages || []).filter(
     (item) => item.sender === selectedAgentId || item.recipient === selectedAgentId,
@@ -4782,24 +4797,39 @@ function AgentChatPanel({
     }
     setPending(true);
     setStatus("Sending chat");
+    const guidanceTaskId = directiveMode
+      ? directiveTaskId || defaultDirectiveTask?.assignment_id || ""
+      : "";
     try {
-      await api<Record<string, unknown>>("/api/chat/ask-agent", {
+      const reply = await api<Record<string, unknown>>("/api/chat/ask-agent", {
         method: "POST",
         json: {
           agent_id: selectedAgentId,
           content: message,
           idempotency_key: randomId("web-chat"),
           resume_escalations: resumeEscalations && escalated.length > 0,
+          guidance_assignment_id: guidanceTaskId || undefined,
           ...modelRoutePayload(modelRoute),
         },
       });
       setMessage("");
       setResumeEscalations(false);
-      setStatus(
-        resumeEscalations && escalated.length > 0
-          ? `Chat reply saved — resuming ${escalated.length} escalated task(s)`
-          : "Chat reply saved",
-      );
+      setDirectiveMode(false);
+      const attached = reply.guidance_attached as
+        | { assignment_id?: string; error?: string }
+        | null
+        | undefined;
+      if (attached?.error) {
+        setStatus(`Chat reply saved — directive failed: ${attached.error}`);
+      } else if (attached?.assignment_id) {
+        setStatus(`Chat reply saved — directive attached to task ${attached.assignment_id.slice(0, 8)}`);
+      } else {
+        setStatus(
+          resumeEscalations && escalated.length > 0
+            ? `Chat reply saved — resuming ${escalated.length} escalated task(s)`
+            : "Chat reply saved",
+        );
+      }
       await onDone();
     } finally {
       setPending(false);
@@ -4838,6 +4868,33 @@ function AgentChatPanel({
             />
             Resume {escalated.length > 1 ? "them" : "it"} with this reply
           </label>
+        </div>
+      )}
+      {steerableTasks.length > 0 && (
+        <div className="ob-directive-bar">
+          <label className="ob-escalation-toggle" title="When checked, this message is also attached to the selected task as operator guidance — the agent sees it in its prompt on its next run, even if the task is queued or in progress.">
+            <input
+              type="checkbox"
+              checked={directiveMode}
+              disabled={!canChat || pending}
+              onChange={(event) => setDirectiveMode(event.target.checked)}
+            />
+            Send as directive to task
+          </label>
+          {directiveMode && (
+            <select
+              className="ob-directive-task"
+              value={directiveTaskId || defaultDirectiveTask?.assignment_id || ""}
+              disabled={!canChat || pending}
+              onChange={(event) => setDirectiveTaskId(event.target.value)}
+            >
+              {steerableTasks.map((item) => (
+                <option key={item.assignment_id} value={item.assignment_id}>
+                  {item.assignment_id.slice(0, 8)} · {item.status} · {item.assignment.slice(0, 60)}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
       )}
       <div className="chat-compose">

@@ -271,6 +271,7 @@ def send_user_chat(
     channel: str | None = None,
     idempotency_key: str | None = None,
     resume_escalations: bool = False,
+    guidance_assignment_id: str | None = None,
 ) -> dict[str, Any]:
     agent = next((item for item in store.agents() if item.agent_id == agent_id), None)
     if agent is None:
@@ -386,6 +387,25 @@ def send_user_chat(
             operator=sender,
             operator_message=content,
         )
+    guidance_attached: dict[str, Any] | None = None
+    if guidance_assignment_id and guidance_assignment_id not in {
+        item["assignment_id"] for item in resumed
+    }:
+        try:
+            guidance_attached = attach_operator_guidance(
+                store,
+                guidance_assignment_id,
+                operator=sender,
+                message=content,
+                conversation_id=conversation_id,
+            )
+        except AssignmentActionError as exc:
+            # The chat reply already succeeded — report the targeting problem
+            # instead of failing the whole exchange.
+            guidance_attached = {
+                "assignment_id": guidance_assignment_id,
+                "error": str(exc),
+            }
     return {
         "status": "complete",
         "conversation_id": conversation_id,
@@ -397,6 +417,7 @@ def send_user_chat(
         "model": response.model,
         "route_type": response.route_type,
         "assignments_resumed": resumed,
+        "guidance_attached": guidance_attached,
     }
 
 
@@ -415,6 +436,104 @@ def send_user_chat(
 MAX_OPERATOR_GUIDANCE_ENTRIES = 5
 
 
+def attach_operator_guidance(
+    store: StateStore,
+    assignment_id: str,
+    *,
+    operator: str,
+    message: str,
+    conversation_id: str | None = None,
+    resume: bool = True,
+) -> dict[str, Any]:
+    """Attach an operator directive to any non-terminal assignment.
+
+    The entry lands in ``operator_guidance`` and rides into the agent's next
+    prompt via the assignment floor — the assignment does not need to be
+    escalated. An awaiting-human assignment is additionally taken off the
+    shelf (the pre-existing escalation-resume behavior) unless ``resume`` is
+    False.
+    """
+    assignment = store.find_assignment(assignment_id)
+    if assignment is None:
+        raise AssignmentActionError(f"unknown assignment: {assignment_id}")
+    if assignment.status in TERMINAL_STATUSES:
+        raise AssignmentActionError(
+            f"assignment {assignment_id} is already {assignment.status.value}"
+        )
+    guidance = {
+        "at": utc_now_iso(),
+        "operator": operator,
+        "conversation_id": conversation_id,
+        "operator_message": message[:4000],
+    }
+    assignment.operator_guidance = [
+        *assignment.operator_guidance[-(MAX_OPERATOR_GUIDANCE_ENTRIES - 1):],
+        guidance,
+    ]
+    assignment.updated_at = utc_now_iso()
+    store.update_assignment(assignment)
+    resumed = False
+    if resume and assignment.awaiting_human:
+        if assignment.status == AssignmentStatus.BLOCKED:
+            reissue_assignment(store, assignment.assignment_id, by=operator)
+        else:
+            assignment.awaiting_human = False
+            assignment.updated_at = utc_now_iso()
+            store.update_assignment(assignment)
+        resumed = True
+    refreshed = store.find_assignment(assignment.assignment_id) or assignment
+    agent_id = assignment.assigned_to
+    channel = conversation_id or f"user:{operator}:{agent_id}"
+    store.add_message(
+        ChatMessage(
+            channel=channel,
+            sender="orchestrator",
+            recipient=agent_id,
+            content=(
+                f"Operator reply applied: assignment {assignment.assignment_id} "
+                f"was re-queued for {agent_id} with this conversation attached "
+                "as guidance."
+                if resumed
+                else (
+                    f"Operator guidance attached to assignment "
+                    f"{assignment.assignment_id} ({refreshed.status.value}); "
+                    f"{agent_id} will see it on its next run."
+                )
+            ),
+            metadata={
+                "kind": "chat_guidance_applied",
+                "conversation_id": channel,
+                "assignment_id": assignment.assignment_id,
+            },
+        )
+    )
+    _record_operator_event(
+        store,
+        action="attach_guidance",
+        summary=(
+            f"operator guidance attached to {assignment.assignment_id}"
+            + (" (escalation resumed)" if resumed else "")
+        ),
+        assignment_id=assignment.assignment_id,
+        agent_id=agent_id,
+        by=operator,
+        payload={"resumed": resumed, "status": refreshed.status.value},
+    )
+    LOGGER.info(
+        "chat_guidance_applied",
+        extra={
+            "assignment_id": assignment.assignment_id,
+            "agent_id": agent_id,
+            "operator": operator,
+        },
+    )
+    return {
+        "assignment_id": assignment.assignment_id,
+        "status": refreshed.status.value,
+        "resumed": resumed,
+    }
+
+
 def _resume_escalations_with_chat_guidance(
     store: StateStore,
     *,
@@ -427,55 +546,18 @@ def _resume_escalations_with_chat_guidance(
     for assignment in store.assignments():
         if assignment.assigned_to != agent_id or not assignment.awaiting_human:
             continue
-        guidance = {
-            "at": utc_now_iso(),
-            "operator": operator,
-            "conversation_id": conversation_id,
-            "operator_message": operator_message[:4000],
-        }
-        assignment.operator_guidance = [
-            *assignment.operator_guidance[-(MAX_OPERATOR_GUIDANCE_ENTRIES - 1):],
-            guidance,
-        ]
-        store.update_assignment(assignment)
-        if assignment.status == AssignmentStatus.BLOCKED:
-            reissue_assignment(store, assignment.assignment_id, by=operator)
-        else:
-            assignment.awaiting_human = False
-            assignment.updated_at = utc_now_iso()
-            store.update_assignment(assignment)
+        applied = attach_operator_guidance(
+            store,
+            assignment.assignment_id,
+            operator=operator,
+            message=operator_message,
+            conversation_id=conversation_id,
+        )
         resumed.append(
             {
-                "assignment_id": assignment.assignment_id,
-                "status": (
-                    store.find_assignment(assignment.assignment_id) or assignment
-                ).status.value,
+                "assignment_id": applied["assignment_id"],
+                "status": applied["status"],
             }
-        )
-        store.add_message(
-            ChatMessage(
-                channel=conversation_id,
-                sender="orchestrator",
-                recipient=agent_id,
-                content=(
-                    f"Operator reply applied: assignment {assignment.assignment_id} "
-                    f"was re-queued for {agent_id} with this conversation attached "
-                    "as guidance."
-                ),
-                metadata={
-                    "kind": "chat_guidance_applied",
-                    "conversation_id": conversation_id,
-                    "assignment_id": assignment.assignment_id,
-                },
-            )
-        )
-        LOGGER.info(
-            "chat_guidance_applied",
-            extra={
-                "assignment_id": assignment.assignment_id,
-                "agent_id": agent_id,
-                "operator": operator,
-            },
         )
     return resumed
 

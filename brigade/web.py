@@ -48,6 +48,7 @@ from brigade.services import (
     AssignmentActionError,
     ProposalAlreadyDecidedError,
     UnknownProposalError,
+    attach_operator_guidance,
     build_chat_payload,
     build_cockpit_payload,
     build_hierarchy_payload,
@@ -837,6 +838,28 @@ def create_app(
         except AssignmentActionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/tasks/{assignment_id}/guidance")
+    async def attach_task_guidance(
+        assignment_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("chat:write", current)
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            raise HTTPException(status_code=422, detail="message is required")
+        if store.find_assignment(assignment_id) is None:
+            raise HTTPException(status_code=404, detail="unknown assignment")
+        try:
+            return attach_operator_guidance(
+                store,
+                assignment_id,
+                operator=user.username if user else "web",
+                message=message,
+            )
+        except AssignmentActionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/chat/channels")
     async def chat_channels(current: AuthResult = auth_dependency) -> list[dict[str, object]]:
         require("chat:read", current)
@@ -886,6 +909,7 @@ def create_app(
             channel=payload.get("channel"),
             idempotency_key=payload.get("idempotency_key") or f"web:{uuid4()}",
             resume_escalations=bool(payload.get("resume_escalations")),
+            guidance_assignment_id=payload.get("guidance_assignment_id"),
         )
 
     @app.post("/api/chat/ask-orchestrator")
