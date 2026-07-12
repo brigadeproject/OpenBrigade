@@ -2228,9 +2228,17 @@ def _find_chat_by_idempotency(store: StateStore, key: str) -> ChatMessage | None
     )
 
 
+# Chat requests block an HTTP response while waiting, so they get a shorter
+# lock-wait budget than the runner; with per-model-call locking a slot usually
+# frees within one completion.
+CHAT_LOCAL_INFERENCE_WAIT_SECONDS = 120
+
+
 def _acquire_chat_local_inference_lock(store: StateStore, holder: str) -> None:
     try:
-        _acquire_local_inference_lock(store, holder)
+        _acquire_local_inference_lock(
+            store, holder, wait_seconds=CHAT_LOCAL_INFERENCE_WAIT_SECONDS
+        )
         return
     except RuntimeError as exc:
         if "local inference unavailable until" not in str(exc):
@@ -2247,7 +2255,9 @@ def _acquire_chat_local_inference_lock(store: StateStore, holder: str) -> None:
             "next_available": now,
         }
     )
-    _acquire_local_inference_lock(store, holder)
+    _acquire_local_inference_lock(
+        store, holder, wait_seconds=CHAT_LOCAL_INFERENCE_WAIT_SECONDS
+    )
 
 
 def _release_chat_local_inference_lock(store: StateStore, holder: str) -> None:

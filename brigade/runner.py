@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -29,7 +32,6 @@ from brigade.tools import (
     default_tool_registry,
 )
 from brigade.workspace import (
-    REQUIRED_AGENT_FILES,
     HeartbeatValidationError,
     parse_heartbeat_assignment_block,
     write_heartbeat_assignment,
@@ -37,6 +39,13 @@ from brigade.workspace import (
 
 LOCAL_INFERENCE_LOCK_TTL_SECONDS = 600
 LOCAL_INFERENCE_RELEASE_COOLDOWN_SECONDS = 0
+# The lock is held per model call (not per assignment run), so contenders
+# normally wait at most one completion; the budget covers a slow local model
+# plus provider retries before surfacing backpressure.
+LOCAL_INFERENCE_ACQUIRE_WAIT_SECONDS = float(
+    os.environ.get("BRIGADE_LOCAL_INFERENCE_WAIT_SECONDS", "480")
+)
+LOCAL_INFERENCE_ACQUIRE_POLL_SECONDS = 2.0
 LOCAL_INFERENCE_BACKPRESSURE_PREFIXES = (
     "local inference unavailable until ",
     "local inference already held by ",
@@ -52,7 +61,6 @@ DECOMPOSITION_SOURCES = {
     "orchestrator_mission_continuation",
 }
 DECOMPOSITION_TOOLS = {"create_subtasks", "delegate"}
-MAX_CONTEXT_FILE_CHARS = 4000
 # Tool outputs re-enter the next iteration's prompt; unbounded observations
 # (full web pages, large files) bloat the prompt enough to destabilize local
 # models, so cap each one like workspace context files.
@@ -68,6 +76,12 @@ TRANSIENT_ERROR_HINTS = (
     "5",
 )
 LOGGER = logging.getLogger(__name__)
+
+# Least-recently-served ordering for managed-agent runs. In-process state is
+# sufficient: a single orchestrator daemon executes all managed runs, and the
+# goal is only to stop one agent from pinning the front of the queue across
+# cycles.
+_LAST_SERVED_AT: dict[str, float] = {}
 
 
 class MalformedProviderOutput(ValueError):
@@ -106,7 +120,14 @@ def run_managed_agents(
     provider_factory: Callable[[str], ModelProvider] | None = None,
     fallback_provider: ModelProvider | None = None,
 ) -> list[RunResult]:
-    target_ids = [agent_id] if agent_id else [item.agent_id for item in store.agents()]
+    if agent_id:
+        target_ids = [agent_id]
+    else:
+        # Serve least-recently-served agents first; ties keep creation order.
+        target_ids = sorted(
+            (item.agent_id for item in store.agents()),
+            key=lambda item: _LAST_SERVED_AT.get(item, 0.0),
+        )
     results: list[RunResult] = []
     registry = tool_registry or default_tool_registry()
     for current_agent_id in target_ids:
@@ -124,6 +145,7 @@ def run_managed_agents(
                     tool_registry=registry,
                 )
             )
+            _LAST_SERVED_AT[current_agent_id] = time.monotonic()
         except RuntimeError as exc:
             backpressure = is_local_inference_backpressure(exc)
             if (
@@ -155,12 +177,16 @@ def run_managed_agents(
                             tool_registry=registry,
                         )
                     )
+                    _LAST_SERVED_AT[current_agent_id] = time.monotonic()
                     continue
                 except RuntimeError as fallback_exc:
                     exc = fallback_exc
                     backpressure = is_local_inference_backpressure(exc)
             summary = str(exc)
             if not backpressure:
+                # A backpressured agent was never served, so it keeps its spot
+                # at the front of the next cycle's ordering.
+                _LAST_SERVED_AT[current_agent_id] = time.monotonic()
                 store.add_alert(f"agent {current_agent_id} run deferred: {summary}")
             log = LOGGER.info if backpressure else LOGGER.warning
             log(
@@ -284,13 +310,7 @@ def run_agent_once(
             )
 
     cloud_job: dict[str, object] | None = None
-    lock_acquired = False
-    local_release_cooldown_seconds = LOCAL_INFERENCE_RELEASE_COOLDOWN_SECONDS
     try:
-        if route_type == "local":
-            _acquire_local_inference_lock(store, agent_id)
-            lock_acquired = True
-
         if route_type == "cloud":
             cloud_job = {
                 "job_id": str(uuid4()),
@@ -317,6 +337,7 @@ def run_agent_once(
             store,
             provider,
             registry,
+            lock_local=route_type == "local",
         )
         LOGGER.info(
             "agent_run_completed",
@@ -379,8 +400,6 @@ def run_agent_once(
         persist_financial_report(store, store.data_dir)
         return result
     except Exception as exc:
-        if route_type == "local" and isinstance(exc, ModelUnavailableError):
-            local_release_cooldown_seconds = 0
         if cloud_job is not None:
             cloud_job["status"] = "failed"
             cloud_job["updated_at"] = utc_now_iso()
@@ -388,12 +407,6 @@ def run_agent_once(
             store.upsert_cloud_job(cloud_job)
         raise
     finally:
-        if lock_acquired:
-            _release_local_inference_lock(
-                store,
-                agent_id,
-                cooldown_seconds=local_release_cooldown_seconds,
-            )
         if execution_claim_acquired:
             store.release_assignment_execution_claim(
                 assignment.assignment_id,
@@ -407,6 +420,8 @@ def _complete_assignment_with_tools(
     store: StateStore,
     provider: ModelProvider,
     registry: ToolRegistry,
+    *,
+    lock_local: bool = False,
 ) -> tuple[list[ModelResponse], ParsedAgentResponse, list[dict[str, Any]]]:
     responses: list[ModelResponse] = []
     observations: list[dict[str, Any]] = []
@@ -422,7 +437,14 @@ def _complete_assignment_with_tools(
             registry,
             observations=observations,
         )
-        response = _complete_with_retries(provider, prompt, tools=native_tools)
+        response = _locked_complete_with_retries(
+            store,
+            agent.agent_id,
+            provider,
+            prompt,
+            tools=native_tools,
+            lock_local=lock_local,
+        )
         responses.append(response)
         parsed = parse_agent_response(response.text)
         if parsed.status == "complete" and assignment.kind != AssignmentKind.REST:
@@ -655,18 +677,6 @@ def build_assignment_prompt(
             compact_json(context),
         ]
     )
-
-
-def _workspace_context(workspace: Path) -> dict[str, str]:
-    context: dict[str, str] = {}
-    for filename in REQUIRED_AGENT_FILES:
-        path = workspace / filename
-        if not path.exists() or not path.is_file():
-            context[filename] = "<missing>"
-            continue
-        text = path.read_text(encoding="utf-8")
-        context[filename] = _truncate(text, MAX_CONTEXT_FILE_CHARS)
-    return context
 
 
 def _dependency_state(store: StateStore, assignment: Assignment) -> list[dict[str, Any]]:
@@ -1047,6 +1057,33 @@ def _native_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
     return specs
 
 
+def _locked_complete_with_retries(
+    store: StateStore,
+    agent_id: str,
+    provider: ModelProvider,
+    prompt: str,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    lock_local: bool = False,
+) -> ModelResponse:
+    """Run one model completion, holding the local-inference lock only for the
+    duration of that call so other consumers (chat, other agents) can
+    interleave between iterations and tool executions."""
+    if not lock_local:
+        return _complete_with_retries(provider, prompt, tools=tools)
+    _acquire_local_inference_lock(store, agent_id)
+    cooldown_seconds = LOCAL_INFERENCE_RELEASE_COOLDOWN_SECONDS
+    try:
+        return _complete_with_retries(provider, prompt, tools=tools)
+    except ModelUnavailableError:
+        # A missing local model must not start a cooldown that would delay the
+        # fallback provider.
+        cooldown_seconds = 0
+        raise
+    finally:
+        _release_local_inference_lock(store, agent_id, cooldown_seconds=cooldown_seconds)
+
+
 def _complete_with_retries(
     provider: ModelProvider,
     prompt: str,
@@ -1179,7 +1216,44 @@ def _write_transcript(
     return path
 
 
-def _acquire_local_inference_lock(store: StateStore, agent_id: str) -> None:
+def _acquire_local_inference_lock(
+    store: StateStore,
+    agent_id: str,
+    *,
+    wait_seconds: float | None = None,
+) -> None:
+    """Acquire the local-inference lock, waiting in a bounded poll loop while
+    another holder finishes instead of failing fast."""
+    budget = LOCAL_INFERENCE_ACQUIRE_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            _try_acquire_local_inference_lock(store, agent_id)
+            return
+        except RuntimeError as exc:
+            if not is_local_inference_backpressure(exc):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not _lock_may_free_within(exc, remaining):
+                raise
+            time.sleep(min(LOCAL_INFERENCE_ACQUIRE_POLL_SECONDS, remaining))
+
+
+def _lock_may_free_within(exc: BaseException, remaining_seconds: float) -> bool:
+    """A cooldown error names when inference frees up; polling past the wait
+    budget is pointless, so fail fast when that moment is out of reach."""
+    message = str(exc)
+    prefix = "local inference unavailable until "
+    if not message.startswith(prefix):
+        return True
+    try:
+        available_at = parse_utc_iso(message[len(prefix) :].strip())
+    except (ValueError, TypeError):
+        return True
+    return available_at <= utc_now() + timedelta(seconds=remaining_seconds)
+
+
+def _try_acquire_local_inference_lock(store: StateStore, agent_id: str) -> None:
     acquire = getattr(store, "acquire_local_inference_lock", None)
     if callable(acquire):
         acquire(agent_id, lock_ttl_seconds=LOCAL_INFERENCE_LOCK_TTL_SECONDS)

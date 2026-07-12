@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -11,7 +12,11 @@ from brigade.memory import (
     curate_workspace_memory,
 )
 from brigade.providers import ModelResponse, ModelUnavailableError
-from brigade.runner import run_agent_once, run_managed_agents
+from brigade.runner import (
+    _acquire_local_inference_lock,
+    run_agent_once,
+    run_managed_agents,
+)
 from brigade.schemas import Agent, Assignment, AssignmentStatus, Goal, Mission
 from brigade.state import JsonStateStore
 from brigade.time import add_seconds_iso, utc_now_iso
@@ -423,7 +428,8 @@ def test_run_agent_once_abandons_after_ten_cycles(tmp_path):
     assert store.alerts()
 
 
-def test_run_agent_once_respects_local_inference_lock(tmp_path):
+def test_run_agent_once_respects_local_inference_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("brigade.runner.LOCAL_INFERENCE_ACQUIRE_WAIT_SECONDS", 0)
     store = JsonStateStore(tmp_path / "state.json")
     agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
     assignment = Assignment(
@@ -451,7 +457,8 @@ def test_run_agent_once_respects_local_inference_lock(tmp_path):
     assert store.assignment_execution_claim(assignment.assignment_id) is None
 
 
-def test_run_managed_agents_defers_local_cooldown_without_crashing(tmp_path):
+def test_run_managed_agents_defers_local_cooldown_without_crashing(tmp_path, monkeypatch):
+    monkeypatch.setattr("brigade.runner.LOCAL_INFERENCE_ACQUIRE_WAIT_SECONDS", 0)
     store = JsonStateStore(tmp_path / "state.json")
     agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
     assignment = Assignment(
@@ -568,6 +575,116 @@ def test_run_managed_agents_runs_next_local_worker_without_cooldown(tmp_path):
     state = store.local_inference()
     assert state["status"] == "idle"
     assert state["next_available"] == state["last_completed"]
+
+
+def test_local_lock_held_per_model_call_not_across_tool_execution(tmp_path, monkeypatch):
+    store = JsonStateStore(tmp_path / "state.json")
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    assignment = Assignment(
+        assignment="Read memory before answering",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+    )
+    assignment.transition_to(AssignmentStatus.ASSIGNED)
+    store.add_agent(agent)
+    store.add_assignment(assignment)
+    heartbeat = write_heartbeat_assignment(agent, assignment, tmp_path)
+    (heartbeat.parent / "MEMORY.md").write_text("Useful memory.", encoding="utf-8")
+
+    lock_status_during_completion: list[str] = []
+
+    class LocalToolProvider(ToolUsingProvider):
+        route_type = "local"
+
+        def complete(self, prompt: str) -> ModelResponse:
+            lock_status_during_completion.append(store.local_inference().get("status"))
+            return super().complete(prompt)
+
+    registry = default_tool_registry()
+    lock_status_during_tools: list[str] = []
+    original_execute = registry.execute
+
+    def probing_execute(name, context, arguments):
+        lock_status_during_tools.append(store.local_inference().get("status"))
+        return original_execute(name, context, arguments)
+
+    monkeypatch.setattr(registry, "execute", probing_execute)
+
+    result = run_agent_once("sage", store, LocalToolProvider(), tool_registry=registry)
+
+    assert result.status == "complete"
+    assert lock_status_during_completion == ["busy", "busy"]
+    assert lock_status_during_tools == ["idle"]
+    assert store.local_inference()["status"] == "idle"
+
+
+def test_acquire_local_inference_lock_waits_out_short_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setattr("brigade.runner.LOCAL_INFERENCE_ACQUIRE_POLL_SECONDS", 0.05)
+    store = JsonStateStore(tmp_path / "state.json")
+    store.set_local_inference(
+        {
+            "status": "idle",
+            "holder": None,
+            "last_completed": utc_now_iso(),
+            "next_available": add_seconds_iso(utc_now_iso(), 1),
+        }
+    )
+
+    _acquire_local_inference_lock(store, "sage", wait_seconds=10)
+
+    state = store.local_inference()
+    assert state["status"] == "busy"
+    assert state["holder"] == "sage"
+
+
+def test_acquire_local_inference_lock_fails_fast_when_cooldown_exceeds_budget(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    store.set_local_inference(
+        {
+            "status": "idle",
+            "holder": None,
+            "last_completed": utc_now_iso(),
+            "next_available": add_seconds_iso(utc_now_iso(), 900),
+        }
+    )
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="local inference unavailable"):
+        _acquire_local_inference_lock(store, "sage", wait_seconds=30)
+    assert time.monotonic() - started < 5
+
+
+def test_run_managed_agents_serves_least_recently_served_first(tmp_path, monkeypatch):
+    store = JsonStateStore(tmp_path / "state.json")
+    assignments: dict[str, str] = {}
+    for agent_id in ("sage", "garde"):
+        agent = Agent(
+            agent_id=agent_id,
+            display_name=agent_id.upper(),
+            workspace_path=f"workspace-{agent_id}",
+        )
+        assignment = Assignment(
+            assignment=f"Complete work for {agent_id}",
+            assigned_to=agent_id,
+            created_by="human",
+            source="direct_command",
+        )
+        assignment.transition_to(AssignmentStatus.ASSIGNED)
+        store.add_agent(agent)
+        store.add_assignment(assignment)
+        write_heartbeat_assignment(agent, assignment, tmp_path)
+        assignments[agent_id] = assignment.assignment_id
+
+    # sage was served recently; garde never — garde must go first this cycle.
+    monkeypatch.setattr("brigade.runner._LAST_SERVED_AT", {"sage": time.monotonic()})
+
+    results = run_managed_agents(store, CompleteProvider())
+
+    assert [item.assignment_id for item in results] == [
+        assignments["garde"],
+        assignments["sage"],
+    ]
 
 
 def test_run_managed_agents_falls_back_to_default_provider(tmp_path):
