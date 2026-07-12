@@ -71,7 +71,11 @@ def test_ingested_document_produces_intake_proposal_on_next_cycle(tmp_path):
     store = _store(tmp_path)
     _ingest(store, title="Release notes", document_id="doc-1", when="2026-06-12T00:00:00Z")
 
-    result = run_full_cycle(store, None, OrchestrationConfig(proactive_mode="off"))
+    # rest_enabled=False keeps the outcome intake-only even when the suite
+    # runs inside the UTC rest window.
+    result = run_full_cycle(
+        store, None, OrchestrationConfig(proactive_mode="off", rest_enabled=False)
+    )
 
     intake = result.sub_results["intake"]
     assert intake["mode"] == "propose"

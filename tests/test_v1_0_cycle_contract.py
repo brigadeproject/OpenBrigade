@@ -394,7 +394,10 @@ def test_run_full_cycle_dispatches_and_persists_v2_record(tmp_path):
 def test_run_full_cycle_empty_queue_records_proposal_outcome(tmp_path):
     store = _store_with_team(tmp_path)
 
-    result = run_full_cycle(store)
+    # rest_enabled=False: inside the UTC rest window the cycle would create a
+    # rest assignment and report mode "worked" instead of the quiet outcome
+    # this test asserts.
+    result = run_full_cycle(store, config=OrchestrationConfig(rest_enabled=False))
 
     assert result.outcome.mode == "no_work"
     assert result.outcome.reason == "queue_empty_proposal_recorded"
@@ -403,7 +406,7 @@ def test_run_full_cycle_empty_queue_records_proposal_outcome(tmp_path):
 def test_idle_on_call_chief_is_clean_no_work_not_stale(tmp_path):
     store = _store_with_team(tmp_path, chief_goal_mode="on_call")
 
-    result = run_full_cycle(store)
+    result = run_full_cycle(store, config=OrchestrationConfig(rest_enabled=False))
 
     # No synthesized work for the on-call chief and a clean taxonomy outcome.
     assert store.assignments() == []

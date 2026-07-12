@@ -1221,6 +1221,9 @@ def test_cli_daemon_records_one_idle_mission_proposal_without_creating_assignmen
     # shipped default is now create-mode (1.0.2).
     monkeypatch.setenv("BRIGADE_PROACTIVE_MODE", "propose")
     monkeypatch.setenv("BRIGADE_PROACTIVE_CREATION_ENABLED", "false")
+    # Rest creation inside the UTC rest window would add cycle actions and
+    # break the single-proposal assertion below.
+    monkeypatch.setenv("BRIGADE_REST_ENABLED", "false")
     monkeypatch.setattr(
         "brigade.cli.provider_from_settings",
         lambda *args, **kwargs: TestProvider(),

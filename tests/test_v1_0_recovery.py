@@ -525,6 +525,9 @@ def test_starvation_alert_reaches_orchestrator_chat(tmp_path):
         proactive_mode="off",
         blocker_resolution_enabled=False,
         dispatch_starvation_alert_cycles=1,
+        # A rest assignment created inside the UTC rest window would count as
+        # cycle work and reset the starvation streak.
+        rest_enabled=False,
     )
     result = run_full_cycle(store, None, config)
 
