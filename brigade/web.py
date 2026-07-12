@@ -1089,6 +1089,14 @@ def create_app(
             return index_path.read_text(encoding="utf-8")
         return _fallback_html()
 
+    @app.get("/mobile", response_class=HTMLResponse)
+    @app.get("/mobile.html", response_class=HTMLResponse)
+    async def mobile() -> str:
+        mobile_path = static_root / "mobile.html"
+        if mobile_path.exists():
+            return mobile_path.read_text(encoding="utf-8")
+        return _fallback_html()
+
     return app
 
 
