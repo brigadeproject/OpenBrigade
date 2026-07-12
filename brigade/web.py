@@ -71,7 +71,11 @@ from brigade.services import (
 from brigade.store import RedisRuntimeClient, StateStore, open_state_store
 from brigade.time import utc_now_iso
 from brigade.tui import build_dashboard_payload
-from brigade.workspace import ensure_agent_workspace, validate_agent_workspace
+from brigade.workspace import (
+    REQUIRED_AGENT_FILES,
+    ensure_agent_workspace,
+    validate_agent_workspace,
+)
 
 
 def create_app(
@@ -625,6 +629,60 @@ def create_app(
         updated = replace(agent, **updates)
         store.add_agent(updated)
         return updated.to_dict()
+
+    MAX_WORKSPACE_FILE_BYTES = 64 * 1024
+
+    def _workspace_file_path(agent_id: str, filename: str) -> Path:
+        agent = next(
+            (item for item in store.agents() if item.agent_id == agent_id), None
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="unknown agent")
+        # Whitelist membership is the traversal guard: only bare manifest
+        # filenames are ever joined to the workspace path.
+        if filename not in REQUIRED_AGENT_FILES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "filename must be one of: " + ", ".join(REQUIRED_AGENT_FILES)
+                ),
+            )
+        return settings.data_dir / agent.workspace_path / filename
+
+    @app.get("/api/agents/{agent_id}/files/{filename}")
+    async def read_agent_file(
+        agent_id: str,
+        filename: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        require("status:read", current)
+        path = _workspace_file_path(agent_id, filename)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            raise HTTPException(status_code=404, detail="file not found") from None
+        return {"agent_id": agent_id, "filename": filename, "content": content}
+
+    @app.put("/api/agents/{agent_id}/files/{filename}")
+    async def write_agent_file(
+        agent_id: str,
+        filename: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        require("agent:write", current)
+        path = _workspace_file_path(agent_id, filename)
+        content = payload.get("content")
+        if not isinstance(content, str):
+            raise HTTPException(status_code=400, detail="content must be a string")
+        if len(content.encode("utf-8")) > MAX_WORKSPACE_FILE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"content exceeds {MAX_WORKSPACE_FILE_BYTES} bytes",
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return {"status": "saved", "agent_id": agent_id, "filename": filename}
 
     @app.get("/api/teams")
     async def teams(current: AuthResult = auth_dependency) -> dict[str, object]:

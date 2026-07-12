@@ -3993,3 +3993,78 @@ button.danger:disabled {
     min-height: 0;
   }
 }
+
+/* ===== Agents & Teams tab ===== */
+.agents-view {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.agents-layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.agents-roster .ob-roster-list {
+  max-height: calc(100vh - 260px);
+}
+
+.ob-agent-row.is-selected {
+  background: var(--c-panel);
+  box-shadow: var(--bevel-out), 0 0 9px rgba(91, 157, 255, 0.35);
+}
+
+.agents-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.agents-tabs {
+  grid-template-columns: repeat(2, minmax(0, 200px));
+  border-bottom: none;
+  padding: 0;
+}
+
+.agents-tabs button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.ob-file-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.ob-file-editor-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ob-file-editor-bar select {
+  flex: 1;
+}
+
+.ob-file-editor-text {
+  min-height: 260px;
+  resize: vertical;
+  font-family: "Cascadia Mono", "Fira Code", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+@media (max-width: 1180px) {
+  .agents-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .agents-roster .ob-roster-list {
+    max-height: 280px;
+  }
+}

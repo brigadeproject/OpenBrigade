@@ -22,6 +22,7 @@ const OPS_ROOM_FALLBACK_ROOMS: OpsRoomRoom[] = [
 const TAB_VIEWS = [
   { id: "cockpit", label: "Cockpit" },
   { id: "brigade", label: "Brigade" },
+  { id: "agents", label: "Agents & Teams" },
   { id: "proposals", label: "Proposals" },
   { id: "telemetry", label: "Telemetry" },
 ] as const;
@@ -126,6 +127,7 @@ type VisualAgent = {
   model_name: string;
   team_id?: string | null;
   team_role: string;
+  specialties?: string[];
   status: string;
   activity: string;
   room?: AgentRoom | null;
@@ -389,7 +391,6 @@ function App() {
   const [proposals, setProposals] = useState<ProposalRecord[]>([]);
   const [connectorApprovals, setConnectorApprovals] = useState<ConnectorApprovalRecord[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState("");
-  const [agentModelSelections, setAgentModelSelections] = useState<Record<string, ModelRoute>>({});
   const [orchestratorModel, setOrchestratorModel] = useState<ModelRoute | null>(null);
   const [status, setStatus] = useState("Loading");
   const [streamStatus, setStreamStatus] = useState("connecting");
@@ -656,9 +657,10 @@ function App() {
 
   const agents = useMemo(() => allAgents(cockpit, snapshot), [cockpit, snapshot]);
   const recommendedModel = modelRouteFromOption(models?.recommended || null);
-  const selectedAgentModel = selectedAgentId
-    ? agentModelSelections[selectedAgentId] || recommendedModel
-    : recommendedModel;
+  // Chat's fallback route when an agent has no configured/last-run model; the
+  // per-agent override map went away with the Cockpit manage box (agent models
+  // are edited in the Agents & Teams tab and persisted via PATCH).
+  const selectedAgentModel = recommendedModel;
 
   const selectAgent = useCallback((agentId: string, panel: "tasks" | "chat" | "goals" = "tasks") => {
     if (!agentId) {
@@ -681,13 +683,6 @@ function App() {
     setTaskDialogOpen(false);
     setTaskDialogDraft(null);
   }, []);
-
-  const setSelectedAgentModel = useCallback((route: ModelRoute) => {
-    if (!selectedAgentId) {
-      return;
-    }
-    setAgentModelSelections((current) => ({ ...current, [selectedAgentId]: route }));
-  }, [selectedAgentId]);
 
   const statusTone = tokenExpired || authMessage ? "bad" : streamStatus === "live" ? "good" : "warn";
 
@@ -761,21 +756,13 @@ function App() {
           <CockpitView
             cockpit={cockpit}
             settings={settings}
-            auth={auth}
-            authMessage={authMessage}
-            tokenExpired={tokenExpired}
             models={models}
-            selectedAgentId={selectedAgentId}
-            selectedAgentModel={selectedAgentModel}
             orchestratorModel={orchestratorModel || recommendedModel}
             heartbeatPaused={heartbeatPaused}
             can={can}
             api={api}
             onSelectAgent={selectAgent}
-            onSelectedAgentModelChange={setSelectedAgentModel}
             onOrchestratorModelChange={setOrchestratorModel}
-            onModelsChange={setModels}
-            onSettingsChange={setSettings}
             onRefresh={refreshAll}
             setStatus={setStatus}
             onOpenTaskDialog={openTaskDialog}
@@ -786,8 +773,25 @@ function App() {
             settings={settings}
             models={models}
             canEdit={can("task:write")}
+            canManageModels={can("admin")}
+            auth={auth}
+            authMessage={authMessage}
+            tokenExpired={tokenExpired}
             api={api}
+            onModelsChange={setModels}
             onSettingsChange={setSettings}
+            onRefresh={refreshAll}
+            setStatus={setStatus}
+          />
+        ) : view === "agents" ? (
+          <AgentManagementView
+            agents={agents}
+            teams={snapshot?.teams || cockpit?.teams || []}
+            models={models}
+            can={can}
+            api={api}
+            onOpenAgent={selectAgent}
+            onRefresh={refreshAll}
             setStatus={setStatus}
           />
         ) : view === "proposals" ? (
@@ -1118,16 +1122,28 @@ function TelemetryView({
   settings,
   models,
   canEdit,
+  canManageModels,
+  auth,
+  authMessage,
+  tokenExpired,
   api,
+  onModelsChange,
   onSettingsChange,
+  onRefresh,
   setStatus,
 }: {
   cockpit: CockpitPayload | null;
   settings: SettingsPayload | null;
   models: ModelInventory | null;
   canEdit: boolean;
+  canManageModels: boolean;
+  auth: AuthMe | null;
+  authMessage: string;
+  tokenExpired: boolean;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  onModelsChange: (models: ModelInventory) => void;
   onSettingsChange: (settings: SettingsPayload) => void;
+  onRefresh: () => Promise<void>;
   setStatus: (message: string) => void;
 }) {
   const usage = cockpit?.usage || null;
@@ -1463,6 +1479,43 @@ function TelemetryView({
             >
               {savingProactive ? "Saving…" : "Save"}
             </button>
+          </div>
+        </div>
+      </div>
+
+      {/* System configuration panels, relocated from the Cockpit manage box. */}
+      <div className="ob-manage-grid">
+        <div className="ob-panel ob-manage-panel">
+          <div className="ob-panel-head"><span className="ob-panel-title">Models</span></div>
+          <div className="ob-panel-pad">
+            <ModelSummary
+              cockpit={cockpit}
+              models={models}
+              canEdit={canManageModels}
+              api={api}
+              onModelsChange={onModelsChange}
+              onSettingsChange={onSettingsChange}
+              onDone={onRefresh}
+              setStatus={setStatus}
+            />
+          </div>
+        </div>
+        <div className="ob-panel ob-manage-panel">
+          <div className="ob-panel-head"><span className="ob-panel-title">Usage</span></div>
+          <div className="ob-panel-pad">
+            <UsageSummary usage={usage} />
+          </div>
+        </div>
+        <div className="ob-panel ob-manage-panel">
+          <div className="ob-panel-head"><span className="ob-panel-title">Settings &amp; Auth</span></div>
+          <div className="ob-panel-pad">
+            <SettingsStatus
+              settings={settings}
+              cockpit={cockpit}
+              auth={auth}
+              authMessage={authMessage}
+              tokenExpired={tokenExpired}
+            />
           </div>
         </div>
       </div>
@@ -2636,47 +2689,30 @@ function ManualOrchestrationView({
 function CockpitView({
   cockpit,
   settings,
-  auth,
-  authMessage,
-  tokenExpired,
   models,
-  selectedAgentId,
-  selectedAgentModel,
   orchestratorModel,
   heartbeatPaused,
   can,
   api,
   onSelectAgent,
-  onSelectedAgentModelChange,
   onOrchestratorModelChange,
-  onModelsChange,
-  onSettingsChange,
   onRefresh,
   setStatus,
   onOpenTaskDialog,
 }: {
   cockpit: CockpitPayload | null;
   settings: SettingsPayload | null;
-  auth: AuthMe | null;
-  authMessage: string;
-  tokenExpired: boolean;
   models: ModelInventory | null;
-  selectedAgentId: string;
-  selectedAgentModel: ModelRoute | null;
   orchestratorModel: ModelRoute | null;
   heartbeatPaused: boolean;
   can: (permission: string) => boolean;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
   onSelectAgent: (agentId: string, panel?: "tasks" | "chat" | "goals") => void;
-  onSelectedAgentModelChange: (route: ModelRoute) => void;
   onOrchestratorModelChange: (route: ModelRoute) => void;
-  onModelsChange: (models: ModelInventory) => void;
-  onSettingsChange: (settings: SettingsPayload) => void;
   onRefresh: () => Promise<void>;
   setStatus: (status: string) => void;
   onOpenTaskDialog: (draft?: TaskDialogDraft) => void;
 }) {
-  const selectedAgent = cockpit?.agents.find((agent) => agent.agent_id === selectedAgentId) || null;
   const agents = cockpit?.agents || [];
   const datastores = cockpit?.datastores || [];
   const alerts = cockpit?.alerts || [];
@@ -2785,87 +2821,6 @@ function CockpitView({
         </div>
       </div>
 
-      <details className="ob-manage">
-        <summary>Management &amp; configuration</summary>
-        <div className="ob-manage-grid">
-          <div className="ob-panel ob-manage-panel">
-            <div className="ob-panel-head"><span className="ob-panel-title">Selected Agent</span></div>
-            <div className="ob-panel-pad">
-              <AgentInspector agent={selectedAgent} teams={cockpit?.teams || []} />
-              {selectedAgent && (
-                <>
-                  <ModelSelect
-                    label="Agent model"
-                    inventory={models}
-                    route={agentModelRoute(selectedAgent, models)}
-                    onChange={(route) => {
-                      api(`/api/agents/${encodeURIComponent(selectedAgent.agent_id)}`, {
-                        method: "PATCH",
-                        json: { model_provider: route.provider, model_name: route.model },
-                      })
-                        .then(() => onRefresh())
-                        .then(() => setStatus(`${selectedAgent.agent_id} model set to ${route.model}`))
-                        .catch((error) => setStatus(errorMessage(error)));
-                    }}
-                  />
-                  <div className="button-row">
-                    <button onClick={() => onSelectAgent(selectedAgent.agent_id, "chat")}>Chat</button>
-                    <button onClick={() => onSelectAgent(selectedAgent.agent_id, "tasks")}>Tasks</button>
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-          <div className="ob-panel ob-manage-panel">
-            <div className="ob-panel-head"><span className="ob-panel-title">Models</span></div>
-            <div className="ob-panel-pad">
-              <ModelSummary
-                cockpit={cockpit}
-                models={models}
-                canEdit={can("admin")}
-                api={api}
-                onModelsChange={onModelsChange}
-                onSettingsChange={onSettingsChange}
-                onDone={onRefresh}
-                setStatus={setStatus}
-              />
-            </div>
-          </div>
-          <div className="ob-panel ob-manage-panel">
-            <div className="ob-panel-head"><span className="ob-panel-title">Teams</span></div>
-            <div className="ob-panel-pad">
-              <TeamBoard
-                teams={cockpit?.teams || []}
-                agents={agents}
-                canEdit={can("team:write")}
-                canManageAgents={can("agent:write")}
-                models={models}
-                api={api}
-                onDone={onRefresh}
-                setStatus={setStatus}
-              />
-            </div>
-          </div>
-          <div className="ob-panel ob-manage-panel">
-            <div className="ob-panel-head"><span className="ob-panel-title">Usage</span></div>
-            <div className="ob-panel-pad">
-              <UsageSummary usage={cockpit?.usage || null} />
-            </div>
-          </div>
-          <div className="ob-panel ob-manage-panel">
-            <div className="ob-panel-head"><span className="ob-panel-title">Settings &amp; Auth</span></div>
-            <div className="ob-panel-pad">
-              <SettingsStatus
-                settings={settings}
-                cockpit={cockpit}
-                auth={auth}
-                authMessage={authMessage}
-                tokenExpired={tokenExpired}
-              />
-            </div>
-          </div>
-        </div>
-      </details>
     </section>
   );
 }
@@ -4639,12 +4594,330 @@ function OpsRoomView({
   );
 }
 
-function AgentInspector({ agent, teams }: { agent: VisualAgent | null; teams: Team[] }) {
+// Keep in sync with REQUIRED_AGENT_FILES in brigade/workspace.py — the API
+// whitelists exactly these.
+const WORKSPACE_FILES = [
+  "IDENTITY.md",
+  "SOUL.md",
+  "MEMORY.md",
+  "TOOLS.md",
+  "USER.md",
+  "AGENTS.md",
+] as const;
+
+function WorkspaceFileEditor({
+  agent,
+  canEdit,
+  api,
+  setStatus,
+}: {
+  agent: VisualAgent;
+  canEdit: boolean;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  setStatus: (message: string) => void;
+}) {
+  const [filename, setFilename] = useState<string>(WORKSPACE_FILES[0]);
+  const [content, setContent] = useState("");
+  const [loadedContent, setLoadedContent] = useState("");
+  const [loading, setLoading] = useState(false);
+  const fileUrl = (file: string) =>
+    `/api/agents/${encodeURIComponent(agent.agent_id)}/files/${encodeURIComponent(file)}`;
+  const dirty = content !== loadedContent;
+
+  const load = useCallback(
+    (file: string) => {
+      setLoading(true);
+      api<{ content: string }>(fileUrl(file))
+        .then((payload) => {
+          setContent(payload.content);
+          setLoadedContent(payload.content);
+        })
+        .catch((error) => {
+          setContent("");
+          setLoadedContent("");
+          setStatus(errorMessage(error));
+        })
+        .finally(() => setLoading(false));
+    },
+    [agent.agent_id, api, setStatus],
+  );
+
+  useEffect(() => {
+    load(filename);
+  }, [agent.agent_id, filename, load]);
+
+  const save = () => {
+    api(fileUrl(filename), { method: "PUT", json: { content } })
+      .then(() => {
+        setLoadedContent(content);
+        setStatus(`${agent.agent_id}/${filename} saved — live on the next heartbeat`);
+      })
+      .catch((error) => setStatus(errorMessage(error)));
+  };
+
+  return (
+    <div className="ob-file-editor">
+      <div className="ob-file-editor-bar">
+        <select
+          value={filename}
+          onChange={(event) => {
+            const next = event.target.value;
+            if (dirty && !window.confirm(`Discard unsaved changes to ${filename}?`)) {
+              return;
+            }
+            setFilename(next);
+          }}
+        >
+          {WORKSPACE_FILES.map((file) => (
+            <option key={file} value={file}>
+              {file}
+            </option>
+          ))}
+        </select>
+        <button disabled={!dirty || !canEdit || loading} onClick={save}>
+          Save
+        </button>
+        <button disabled={!dirty || loading} onClick={() => load(filename)}>
+          Revert
+        </button>
+      </div>
+      <textarea
+        className="ob-file-editor-text"
+        value={loading ? "loading…" : content}
+        readOnly={!canEdit || loading}
+        spellCheck={false}
+        onChange={(event) => setContent(event.target.value)}
+      />
+      <p className="muted">
+        {dirty
+          ? "Unsaved changes."
+          : "Injected into the agent's prompt (IDENTITY.md) or read by the agent in its workspace."}
+      </p>
+    </div>
+  );
+}
+
+function AgentManagementView({
+  agents,
+  teams,
+  models,
+  can,
+  api,
+  onOpenAgent,
+  onRefresh,
+  setStatus,
+}: {
+  agents: VisualAgent[];
+  teams: Team[];
+  models: ModelInventory | null;
+  can: (permission: string) => boolean;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  onOpenAgent: (agentId: string, panel?: "tasks" | "chat" | "goals") => void;
+  onRefresh: () => Promise<void>;
+  setStatus: (message: string) => void;
+}) {
+  // Selection here is deliberately tab-local: managing an agent must not
+  // disturb the Cockpit/Brigade working selection.
+  const [managedAgentId, setManagedAgentId] = useState("");
+  const managedAgent = agents.find((agent) => agent.agent_id === managedAgentId) || null;
+
+  return (
+    <section className="agents-view">
+      <div className="agents-layout">
+        <div className="ob-panel agents-roster">
+          <div className="ob-panel-head">
+            <span className="ob-panel-title">Agents</span>
+            <span className="ob-badge">{agents.length}</span>
+          </div>
+          <div className="ob-roster-list">
+            {agents.length === 0 && <p className="muted">No agents.</p>}
+            {agents.map((agent) => {
+              const badge = agentStatusBadge(agent.status);
+              return (
+                <button
+                  key={agent.agent_id}
+                  type="button"
+                  className={`ob-agent-row${agent.agent_id === managedAgentId ? " is-selected" : ""}`}
+                  style={sigStyle(agent.agent_id)}
+                  onClick={() => setManagedAgentId(agent.agent_id)}
+                >
+                  <span className="ob-agent-avatar">{agentInitials(agent.display_name)}</span>
+                  <span className="ob-agent-meta">
+                    <span className="ob-agent-name">{agent.display_name}</span>
+                    <span className="ob-agent-task">
+                      {(agent.team_role || agent.role).replace("_", " ")}
+                      {agent.team_id ? ` · ${agent.team_id}` : ""}
+                    </span>
+                  </span>
+                  <span className={`ob-agent-badge ${badge.tone}`}>{badge.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="agents-detail">
+          {/* Section bar: single section today; an Org Chart view (chief/worker
+              relationships, escalation paths) slots in here later. */}
+          <nav className="panel-tabs agents-tabs" aria-label="Management sections">
+            <button className="active">Roster &amp; Editing</button>
+            <button disabled title="Coming later: chief/worker relationships and escalation paths">
+              Org Chart
+            </button>
+          </nav>
+          <div className="ob-manage-grid">
+            <div className="ob-panel ob-manage-panel">
+              <div className="ob-panel-head"><span className="ob-panel-title">Selected Agent</span></div>
+              <div className="ob-panel-pad">
+                <AgentInspector
+                  agent={managedAgent}
+                  teams={teams}
+                  emptyHint="Select an agent from the roster on the left."
+                />
+                {managedAgent && (
+                  <>
+                    <ModelSelect
+                      label="Agent model"
+                      inventory={models}
+                      route={agentModelRoute(managedAgent, models)}
+                      onChange={(route) => {
+                        api(`/api/agents/${encodeURIComponent(managedAgent.agent_id)}`, {
+                          method: "PATCH",
+                          json: { model_provider: route.provider, model_name: route.model },
+                        })
+                          .then(() => onRefresh())
+                          .then(() => setStatus(`${managedAgent.agent_id} model set to ${route.model}`))
+                          .catch((error) => setStatus(errorMessage(error)));
+                      }}
+                    />
+                    <AgentProfileEditor
+                      agent={managedAgent}
+                      api={api}
+                      onSaved={onRefresh}
+                      setStatus={setStatus}
+                    />
+                    <div className="button-row">
+                      <button onClick={() => onOpenAgent(managedAgent.agent_id, "chat")}>Chat</button>
+                      <button onClick={() => onOpenAgent(managedAgent.agent_id, "tasks")}>Tasks</button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+            <div className="ob-panel ob-manage-panel">
+              <div className="ob-panel-head">
+                <span className="ob-panel-title">Personality &amp; Memory Files</span>
+              </div>
+              <div className="ob-panel-pad">
+                {managedAgent ? (
+                  <WorkspaceFileEditor
+                    key={managedAgent.agent_id}
+                    agent={managedAgent}
+                    canEdit={can("agent:write")}
+                    api={api}
+                    setStatus={setStatus}
+                  />
+                ) : (
+                  <p className="muted">Select an agent to edit its workspace files.</p>
+                )}
+              </div>
+            </div>
+            <div className="ob-panel ob-manage-panel">
+              <div className="ob-panel-head"><span className="ob-panel-title">Teams &amp; Onboarding</span></div>
+              <div className="ob-panel-pad">
+                <TeamBoard
+                  teams={teams}
+                  agents={agents}
+                  canEdit={can("team:write")}
+                  canManageAgents={can("agent:write")}
+                  models={models}
+                  api={api}
+                  onDone={onRefresh}
+                  setStatus={setStatus}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function AgentProfileEditor({
+  agent,
+  api,
+  onSaved,
+  setStatus,
+}: {
+  agent: VisualAgent;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  onSaved: () => void;
+  setStatus: (message: string) => void;
+}) {
+  const savedSpecialties = (agent.specialties || []).join(", ");
+  const [role, setRole] = useState(agent.role);
+  const [specialties, setSpecialties] = useState(savedSpecialties);
+  useEffect(() => {
+    setRole(agent.role);
+    setSpecialties((agent.specialties || []).join(", "));
+  }, [agent.agent_id]);
+  const dirty = role !== agent.role || specialties !== savedSpecialties;
+  const save = () => {
+    api(`/api/agents/${encodeURIComponent(agent.agent_id)}`, {
+      method: "PATCH",
+      json: {
+        role,
+        specialties: specialties
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean),
+      },
+    })
+      .then(() => onSaved())
+      .then(() => setStatus(`${agent.agent_id} profile updated`))
+      .catch((error) => setStatus(errorMessage(error)));
+  };
+  return (
+    <div className="agent-profile-edit">
+      <label className="model-select">
+        <span>Role</span>
+        <select value={role} onChange={(event) => setRole(event.target.value)}>
+          <option value="line_worker">line_worker</option>
+          <option value="crew_chief">crew_chief</option>
+        </select>
+      </label>
+      <label className="model-select">
+        <span>Specialties</span>
+        <input
+          value={specialties}
+          placeholder="comma-separated, e.g. web design, css, telemetry"
+          onChange={(event) => setSpecialties(event.target.value)}
+        />
+      </label>
+      <div className="button-row">
+        <button disabled={!dirty} onClick={save}>
+          Save profile
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AgentInspector({
+  agent,
+  teams,
+  emptyHint = "Select an agent from the header or Ops Room.",
+}: {
+  agent: VisualAgent | null;
+  teams: Team[];
+  emptyHint?: string;
+}) {
   if (!agent) {
     return (
       <section className="inspector empty">
         <h2>No Agent Selected</h2>
-        <p>Select an agent from the header or Ops Room.</p>
+        <p>{emptyHint}</p>
       </section>
     );
   }
@@ -4662,6 +4935,8 @@ function AgentInspector({ agent, teams }: { agent: VisualAgent | null; teams: Te
       <dl>
         <dt>Role</dt>
         <dd>{agent.team_role || agent.role}</dd>
+        <dt>Specialties</dt>
+        <dd>{(agent.specialties || []).join(", ") || "none"}</dd>
         <dt>Team</dt>
         <dd>{team?.display_name || agent.team_id || "none"}</dd>
         <dt>Usage</dt>
