@@ -20,3 +20,12 @@ AGENTS.md
 checklists/
 .codex/
 .claude/
+
+# Host-specific ops tooling (MACINTYRE crash forensics, power logging,
+# systemd units) — local operational detail, not for the public repo.
+ops/RUNBOOK-crash-recovery.md
+ops/brigade-app.service
+ops/gpu-peak-power.sh
+ops/gpu-power-log.logrotate
+ops/gpu-power-log.service
+ops/setup-crash-forensics.sh
