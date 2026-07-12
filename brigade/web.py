@@ -611,6 +611,15 @@ def create_app(
             updates["model_provider"] = str(payload["model_provider"])
         if payload.get("model_name") is not None:
             updates["model_name"] = str(payload["model_name"])
+        if payload.get("role") is not None:
+            role = str(payload["role"]).strip()
+            if role not in {"line_worker", "crew_chief"}:
+                raise HTTPException(
+                    status_code=400, detail="role must be line_worker or crew_chief"
+                )
+            updates["role"] = role
+        if payload.get("specialties") is not None:
+            updates["specialties"] = _string_list(payload["specialties"])
         if not updates:
             raise HTTPException(status_code=400, detail="no updatable fields provided")
         updated = replace(agent, **updates)

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+from brigade.profile import derive_agent_profile
 from brigade.schemas import Agent, Assignment, AssignmentStatus, Team
 from brigade.store import StateStore
 from brigade.time import parse_utc_iso, utc_now
@@ -83,8 +85,10 @@ CREW_CHIEF_SYSTEM_PROMPT = "\n".join(
         "You are an OpenBrigade Crew Chief.",
         "Keep your team's goals moving before the Orchestrator has to intervene.",
         "Reassign or delegate team work when a goal is stale or an agent is overloaded.",
-        "Route each task to the member whose specialties match it first; "
-        "give generalists the remainder.",
+        "Route each task using the member profiles in agent_load: prefer the "
+        "member whose declared or demonstrated specialties match it, then one "
+        "whose built tools or recent completions fit; give generalists the "
+        "remainder.",
     ]
 )
 
@@ -161,6 +165,7 @@ def build_agent_floor(
         "system_prompt": BASE_AGENT_SYSTEM_PROMPT,
         "mission": mission.to_dict() if mission else None,
         "agent": agent.to_dict(),
+        "identity": _agent_identity(store, agent),
         "assignment": assignment.to_dict(),
         "goals": build_goal_snapshots(
             store,
@@ -175,6 +180,8 @@ def build_agent_floor(
             *workspace_tool_manifest(store.data_dir / agent.workspace_path),
         ],
     }
+    if payload["identity"] is None:
+        del payload["identity"]
     if _is_crew_chief(agent, store.teams()):
         payload["crew_chief_floor"] = build_crew_chief_floor(
             store,
@@ -182,6 +189,22 @@ def build_agent_floor(
             stale_seconds=stale_seconds,
         )
     return payload
+
+
+MAX_IDENTITY_CHARS = 4000
+
+
+def _agent_identity(store: StateStore, agent: Agent) -> str | None:
+    """The agent's own IDENTITY.md, truncated, so it acts in character
+    without spending an iteration on read_file."""
+    path = store.data_dir / agent.workspace_path / "IDENTITY.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    return text[:MAX_IDENTITY_CHARS]
 
 
 def build_goal_snapshots(
@@ -370,7 +393,8 @@ def build_chat_status_context(store: StateStore, agent_id: str) -> dict[str, Any
 def build_agent_load(store: StateStore, agent_ids: list[str]) -> list[dict[str, Any]]:
     assignments = store.assignments()
     states = store.agent_states()
-    specialties_by_agent = {agent.agent_id: agent.specialties for agent in store.agents()}
+    agents_by_id = {agent.agent_id: agent for agent in store.agents()}
+    history = store.assignment_history()
     rows = []
     for agent_id in agent_ids:
         queued = [
@@ -390,15 +414,18 @@ def build_agent_load(store: StateStore, agent_ids: list[str]) -> list[dict[str, 
             }
         ]
         state = states.get(agent_id)
-        rows.append(
-            {
-                "agent": agent_id,
-                "state": state.status if state else ("busy" if open_items else "idle"),
-                "queue_depth": len(queued),
-                "open_tasks": len(open_items),
-                "specialties": specialties_by_agent.get(agent_id, []),
-            }
-        )
+        agent = agents_by_id.get(agent_id)
+        row = {
+            "agent": agent_id,
+            "state": state.status if state else ("busy" if open_items else "idle"),
+            "queue_depth": len(queued),
+            "open_tasks": len(open_items),
+            "role": agent.role if agent else "line_worker",
+            "specialties": agent.specialties if agent else [],
+        }
+        if agent is not None:
+            row.update(derive_agent_profile(store, agent, history=history))
+        rows.append(row)
     return rows
 
 

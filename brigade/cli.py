@@ -328,6 +328,28 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["ollama", "litellm", "openai", "openai-codex", "anthropic", "gemini"],
     )
     agent_model.add_argument("--model", required=True)
+    agent_update = agent_sub.add_parser(
+        "update",
+        help="Update one agent's role and/or specialties.",
+    )
+    agent_update.add_argument("--id", required=True)
+    agent_update.add_argument(
+        "--role",
+        default=None,
+        choices=["line_worker", "crew_chief"],
+        help="New role label.",
+    )
+    agent_update.add_argument(
+        "--specialty",
+        dest="specialties",
+        action="append",
+        default=None,
+        help=(
+            "Specialty tag for routing hints. Repeat for multiple; the full "
+            "list replaces the agent's current specialties. Pass a single "
+            "empty value ('') to clear them."
+        ),
+    )
     agent_sub.add_parser("list")
 
     team = subcommands.add_parser(
@@ -1474,6 +1496,25 @@ def _main(argv: Sequence[str] | None = None) -> int:
             model_provider=args.provider,
             model_name=args.model,
         )
+        store.add_agent(updated)
+        print(json.dumps(updated.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "agent" and args.agent_command == "update":
+        _require_permission(store, settings, actor, "agent:write")
+        agent = _find_agent(store, args.id)
+        if agent is None:
+            raise ValueError(f"unknown agent: {args.id}")
+        updates: dict[str, Any] = {}
+        if args.role is not None:
+            updates["role"] = args.role
+        if args.specialties is not None:
+            updates["specialties"] = [
+                item.strip() for item in args.specialties if item.strip()
+            ]
+        if not updates:
+            raise ValueError("nothing to update: pass --role and/or --specialty")
+        updated = replace(agent, **updates)
         store.add_agent(updated)
         print(json.dumps(updated.to_dict(), indent=2, sort_keys=True))
         return 0

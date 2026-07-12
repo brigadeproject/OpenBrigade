@@ -1724,3 +1724,39 @@ def test_cli_chat_tui_delegation_respects_allow_host_state(tmp_path):
     )
 
     assert _live_chat_tui_command(args, ["chat", "tui"], cwd=tmp_path, in_container=False) is None
+
+
+def test_cli_agent_update_role_and_specialties(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    assert main(["agent", "add", "--id", "sage", "--name", "SAGE", "--workspace", "ws"]) == 0
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "agent",
+                "update",
+                "--id",
+                "sage",
+                "--role",
+                "crew_chief",
+                "--specialty",
+                "telemetry",
+                "--specialty",
+                "web design",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["role"] == "crew_chief"
+    assert payload["specialties"] == ["telemetry", "web design"]
+
+    # Specialties replace wholesale; role stays untouched when omitted.
+    assert main(["agent", "update", "--id", "sage", "--specialty", "css"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["role"] == "crew_chief"
+    assert payload["specialties"] == ["css"]
+
+    with pytest.raises(ValueError, match="nothing to update"):
+        main(["agent", "update", "--id", "sage"])

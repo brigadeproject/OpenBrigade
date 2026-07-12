@@ -18,6 +18,7 @@ from brigade.orchestrator import (
     _idempotency_seen,
     orchestration_event,
 )
+from brigade.profile import derived_specialty_tokens
 from brigade.schemas import Agent, Assignment, Priority
 from brigade.store import StateStore
 
@@ -196,6 +197,7 @@ def _route_intake(
     item_tokens = _tokens(f"{item['title']} {item['text']}")
     goals_by_agent = store.goals()
     agents_by_id = {agent.agent_id: agent for agent in store.agents()}
+    history = store.assignment_history()
     best: tuple[int, Agent] | None = None
     for chief in sorted(chiefs, key=lambda agent: agent.agent_id):
         vocabulary: set[str] = set()
@@ -210,6 +212,7 @@ def _route_intake(
                     continue
                 for specialty in member.specialties:
                     vocabulary |= _tokens(specialty)
+                vocabulary |= derived_specialty_tokens(store, member, history=history)
         score = len(item_tokens & vocabulary)
         if score > 0 and (best is None or score > best[0]):
             best = (score, chief)

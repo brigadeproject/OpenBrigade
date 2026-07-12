@@ -19,6 +19,7 @@ from brigade.orchestrator import (
     policy_routed_chief_id,
     route_to_chief,
 )
+from brigade.profile import derived_specialty_tokens
 from brigade.schemas import (
     MALFORMED_PROVIDER_OUTPUT_MARKER,
     Agent,
@@ -527,14 +528,18 @@ def reassignment_target(
         if agent_id in agent_map and agent_id not in occupied
     ]
     text_tokens = set(blocked.assignment.lower().split())
-    specialists = [
-        agent
-        for agent in idle
-        if any(
-            token in text_tokens
+    history = store.assignment_history() if idle else []
+
+    def specialty_tokens(agent: Agent) -> set[str]:
+        declared = {
+            token
             for specialty in agent.specialties
             for token in specialty.lower().split()
-        )
+        }
+        return declared | derived_specialty_tokens(store, agent, history=history)
+
+    specialists = [
+        agent for agent in idle if specialty_tokens(agent) & text_tokens
     ]
     if specialists:
         return specialists[0]
