@@ -15,7 +15,13 @@ from uuid import uuid4
 from brigade.finance import persist_financial_report
 from brigade.orchestrator import orchestration_event, record_orchestration_events
 from brigade.prompt_floors import build_agent_floor, compact_json
-from brigade.providers import ModelProvider, ModelResponse, ModelUnavailableError
+from brigade.providers import (
+    ModelProvider,
+    ModelResponse,
+    ModelUnavailableError,
+    demote_unavailable_model,
+    is_model_not_found_error,
+)
 from brigade.schemas import (
     MALFORMED_PROVIDER_OUTPUT_MARKER,
     AgentState,
@@ -1070,7 +1076,11 @@ def _locked_complete_with_retries(
     duration of that call so other consumers (chat, other agents) can
     interleave between iterations and tool executions."""
     if not lock_local:
-        return _complete_with_retries(provider, prompt, tools=tools)
+        try:
+            return _complete_with_retries(provider, prompt, tools=tools)
+        except RuntimeError as exc:
+            _demote_model_on_not_found(store, provider, exc)
+            raise
     _acquire_local_inference_lock(store, agent_id)
     cooldown_seconds = LOCAL_INFERENCE_RELEASE_COOLDOWN_SECONDS
     try:
@@ -1080,8 +1090,27 @@ def _locked_complete_with_retries(
         # fallback provider.
         cooldown_seconds = 0
         raise
+    except RuntimeError as exc:
+        _demote_model_on_not_found(store, provider, exc)
+        raise
     finally:
         _release_local_inference_lock(store, agent_id, cooldown_seconds=cooldown_seconds)
+
+
+def _demote_model_on_not_found(
+    store: StateStore, provider: ModelProvider, exc: Exception
+) -> None:
+    if not is_model_not_found_error(exc):
+        return
+    provider_name = getattr(provider, "provider_name", None)
+    model = getattr(provider, "model", None)
+    if not provider_name or not model:
+        return
+    if demote_unavailable_model(store, provider_name, model):
+        LOGGER.warning(
+            "model_demoted_not_found",
+            extra={"provider": provider_name, "model": model},
+        )
 
 
 def _complete_with_retries(

@@ -596,3 +596,84 @@ def test_parse_agent_response_accepts_json_with_trailing_prose():
 
 def test_extract_json_object_without_object_returns_input():
     assert extract_json_object("no structured output here") == "no structured output here"
+
+
+# --- phantom-model demotion on 404 -------------------------------------------------
+
+
+def test_is_model_not_found_error_matches_404_model_errors():
+    from brigade.providers import is_model_not_found_error
+
+    assert is_model_not_found_error(
+        "openai-codex model request failed: Error code: 404 - {'error': "
+        "{'message': 'Model not found gpt-5.6-luna', 'type': 'invalid_request_error', "
+        "'param': 'model', 'code': None}}"
+    )
+    assert is_model_not_found_error("code: 'model_not_found'")
+    assert not is_model_not_found_error("Error code: 429 - rate limited")
+    assert not is_model_not_found_error("Error code: 404 - page missing")
+
+
+def test_demote_unavailable_model_flips_and_persists(tmp_path):
+    from brigade.providers import demote_unavailable_model
+
+    store = _store(tmp_path)
+    store.set_model_inventory(
+        {
+            "providers": {
+                "openai-codex": {
+                    "provider": "openai-codex",
+                    "status": "ok",
+                    "models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-luna", "available": True},
+                        {"provider": "openai-codex", "model": "gpt-5.5", "available": True},
+                    ],
+                }
+            },
+            "updated_at": "2026-07-13T00:00:00+00:00",
+        }
+    )
+    assert demote_unavailable_model(store, "openai-codex", "gpt-5.6-luna") is True
+    models = store.model_inventory()["providers"]["openai-codex"]["models"]
+    by_name = {item["model"]: item for item in models}
+    assert by_name["gpt-5.6-luna"]["available"] is False
+    assert "not callable" in by_name["gpt-5.6-luna"]["detail"]
+    assert by_name["gpt-5.5"]["available"] is True
+    # unknown model / provider are no-ops
+    assert demote_unavailable_model(store, "openai-codex", "nope") is False
+    assert demote_unavailable_model(store, "gemini", "gpt-5.5") is False
+
+
+def test_locked_complete_demotes_model_on_404(tmp_path):
+    from brigade.runner import _locked_complete_with_retries
+
+    store = _store(tmp_path)
+    store.set_model_inventory(
+        {
+            "providers": {
+                "openai-codex": {
+                    "provider": "openai-codex",
+                    "status": "ok",
+                    "models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-luna", "available": True}
+                    ],
+                }
+            }
+        }
+    )
+
+    class NotFoundProvider:
+        provider_name = "openai-codex"
+        model = "gpt-5.6-luna"
+        route_type = "cloud"
+
+        def complete(self, prompt):
+            raise RuntimeError(
+                "openai-codex model request failed: Error code: 404 - "
+                "{'error': {'message': 'Model not found gpt-5.6-luna', 'param': 'model'}}"
+            )
+
+    with pytest.raises(RuntimeError):
+        _locked_complete_with_retries(store, "ada", NotFoundProvider(), "hello")
+    models = store.model_inventory()["providers"]["openai-codex"]["models"]
+    assert models[0]["available"] is False

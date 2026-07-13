@@ -797,6 +797,46 @@ def _inventory_model(
     }
 
 
+def is_model_not_found_error(exc: Exception | str) -> bool:
+    """A 404 for the model itself (e.g. listed by the provider but not callable
+    for this account), as opposed to transient or auth failures."""
+    message = str(exc).lower()
+    if "model_not_found" in message or "model not found" in message:
+        return True
+    return "404" in message and "'param': 'model'" in message
+
+
+def demote_unavailable_model(
+    store: Any,
+    provider_name: str,
+    model: str,
+    *,
+    detail: str = "listed by provider but not callable (404 on last run)",
+) -> bool:
+    """Mark a probed model unavailable after a runtime 404 so agents stop
+    routing to it. A later successful probe/refresh restores it."""
+    inventory = store.model_inventory() or {}
+    providers = inventory.get("providers")
+    if not isinstance(providers, dict):
+        return False
+    record = providers.get(provider_name)
+    if not isinstance(record, dict):
+        return False
+    changed = False
+    for item in record.get("models", []):
+        if (
+            isinstance(item, dict)
+            and item.get("model") == model
+            and item.get("available", True)
+        ):
+            item["available"] = False
+            item["detail"] = detail
+            changed = True
+    if changed:
+        store.set_model_inventory(inventory)
+    return changed
+
+
 def _openai_codex_fallback_models(default_model: str) -> tuple[str, ...]:
     models = [default_model, *OPENAI_CODEX_FALLBACK_MODELS]
     return tuple(dict.fromkeys(model for model in models if model))
