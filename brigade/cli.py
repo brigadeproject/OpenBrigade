@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
-import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2258,7 +2259,21 @@ def _main(argv: Sequence[str] | None = None) -> int:
         provider_factory = _managed_agent_provider_factory(args, settings, store)
         model_inventory = probe_model_inventory(settings)
         store.set_model_inventory(model_inventory)
-        while max_cycles is None or completed < max_cycles:
+        # Graceful drain: docker stop / compose restarts send SIGTERM. Finish
+        # the in-flight cycle or agent run (the handler only sets a flag), stop
+        # dispatching, and exit cleanly instead of being killed mid-run and
+        # leaving assignments stranded in "working".
+        shutdown = threading.Event()
+
+        def _request_drain(signum: int, frame: object) -> None:
+            shutdown.set()
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(signum, _request_drain)
+            except ValueError:  # not the main thread (tests)
+                break
+        while (max_cycles is None or completed < max_cycles) and not shutdown.is_set():
             run_full_cycle(
                 store,
                 provider=provider,
@@ -2266,7 +2281,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     store.runtime_overrides()
                 ),
             )
-            if not args.no_run_agents:
+            if not args.no_run_agents and not shutdown.is_set():
                 agent_results.extend(
                     run_managed_agents(
                         store,
@@ -2278,11 +2293,14 @@ def _main(argv: Sequence[str] | None = None) -> int:
             completed += 1
             if max_cycles is not None and completed >= max_cycles:
                 break
-            time.sleep(sleep_seconds)
+            # Event.wait wakes immediately on SIGTERM, unlike time.sleep
+            if shutdown.wait(sleep_seconds):
+                break
         print(
             json.dumps(
                 {
                     "cycles": completed,
+                    "drained": shutdown.is_set(),
                     "agent_runs": [item.to_dict() for item in agent_results],
                     "model_inventory": model_inventory,
                 },

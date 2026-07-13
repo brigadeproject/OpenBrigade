@@ -47,6 +47,9 @@ services:
     build: .
     container_name: brigade_orchestrator
     restart: unless-stopped
+    # give the SIGTERM drain time to finish an in-flight agent run
+    # instead of SIGKILLing it into a stranded "working" assignment
+    stop_grace_period: 180s
     profiles:
       - app
     command: ["orchestrator", "daemon"]
