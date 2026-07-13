@@ -167,6 +167,13 @@ type Message = {
   created_at: string;
 };
 
+type AlertRecord = {
+  message: string;
+  count: number;
+  first_seen?: string | null;
+  last_seen?: string | null;
+};
+
 type OrchestrationEvent = {
   id: string;
   schema_version: number;
@@ -211,7 +218,7 @@ type OpsRoomSnapshot = {
   teams: Team[];
   assignments: Assignment[];
   goals: Record<string, Goal[]>;
-  alerts: string[];
+  alerts: AlertRecord[];
   financial_report?: Record<string, unknown> | null;
   local_inference?: Record<string, unknown>;
   cloud_jobs?: Record<string, unknown>[];
@@ -256,7 +263,7 @@ type CockpitPayload = {
     alerts: number;
     status_by_agent: Record<string, number>;
   };
-  alerts: string[];
+  alerts: AlertRecord[];
   datastores: { name: string; ok: boolean; detail: string }[];
   models: {
     default_provider: string;
@@ -3608,7 +3615,7 @@ function AlertList({
   onDone,
   setStatus,
 }: {
-  alerts: string[];
+  alerts: AlertRecord[];
   canClear: boolean;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
   onDone: () => Promise<void>;
@@ -3636,9 +3643,13 @@ function AlertList({
         </button>
       </div>
       <div className="stack-list compact">
-        {alerts.slice(-8).map((alert, index) => (
-          <article key={`${index}:${alert}`} className="alert-row">
-            <p>{alert}</p>
+        {alerts.slice(-8).map((alert) => (
+          <article key={alert.message} className="alert-row">
+            <p>{alert.message}</p>
+            <p className="muted">
+              {alert.count > 1 ? `×${alert.count} · ` : ""}
+              {alert.last_seen ? `last ${formatLogTime(alert.last_seen)}` : "undated"}
+            </p>
           </article>
         ))}
       </div>

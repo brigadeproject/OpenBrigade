@@ -24,6 +24,7 @@ from brigade.schemas import (
     team_from_dict,
     user_from_dict,
 )
+from brigade.time import utc_now_iso
 
 EMPTY_STATE: dict[str, Any] = {
     "mission": None,
@@ -292,11 +293,28 @@ class JsonStateStore:
 
     def add_alert(self, message: str) -> None:
         state = self.load()
-        state.setdefault("alerts", []).append(message)
+        state.setdefault("alerts", []).append(
+            {"message": message, "created_at": utc_now_iso()}
+        )
         self.save(state)
 
     def alerts(self) -> list[str]:
-        return list(self.load().get("alerts", []))
+        return [record["message"] for record in self.alert_records()]
+
+    def alert_records(self) -> list[dict[str, Any]]:
+        records = []
+        for item in self.load().get("alerts", []):
+            if isinstance(item, dict):
+                records.append(
+                    {
+                        "message": str(item.get("message") or ""),
+                        "created_at": item.get("created_at"),
+                    }
+                )
+            else:
+                # pre-timestamp entries were plain strings
+                records.append({"message": str(item), "created_at": None})
+        return records
 
     def clear_alerts(self) -> int:
         state = self.load()

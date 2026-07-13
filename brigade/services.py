@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -1177,6 +1178,59 @@ def build_orchestration_payload(store: StateStore) -> dict[str, Any]:
     return build_orchestration_telemetry(store.orchestrator_reasoning())
 
 
+ALERT_TTL_HOURS = 48
+ALERT_FEED_LIMIT = 50
+
+
+def build_alert_feed(
+    store: StateStore,
+    *,
+    ttl_hours: int = ALERT_TTL_HOURS,
+    limit: int = ALERT_FEED_LIMIT,
+) -> list[dict[str, Any]]:
+    """Alert records for the GUI: de-duplicated with repeat counts and
+    timestamps, dropping alerts whose last occurrence is past the TTL so a
+    stale wall can't masquerade as a live outage. `clear_alerts` still wipes
+    the underlying rows."""
+    from brigade.time import parse_utc_iso, utc_now
+
+    cutoff = None
+    if ttl_hours > 0:
+        cutoff = utc_now() - timedelta(hours=ttl_hours)
+    grouped: dict[str, dict[str, Any]] = {}
+    for record in store.alert_records():
+        message = str(record.get("message") or "").strip()
+        if not message:
+            continue
+        created_at = record.get("created_at")
+        entry = grouped.get(message)
+        if entry is None:
+            entry = {
+                "message": message,
+                "count": 0,
+                "first_seen": created_at,
+                "last_seen": created_at,
+            }
+            grouped[message] = entry
+        entry["count"] += 1
+        if created_at and (not entry["last_seen"] or created_at > entry["last_seen"]):
+            entry["last_seen"] = created_at
+        if created_at and (not entry["first_seen"] or created_at < entry["first_seen"]):
+            entry["first_seen"] = created_at
+    feed = []
+    for entry in grouped.values():
+        if cutoff is not None and entry["last_seen"]:
+            try:
+                if parse_utc_iso(str(entry["last_seen"])) < cutoff:
+                    continue
+            except ValueError:
+                pass
+        feed.append(entry)
+    # oldest last-occurrence first, so GUIs slicing the tail see the newest
+    feed.sort(key=lambda item: str(item["last_seen"] or ""))
+    return feed[-limit:]
+
+
 def build_ops_room_payload(
     store: StateStore,
 ) -> dict[str, Any]:
@@ -1230,7 +1284,7 @@ def build_ops_room_payload(
             agent_id: [goal.to_dict() for goal in agent_goals]
             for agent_id, agent_goals in goals.items()
         },
-        "alerts": store.alerts(),
+        "alerts": build_alert_feed(store),
         "financial_report": store.latest_financial_report(),
         "local_inference": store.local_inference(),
         "cloud_jobs": store.cloud_jobs(),

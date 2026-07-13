@@ -46,6 +46,12 @@ type VisualAgent = {
   activity: string;
 };
 
+type AlertRecord = {
+  message: string;
+  count: number;
+  last_seen?: string | null;
+};
+
 type CockpitPayload = {
   agents: VisualAgent[];
   tasks: { all: Assignment[] };
@@ -56,7 +62,7 @@ type CockpitPayload = {
     blocked_tasks: number;
     alerts: number;
   };
-  alerts: string[];
+  alerts: AlertRecord[];
   orchestrator: { agent_id: string; display_name: string; channel: string };
 };
 
@@ -783,9 +789,13 @@ function StatusTab({ cockpit }: { cockpit: CockpitPayload | null }) {
       {cockpit.alerts.length > 0 && (
         <>
           <h3 className="m-section-title">Alerts</h3>
-          {cockpit.alerts.map((alert, index) => (
-            <div key={index} className="m-alert">
-              {alert}
+          {cockpit.alerts.map((alert) => (
+            <div key={alert.message} className="m-alert">
+              {alert.message}
+              <span className="m-msg-meta">
+                {alert.count > 1 ? `×${alert.count} · ` : ""}
+                {alert.last_seen ? `last ${formatTime(alert.last_seen)}` : ""}
+              </span>
             </div>
           ))}
         </>
