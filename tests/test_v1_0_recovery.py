@@ -565,3 +565,34 @@ def test_notify_operator_retries_when_no_channel_delivered(tmp_path, monkeypatch
     second = _notify_operator_escalations(store, OrchestrationConfig())
     assert second["notified"][0]["delivery"]["status"] == "sent"
     assert len(store.messages("orchestrator")) == 1
+
+
+# --- JSON extraction from chatty model output -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"status": "complete", "summary": "rested"} Let me know if you need anything!',
+        '{"status": "complete", "summary": "rested"}\nHope that helps.',
+        'Here is my report: {"status": "complete", "summary": "rested"} thanks',
+        '```json\n{"status": "complete", "summary": "rested"}\n```',
+    ],
+)
+def test_extract_json_object_trims_surrounding_prose(text):
+    assert json.loads(extract_json_object(text)) == {
+        "status": "complete",
+        "summary": "rested",
+    }
+
+
+def test_parse_agent_response_accepts_json_with_trailing_prose():
+    parsed = parse_agent_response(
+        '{"status": "complete", "summary": "rested"} Let me know if you need anything!'
+    )
+    assert parsed.status == "complete"
+    assert parsed.summary == "rested"
+
+
+def test_extract_json_object_without_object_returns_input():
+    assert extract_json_object("no structured output here") == "no structured output here"
