@@ -3262,6 +3262,7 @@ function ModelSummary({
   onDone: () => Promise<void>;
   setStatus: (status: string) => void;
 }) {
+  const [refreshing, setRefreshing] = useState(false);
   if (!cockpit) {
     return <p className="muted">Loading model status.</p>;
   }
@@ -3269,6 +3270,19 @@ function ModelSummary({
   const available = options.filter((option) => option.available);
   const defaultOption = options.find((option) => option.is_default) || options[0] || null;
   const defaultKey = defaultOption ? modelOptionKey(defaultOption) : "";
+
+  async function refreshInventory() {
+    setRefreshing(true);
+    setStatus("Probing model providers");
+    try {
+      const result = await api<ModelInventory>("/api/models/refresh", { method: "POST" });
+      onModelsChange(result);
+      setStatus(`Model inventory refreshed — ${result.options.filter((o) => o.available).length} available`);
+      await onDone();
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   async function setDefault(value: string) {
     const option = options.find((item) => modelOptionKey(item) === value);
@@ -3323,6 +3337,13 @@ function ModelSummary({
           ))}
         </select>
       </label>
+      <button
+        disabled={!canEdit || refreshing}
+        onClick={() => refreshInventory().catch((error) => setStatus(errorMessage(error)))}
+        title="Re-probe all model providers and update the inventory"
+      >
+        {refreshing ? "Refreshing…" : "Refresh models"}
+      </button>
       <PermissionNotice
         allowed={canEdit}
         permission="admin"
