@@ -825,3 +825,64 @@ def test_empty_queue_is_not_starvation():
 
     assert result["starved"] is False
     assert result["alert"] is None
+
+
+def test_create_assignment_resolves_display_name_casing(tmp_path):
+    # Prompts show display names (SAGE), ids are lowercase (sage) — the
+    # model echoing either casing must not be rejected as unknown.
+    store = JsonStateStore(tmp_path / "state.json")
+    store.add_agent(Agent("sage", "SAGE", "workspace-sage"))
+    store.add_agent(Agent("infrastructure", "Infrastructure", "workspace-infrastructure"))
+
+    result = apply_orchestrator_actions(
+        store,
+        [
+            {"type": "create_assignment", "agent_id": "SAGE", "assignment": "task one"},
+            {"type": "create_assignment", "agent_id": "Sage", "assignment": "task two"},
+            {"type": "create_assignment", "agent_id": "INFRASTRUCTURE", "assignment": "task three"},
+        ],
+    )
+
+    assert result["rejected"] == []
+    assert {item.assigned_to for item in store.assignments()} == {"sage", "infrastructure"}
+
+
+def test_create_assignment_still_rejects_truly_unknown_agent(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    store.add_agent(Agent("sage", "SAGE", "workspace-sage"))
+
+    result = apply_orchestrator_actions(
+        store,
+        [{"type": "create_assignment", "agent_id": "MERLIN", "assignment": "task"}],
+    )
+
+    assert result["applied"] == []
+    assert "unknown agent MERLIN" in result["rejected"][0]["reason"]
+    assert store.assignments() == []
+
+
+def test_rebalance_resolves_display_name_casing(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    store.add_agent(Agent("sage", "SAGE", "workspace-sage"))
+    store.add_agent(Agent("garde", "GARDE", "workspace-garde"))
+    assignment = Assignment(
+        assignment="Queued work",
+        assigned_to="sage",
+        created_by="human",
+        source="test",
+    )
+    store.add_assignment(assignment)
+
+    result = apply_orchestrator_actions(
+        store,
+        [
+            {
+                "type": "rebalance_queued_assignment",
+                "assignment_id": assignment.assignment_id,
+                "to_agent_id": "GARDE",
+            }
+        ],
+    )
+
+    assert result["rejected"] == []
+    assert store.find_assignment(assignment.assignment_id).assigned_to == "garde"
