@@ -1636,6 +1636,25 @@ def _completed_assignment_ids(
     return completed
 
 
+def _resolve_agent_id(store: StateStore, requested: str) -> str | None:
+    """Canonical agent_id for a model-provided name.
+
+    Prompts render agents as display names ('SAGE', 'ABACUS'), so models echo
+    that casing back; ids are lowercase in the store. Match exact id first,
+    then case-insensitive id, then case-insensitive display name."""
+    agents = store.agents()
+    if requested in {agent.agent_id for agent in agents}:
+        return requested
+    lowered = requested.lower()
+    for agent in agents:
+        if agent.agent_id.lower() == lowered:
+            return agent.agent_id
+    for agent in agents:
+        if (agent.display_name or "").lower() == lowered:
+            return agent.agent_id
+    return None
+
+
 def _apply_create_assignment(store: StateStore, action: dict[str, Any]) -> dict[str, Any]:
     agent_id = str(action.get("agent_id") or "").strip()
     assignment_text = str(action.get("assignment") or "").strip()
@@ -1643,8 +1662,10 @@ def _apply_create_assignment(store: StateStore, action: dict[str, Any]) -> dict[
         raise ValueError("create_assignment is missing agent_id")
     if not assignment_text:
         raise ValueError("create_assignment is missing assignment")
-    if agent_id not in {agent.agent_id for agent in store.agents()}:
+    resolved = _resolve_agent_id(store, agent_id)
+    if resolved is None:
         raise ValueError(f"create_assignment targets unknown agent {agent_id}")
+    agent_id = resolved
     # Chief-first: orchestrator-created work goes to the crew chief managing the
     # suggested agent; the chief decomposes. Falls back when no chief exists.
     chief = route_to_chief(store, agent_id=agent_id)
@@ -1712,8 +1733,10 @@ def _apply_rebalance_queued_assignment(
         raise ValueError("rebalance_queued_assignment is missing assignment_id")
     if not to_agent_id:
         raise ValueError("rebalance_queued_assignment is missing to_agent_id")
-    if to_agent_id not in {agent.agent_id for agent in store.agents()}:
+    resolved = _resolve_agent_id(store, to_agent_id)
+    if resolved is None:
         raise ValueError(f"rebalance target is unknown agent {to_agent_id}")
+    to_agent_id = resolved
     assignment = store.find_assignment(assignment_id)
     if assignment is None:
         raise StaleAssignmentTarget(f"unknown assignment {assignment_id}")

@@ -29,7 +29,11 @@ from brigade.connectors import (
 )
 from brigade.health import check_configured_datastores
 from brigade.markdown import render_markdown_html
-from brigade.providers import available_model_options, provider_from_settings
+from brigade.providers import (
+    available_model_options,
+    probe_model_inventory,
+    provider_from_settings,
+)
 from brigade.rbac import ROLE_PERMISSIONS, can
 from brigade.schemas import (
     Agent,
@@ -412,6 +416,15 @@ def create_app(
     @app.get("/api/models")
     async def models(current: AuthResult = auth_dependency) -> dict[str, object]:
         require("status:read", current)
+        return available_model_options(settings, store.model_inventory())
+
+    @app.post("/api/models/refresh")
+    def refresh_models(current: AuthResult = auth_dependency) -> dict[str, object]:
+        # sync endpoint: the provider probes do blocking network I/O, so let
+        # FastAPI run this in its threadpool instead of stalling the loop
+        require("admin", current)
+        inventory = probe_model_inventory(settings)
+        store.set_model_inventory(inventory)
         return available_model_options(settings, store.model_inventory())
 
     @app.put("/api/models/default")
@@ -1087,6 +1100,14 @@ def create_app(
         index_path = static_root / "index.html"
         if index_path.exists():
             return index_path.read_text(encoding="utf-8")
+        return _fallback_html()
+
+    @app.get("/mobile", response_class=HTMLResponse)
+    @app.get("/mobile.html", response_class=HTMLResponse)
+    async def mobile() -> str:
+        mobile_path = static_root / "mobile.html"
+        if mobile_path.exists():
+            return mobile_path.read_text(encoding="utf-8")
         return _fallback_html()
 
     return app

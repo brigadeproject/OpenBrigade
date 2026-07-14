@@ -1763,3 +1763,29 @@ def test_cli_agent_update_role_and_specialties(tmp_path, monkeypatch, capsys):
 
     with pytest.raises(ValueError, match="nothing to update"):
         main(["agent", "update", "--id", "sage"])
+
+
+def test_cli_daemon_drains_on_sigterm(tmp_path, monkeypatch, capsys):
+    import os
+    import signal
+    import threading
+    import time as _time
+
+    monkeypatch.chdir(tmp_path)
+
+    def send_sigterm():
+        _time.sleep(0.3)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    killer = threading.Thread(target=send_sigterm, daemon=True)
+    killer.start()
+    started = _time.monotonic()
+    # unbounded daemon with a long sleep: without the drain this would hang
+    assert main(["orchestrator", "daemon", "--sleep-seconds", "600", "--no-run-agents"]) == 0
+    elapsed = _time.monotonic() - started
+    killer.join()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["drained"] is True
+    assert payload["cycles"] >= 1
+    assert elapsed < 30

@@ -1,7 +1,7 @@
 FROM node:22-alpine AS web-build
 
 WORKDIR /app/web
-COPY web/package.json web/package-lock.json web/tsconfig.json web/vite.config.ts web/index.html ./
+COPY web/package.json web/package-lock.json web/tsconfig.json web/vite.config.ts web/index.html web/mobile.html ./
 COPY web/src ./src
 COPY web/public ./public
 RUN npm ci

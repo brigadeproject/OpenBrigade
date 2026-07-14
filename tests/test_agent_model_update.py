@@ -92,3 +92,22 @@ def test_patch_agent_rejects_unknown_role(tmp_path):
     app, _ = _app(tmp_path)
     resp = TestClient(app).patch("/api/agents/ada", json={"role": "supervisor"})
     assert resp.status_code == 400
+
+
+def test_models_refresh_probes_and_persists_inventory(tmp_path, monkeypatch):
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    import brigade.web as web
+
+    probed = {
+        "generated_at": "2026-07-13T00:00:00+00:00",
+        "providers": {},
+        "models": [],
+    }
+    monkeypatch.setattr(web, "probe_model_inventory", lambda settings: probed)
+    app, store = _app(tmp_path)
+    resp = TestClient(app).post("/api/models/refresh")
+    assert resp.status_code == 200
+    assert "options" in resp.json()
+    assert store.model_inventory() == probed

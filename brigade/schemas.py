@@ -25,8 +25,6 @@ def extract_json_object(text: str) -> str:
         if end != -1:
             body = body[:end]
         stripped = body.strip()
-    if stripped.startswith("{"):
-        return stripped
     start = stripped.find("{")
     if start == -1:
         return stripped

@@ -128,6 +128,8 @@ class StateStore(Protocol):
 
     def alerts(self) -> list[str]: ...
 
+    def alert_records(self) -> list[dict[str, Any]]: ...
+
     def clear_alerts(self) -> int: ...
 
     def add_knowledge_document(self, document: dict[str, Any]) -> None: ...
@@ -1027,10 +1029,13 @@ class PostgresStateStore:
         )
 
     def alerts(self) -> list[str]:
+        return [record["message"] for record in self.alert_records()]
+
+    def alert_records(self) -> list[dict[str, Any]]:
         return [
-            row[0]
+            {"message": row[0], "created_at": row[1]}
             for row in self._query(
-                "select message from brigade_alerts order by created_at, id"
+                "select message, created_at from brigade_alerts order by created_at, id"
             )
         ]
 

@@ -167,6 +167,13 @@ type Message = {
   created_at: string;
 };
 
+type AlertRecord = {
+  message: string;
+  count: number;
+  first_seen?: string | null;
+  last_seen?: string | null;
+};
+
 type OrchestrationEvent = {
   id: string;
   schema_version: number;
@@ -211,7 +218,7 @@ type OpsRoomSnapshot = {
   teams: Team[];
   assignments: Assignment[];
   goals: Record<string, Goal[]>;
-  alerts: string[];
+  alerts: AlertRecord[];
   financial_report?: Record<string, unknown> | null;
   local_inference?: Record<string, unknown>;
   cloud_jobs?: Record<string, unknown>[];
@@ -256,7 +263,7 @@ type CockpitPayload = {
     alerts: number;
     status_by_agent: Record<string, number>;
   };
-  alerts: string[];
+  alerts: AlertRecord[];
   datastores: { name: string; ok: boolean; detail: string }[];
   models: {
     default_provider: string;
@@ -3262,6 +3269,7 @@ function ModelSummary({
   onDone: () => Promise<void>;
   setStatus: (status: string) => void;
 }) {
+  const [refreshing, setRefreshing] = useState(false);
   if (!cockpit) {
     return <p className="muted">Loading model status.</p>;
   }
@@ -3269,6 +3277,19 @@ function ModelSummary({
   const available = options.filter((option) => option.available);
   const defaultOption = options.find((option) => option.is_default) || options[0] || null;
   const defaultKey = defaultOption ? modelOptionKey(defaultOption) : "";
+
+  async function refreshInventory() {
+    setRefreshing(true);
+    setStatus("Probing model providers");
+    try {
+      const result = await api<ModelInventory>("/api/models/refresh", { method: "POST" });
+      onModelsChange(result);
+      setStatus(`Model inventory refreshed — ${result.options.filter((o) => o.available).length} available`);
+      await onDone();
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   async function setDefault(value: string) {
     const option = options.find((item) => modelOptionKey(item) === value);
@@ -3323,6 +3344,13 @@ function ModelSummary({
           ))}
         </select>
       </label>
+      <button
+        disabled={!canEdit || refreshing}
+        onClick={() => refreshInventory().catch((error) => setStatus(errorMessage(error)))}
+        title="Re-probe all model providers and update the inventory"
+      >
+        {refreshing ? "Refreshing…" : "Refresh models"}
+      </button>
       <PermissionNotice
         allowed={canEdit}
         permission="admin"
@@ -3587,7 +3615,7 @@ function AlertList({
   onDone,
   setStatus,
 }: {
-  alerts: string[];
+  alerts: AlertRecord[];
   canClear: boolean;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
   onDone: () => Promise<void>;
@@ -3615,9 +3643,13 @@ function AlertList({
         </button>
       </div>
       <div className="stack-list compact">
-        {alerts.slice(-8).map((alert, index) => (
-          <article key={`${index}:${alert}`} className="alert-row">
-            <p>{alert}</p>
+        {alerts.slice(-8).map((alert) => (
+          <article key={alert.message} className="alert-row">
+            <p>{alert.message}</p>
+            <p className="muted">
+              {alert.count > 1 ? `×${alert.count} · ` : ""}
+              {alert.last_seen ? `last ${formatLogTime(alert.last_seen)}` : "undated"}
+            </p>
           </article>
         ))}
       </div>
