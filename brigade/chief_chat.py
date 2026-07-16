@@ -18,10 +18,13 @@ from uuid import uuid4
 from brigade.prompt_floors import (
     CREW_CHIEF_CHAT_PROMPT,
     CREW_CHIEF_SYSTEM_PROMPT,
+    MAX_CHAT_MEMORY_CHARS,
     _managed_agent_ids,
     build_chat_status_context,
     build_crew_chief_load,
     compact_json,
+    read_agent_chat_notes,
+    write_agent_chat_notes,
 )
 from brigade.providers import ModelProvider, ModelResponse
 from brigade.runner import MAX_OBSERVATION_CHARS, _truncate
@@ -349,6 +352,14 @@ def _tool_usage_summary(context: ChatToolContext, arguments: dict[str, Any]) -> 
     return ToolResult(True, compact_json({"days": days, "by_model": totals}))
 
 
+def _tool_remember(context: ChatToolContext, arguments: dict[str, Any]) -> ToolResult:
+    note = str(arguments.get("note") or "").strip()
+    if not note:
+        return ToolResult(False, "remember needs a note")
+    write_agent_chat_notes(context.store, context.persona.chief_agent_id, note)
+    return ToolResult(True, "noted — this will be in your memory on every future turn")
+
+
 def search_episode_summaries(
     store: StateStore, query: str, limit: int = 3
 ) -> list[dict[str, Any]]:
@@ -466,6 +477,18 @@ def chief_query_registry() -> ToolRegistry:
         ),
         _tool_usage_summary,
     )
+    registry.register(
+        ToolSpec(
+            name="remember",
+            description=(
+                "Save a durable note to your curated memory (operator "
+                "preferences, standing decisions); it is injected into every "
+                "future chat turn. Memory-only — needs no confirmation."
+            ),
+            argument_schema={"note": "the note to remember"},
+        ),
+        _tool_remember,
+    )
     return registry
 
 
@@ -541,6 +564,47 @@ def _tool_manifest(registry: ToolRegistry) -> list[str]:
     return lines
 
 
+MAX_SUMMARY_CHARS = 2048
+
+
+def build_chat_memory(
+    store: StateStore,
+    *,
+    thread: Conversation,
+    persona: Persona,
+    content: str,
+    history_window: int = 12,
+    exclude_message_id: str | None = None,
+) -> dict[str, Any]:
+    """The three memory blocks, each degrading independently to absence:
+    curated notes (every turn), the thread's rolling summary + recent
+    history (continuity), and episodic recall for the inbound message."""
+    memory: dict[str, Any] = {}
+    notes = read_agent_chat_notes(store, persona.chief_agent_id)
+    if notes.strip():
+        memory["curated_notes"] = notes[-MAX_CHAT_MEMORY_CHARS:]
+    if thread.rolling_summary.strip():
+        memory["conversation_summary"] = thread.rolling_summary[-MAX_SUMMARY_CHARS:]
+    history = [
+        message
+        for message in store.recent_messages(thread.channel, limit=history_window + 1)
+        if message.message_id != exclude_message_id
+    ][-history_window:]
+    if history:
+        memory["recent_thread_history"] = [
+            {
+                "sender": message.sender,
+                "kind": message.metadata.get("kind"),
+                "content": _truncate(message.content, 400),
+            }
+            for message in history
+        ]
+    episodes = search_episode_summaries(store, content, limit=3)
+    if episodes:
+        memory["possibly_relevant_past_episodes"] = episodes
+    return memory
+
+
 def build_chief_chat_prompt(
     store: StateStore,
     *,
@@ -551,6 +615,7 @@ def build_chief_chat_prompt(
     registry: ToolRegistry,
     observations: list[dict[str, Any]],
     pending: dict[str, Any] | None = None,
+    memory: dict[str, Any] | None = None,
     demand_final: bool = False,
 ) -> str:
     if persona.is_front_desk:
@@ -570,6 +635,8 @@ def build_chief_chat_prompt(
     context: dict[str, Any] = {
         "mission": store.mission().statement if store.mission() else "not set",
     }
+    if memory:
+        context.update(memory)
     if pending:
         context["pending_proposal_awaiting_confirmation"] = {
             "summary": pending.get("summary"),
@@ -729,6 +796,14 @@ def run_chief_chat_turn(
     registry = chief_query_registry()
     context = ChatToolContext(store=store, persona=persona, operator=operator)
     tools = native_tool_specs(registry)
+    memory = build_chat_memory(
+        store,
+        thread=thread,
+        persona=persona,
+        content=content,
+        history_window=history_window,
+        exclude_message_id=request.message_id,
+    )
     observations: list[dict[str, Any]] = []
     tools_used: list[str] = []
     final_text: str | None = None
@@ -748,6 +823,7 @@ def run_chief_chat_turn(
             registry=registry,
             observations=observations,
             pending=pending,
+            memory=memory,
             demand_final=demand_final,
         )
         try:
@@ -846,6 +922,13 @@ def run_chief_chat_turn(
         }
     )
     store.touch_conversation(thread.thread_id)
+    _maybe_refresh_summary(
+        store,
+        thread=thread,
+        provider=provider,
+        history_window=history_window,
+        agent_label=agent_label,
+    )
     return {
         "status": "complete",
         "conversation_id": channel,
@@ -859,6 +942,50 @@ def run_chief_chat_turn(
         "iterations": iterations,
         "tools_used": tools_used,
     }
+
+
+def _maybe_refresh_summary(
+    store: StateStore,
+    *,
+    thread: Conversation,
+    provider: ModelProvider,
+    history_window: int,
+    agent_label: str,
+) -> None:
+    """Roll the thread summary forward once it outgrows the history window.
+
+    One cheap extra completion roughly every half-window of turns (each turn
+    appends two messages); any failure is logged and never blocks the turn."""
+    channel = thread.channel
+    messages = store.messages(channel)
+    window = max(1, history_window)
+    if len(messages) <= 2 * window or len(messages) % window not in {0, 1}:
+        return
+    tail = messages[-(4 * window):]
+    transcript = "\n".join(
+        f"{message.sender}: {_truncate(message.content, 300)}" for message in tail
+    )
+    prompt = "\n".join(
+        [
+            "Summarize this operator<->chief conversation in at most 10 short "
+            "bullets. Keep task ids, decisions made, and unresolved questions. "
+            "Reply with plain-text bullets only.",
+            "",
+            "Existing summary (fold it in):",
+            thread.rolling_summary or "<none>",
+            "",
+            "Transcript tail:",
+            transcript,
+        ]
+    )
+    try:
+        response = _complete_model_call(store, provider, prompt, tools=[], holder=agent_label)
+        summary = response.text.strip()[:MAX_SUMMARY_CHARS]
+        if summary:
+            store.set_conversation_summary(thread.thread_id, summary)
+            _record_chief_usage(store, response, channel=channel, agent_id=agent_label)
+    except Exception:
+        LOGGER.warning("chief_chat_summary_refresh_failed", exc_info=True)
 
 
 def _budget_exhausted_answer(observations: list[dict[str, Any]]) -> str:

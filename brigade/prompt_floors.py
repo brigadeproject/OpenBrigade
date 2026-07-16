@@ -80,6 +80,51 @@ def write_orchestrator_notes(store: StateStore, content: str, *, append: bool = 
         combined = combined[-MAX_ORCHESTRATOR_NOTES_CHARS :]
     path.write_text(combined, encoding="utf-8")
 
+CHAT_MEMORY_FILENAME = "CHAT_MEMORY.md"
+MAX_CHAT_MEMORY_CHARS = 8000
+
+
+def _chat_memory_path(store: StateStore, agent_id: str | None) -> Path:
+    """Curated chat memory lives next to the persona's other workspace files;
+    the front desk (agent_id=None) shares the orchestrator workspace."""
+    if agent_id is None:
+        return orchestrator_workspace_path(store) / CHAT_MEMORY_FILENAME
+    agent = next((item for item in store.agents() if item.agent_id == agent_id), None)
+    if agent is None:
+        return orchestrator_workspace_path(store) / CHAT_MEMORY_FILENAME
+    return store.data_dir / agent.workspace_path / CHAT_MEMORY_FILENAME
+
+
+def read_agent_chat_notes(store: StateStore, agent_id: str | None) -> str:
+    path = _chat_memory_path(store, agent_id)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def write_agent_chat_notes(
+    store: StateStore,
+    agent_id: str | None,
+    content: str,
+    *,
+    append: bool = True,
+) -> None:
+    path = _chat_memory_path(store, agent_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if append and path.exists():
+        existing = path.read_text(encoding="utf-8")
+        combined = (
+            (existing.rstrip() + "\n" + content.strip() + "\n")
+            if existing.strip()
+            else (content.strip() + "\n")
+        )
+    else:
+        combined = content.strip() + "\n"
+    if len(combined) > MAX_CHAT_MEMORY_CHARS:
+        combined = combined[-MAX_CHAT_MEMORY_CHARS:]
+    path.write_text(combined, encoding="utf-8")
+
+
 CREW_CHIEF_SYSTEM_PROMPT = "\n".join(
     [
         "You are an OpenBrigade Crew Chief.",

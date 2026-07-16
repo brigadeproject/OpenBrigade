@@ -228,6 +228,117 @@ def test_idempotent_requests_are_deduplicated(tmp_path):
     assert len(provider.calls) == 1
 
 
+def test_history_window_carries_prior_turns(tmp_path):
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(["Noted, the demo is Friday."])
+    _turn(store, provider, content="heads up: the demo is Friday")
+
+    provider = SequencedTestProvider(["You told me the demo is Friday."])
+    _turn(store, provider, content="when is the demo?")
+
+    prompt = provider.calls[0]["prompt"]
+    assert "recent_thread_history" in prompt
+    assert "heads up: the demo is Friday" in prompt
+    # The current request is not duplicated into history.
+    assert prompt.count("when is the demo?") == 1
+
+
+def test_history_window_is_bounded(tmp_path):
+    store = _fleet(tmp_path)
+    for index in range(6):
+        provider = SequencedTestProvider([f"reply {index}"])
+        _turn(store, provider, content=f"question {index}", history_window=2)
+
+    prompt = provider.calls[0]["prompt"]
+    assert "reply 4" in prompt  # inside the 2-message window
+    assert "question 0" not in prompt  # far outside it
+
+
+def test_remember_round_trips_into_next_turn(tmp_path):
+    from brigade.prompt_floors import read_agent_chat_notes
+
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(
+        [
+            json.dumps(
+                {
+                    "status": "tool_call",
+                    "tool": "remember",
+                    "arguments": {"note": "Operator prefers Friday demos."},
+                }
+            ),
+            "Remembered.",
+        ]
+    )
+    _turn(store, provider, content="remember that I prefer Friday demos")
+
+    assert "Friday demos" in read_agent_chat_notes(store, "chief0")
+
+    provider = SequencedTestProvider(["You prefer Friday demos."])
+    _turn(store, provider, content="what do I prefer?")
+    prompt = provider.calls[0]["prompt"]
+    assert "curated_notes" in prompt
+    assert "Operator prefers Friday demos." in prompt
+
+
+def test_episode_recall_block_present_only_on_match(tmp_path):
+    store = _fleet(tmp_path)
+    store.add_episode(
+        {
+            "episode_id": "e1",
+            "agent_id": "chief0",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "source": "chief_chat",
+            "conversation_id": "thread:old",
+            "summary": "Shipped the ingest pipeline rewrite",
+        }
+    )
+    provider = SequencedTestProvider(["We shipped it in January."])
+    _turn(store, provider, content="ingest pipeline rewrite status?")
+    assert "possibly_relevant_past_episodes" in provider.calls[0]["prompt"]
+    assert "Shipped the ingest pipeline rewrite" in provider.calls[0]["prompt"]
+
+    provider = SequencedTestProvider(["All quiet."])
+    _turn(store, provider, content="zzz unrelated zzz")
+    assert "possibly_relevant_past_episodes" not in provider.calls[0]["prompt"]
+
+
+def test_rolling_summary_refreshes_and_feeds_back(tmp_path):
+    store = _fleet(tmp_path)
+    # Window of 1: each turn adds 2 messages, so the 2x threshold trips on
+    # turn two and the provider gets an extra summary completion.
+    provider = SequencedTestProvider(["first reply"])
+    _turn(store, provider, content="first question", history_window=1)
+
+    provider = SequencedTestProvider(
+        ["second reply", "- demo Friday\n- task t1 blocked"]
+    )
+    result = _turn(store, provider, content="second question", history_window=1)
+
+    thread = store.find_conversation(result["conversation_id"].removeprefix("thread:"))
+    assert thread.rolling_summary == "- demo Friday\n- task t1 blocked"
+    assert "Summarize this operator<->chief conversation" in provider.calls[1]["prompt"]
+
+    provider = SequencedTestProvider(["third reply", "- summary again"])
+    _turn(store, provider, content="third question", history_window=1)
+    assert "conversation_summary" in provider.calls[0]["prompt"]
+    assert "demo Friday" in provider.calls[0]["prompt"]
+
+
+def test_summary_refresh_failure_never_blocks_the_turn(tmp_path):
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(["first reply"])
+    _turn(store, provider, content="first question", history_window=1)
+
+    # Only one scripted response: the summary refresh call raises.
+    provider = SequencedTestProvider(["second reply"])
+    result = _turn(store, provider, content="second question", history_window=1)
+
+    assert result["status"] == "complete"
+    thread = store.find_conversation(result["conversation_id"].removeprefix("thread:"))
+    assert thread.rolling_summary == ""
+
+
 def test_thread_send_route_runs_the_loop(tmp_path, monkeypatch):
     import pytest
 
