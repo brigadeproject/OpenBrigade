@@ -154,6 +154,9 @@ CREW_CHIEF_CHAT_PROMPT = "\n".join(
         "Reply with exactly one JSON object describing your plan:",
         '{"status":"propose_actions","summary":"one sentence","actions":[...]}',
         "The operator must reply confirm before anything is applied.",
+        "If a pending proposal is shown in the context and this message is not a "
+        "bare confirm/cancel, treat the message as the operator's real intent and "
+        "propose fresh actions accordingly.",
     ]
 )
 
