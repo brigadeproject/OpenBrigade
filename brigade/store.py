@@ -15,6 +15,7 @@ from brigade.schemas import (
     Assignment,
     AssignmentStatus,
     ChatMessage,
+    Conversation,
     Goal,
     Mission,
     Team,
@@ -23,6 +24,7 @@ from brigade.schemas import (
     agent_state_from_dict,
     assignment_from_dict,
     chat_message_from_dict,
+    conversation_from_dict,
     goal_from_dict,
     mission_from_dict,
     team_from_dict,
@@ -143,6 +145,32 @@ class StateStore(Protocol):
     def add_message(self, message: ChatMessage) -> None: ...
 
     def messages(self, channel: str | None = None) -> list[ChatMessage]: ...
+
+    def recent_messages(self, channel: str, limit: int = 50) -> list[ChatMessage]: ...
+
+    def upsert_conversation(self, conversation: Conversation) -> None: ...
+
+    def find_conversation(self, thread_id: str) -> Conversation | None: ...
+
+    def conversations(
+        self,
+        operator_username: str | None = None,
+        status: str | None = None,
+    ) -> list[Conversation]: ...
+
+    def resolve_active_conversation(
+        self,
+        operator_username: str,
+        persona: str,
+        *,
+        chief_agent_id: str | None = None,
+        team_id: str | None = None,
+        title: str | None = None,
+    ) -> Conversation: ...
+
+    def touch_conversation(self, thread_id: str) -> None: ...
+
+    def set_conversation_summary(self, thread_id: str, summary: str) -> None: ...
 
     def add_orchestrator_reasoning(self, record: dict[str, Any]) -> None: ...
 
@@ -1173,20 +1201,143 @@ class PostgresStateStore:
         sql += " order by created_at, id"
         messages: list[ChatMessage] = []
         for row in self._query(sql, params):
-            messages.append(
-                chat_message_from_dict(
-                    {
-                        "message_id": row[0],
-                        "channel": row[1],
-                        "sender": row[2],
-                        "recipient": row[3],
-                        "content": row[4],
-                        "created_at": _as_iso(row[5]),
-                        "metadata": _decode_json(row[6]),
-                    }
-                )
-            )
+            messages.append(_chat_message_from_row(row))
         return messages
+
+    def recent_messages(self, channel: str, limit: int = 50) -> list[ChatMessage]:
+        rows = self._query(
+            """
+            select id, channel, sender, recipient, content, created_at, metadata
+            from brigade_chat_messages
+            where channel = %s
+            order by created_at desc, id desc
+            limit %s
+            """,
+            (channel, max(1, int(limit))),
+        )
+        return [_chat_message_from_row(row) for row in reversed(rows)]
+
+    def upsert_conversation(self, conversation: Conversation) -> None:
+        self._execute(
+            """
+            insert into brigade_conversations (
+              id, operator_username, persona, chief_agent_id, team_id, status,
+              created_at, updated_at, record
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            on conflict (id) do update set
+              operator_username = excluded.operator_username,
+              persona = excluded.persona,
+              chief_agent_id = excluded.chief_agent_id,
+              team_id = excluded.team_id,
+              status = excluded.status,
+              updated_at = excluded.updated_at,
+              record = excluded.record
+            """,
+            (
+                conversation.thread_id,
+                conversation.operator_username,
+                conversation.persona,
+                conversation.chief_agent_id,
+                conversation.team_id,
+                conversation.status,
+                conversation.created_at,
+                conversation.updated_at,
+                json.dumps(conversation.to_dict(), sort_keys=True),
+            ),
+        )
+
+    def find_conversation(self, thread_id: str) -> Conversation | None:
+        record = self._record_or_none(
+            "select record from brigade_conversations where id = %s",
+            (thread_id,),
+        )
+        return conversation_from_dict(record) if record else None
+
+    def conversations(
+        self,
+        operator_username: str | None = None,
+        status: str | None = None,
+    ) -> list[Conversation]:
+        sql = "select record from brigade_conversations"
+        clauses: list[str] = []
+        params: list[object] = []
+        if operator_username is not None:
+            clauses.append("operator_username = %s")
+            params.append(operator_username)
+        if status is not None:
+            clauses.append("status = %s")
+            params.append(status)
+        if clauses:
+            sql += " where " + " and ".join(clauses)
+        sql += " order by updated_at desc, id"
+        return [conversation_from_dict(record) for record in self._records(sql, tuple(params))]
+
+    def resolve_active_conversation(
+        self,
+        operator_username: str,
+        persona: str,
+        *,
+        chief_agent_id: str | None = None,
+        team_id: str | None = None,
+        title: str | None = None,
+    ) -> Conversation:
+        candidate = Conversation(
+            operator_username=operator_username,
+            persona=persona,
+            chief_agent_id=chief_agent_id,
+            team_id=team_id,
+            title=title,
+        )
+        # The partial unique index makes the insert a no-op when another
+        # request already created the active thread, so the re-select below
+        # always converges on a single winner.
+        self._execute(
+            """
+            insert into brigade_conversations (
+              id, operator_username, persona, chief_agent_id, team_id, status,
+              created_at, updated_at, record
+            )
+            values (%s, %s, %s, %s, %s, 'active', %s, %s, %s::jsonb)
+            on conflict (operator_username, persona) where status = 'active'
+            do nothing
+            """,
+            (
+                candidate.thread_id,
+                candidate.operator_username,
+                candidate.persona,
+                candidate.chief_agent_id,
+                candidate.team_id,
+                candidate.created_at,
+                candidate.updated_at,
+                json.dumps(candidate.to_dict(), sort_keys=True),
+            ),
+        )
+        record = self._record_or_none(
+            """
+            select record from brigade_conversations
+            where operator_username = %s and persona = %s and status = 'active'
+            """,
+            (operator_username, persona),
+        )
+        if record is None:  # pragma: no cover - insert above guarantees a row
+            raise RuntimeError("failed to resolve active conversation")
+        return conversation_from_dict(record)
+
+    def touch_conversation(self, thread_id: str) -> None:
+        conversation = self.find_conversation(thread_id)
+        if conversation is None:
+            return
+        conversation.updated_at = utc_now_iso()
+        self.upsert_conversation(conversation)
+
+    def set_conversation_summary(self, thread_id: str, summary: str) -> None:
+        conversation = self.find_conversation(thread_id)
+        if conversation is None:
+            return
+        conversation.rolling_summary = summary
+        conversation.updated_at = utc_now_iso()
+        self.upsert_conversation(conversation)
 
     def add_orchestrator_reasoning(self, record: dict[str, Any]) -> None:
         self._execute(
@@ -2216,6 +2367,20 @@ def _decode_json(value: Any) -> dict[str, Any]:
 
 def _as_iso(value: Any) -> str:
     return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _chat_message_from_row(row: tuple[Any, ...]) -> ChatMessage:
+    return chat_message_from_dict(
+        {
+            "message_id": row[0],
+            "channel": row[1],
+            "sender": row[2],
+            "recipient": row[3],
+            "content": row[4],
+            "created_at": _as_iso(row[5]),
+            "metadata": _decode_json(row[6]),
+        }
+    )
 
 
 def _goal_identity(goal: dict[str, Any]) -> tuple[object, ...]:

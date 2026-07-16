@@ -86,6 +86,12 @@ class Settings:
     connector_max_inbound_chars: int = 4000
     connector_max_outbound_chars: int = 3500
     connector_max_body_bytes: int = 1_048_576
+    chief_chat_enabled: bool = True
+    chief_chat_max_iterations: int = 6
+    chief_chat_history_window: int = 12
+    chief_chat_default_persona: str = "auto"
+    connector_chief_chat_enabled: bool = False
+    chief_chat_connector_max_iterations: int = 3
     allow_json_store: bool = False
 
 
@@ -539,6 +545,37 @@ def load_settings(
             "BRIGADE_CONNECTOR_MAX_BODY_BYTES",
             dotenv,
             config.get("connector_max_body_bytes", 1_048_576),
+        ),
+        chief_chat_enabled=_env_bool(
+            "BRIGADE_CHIEF_CHAT_ENABLED",
+            dotenv,
+            config.get("chief_chat_enabled", True),
+        ),
+        chief_chat_max_iterations=_env_int(
+            "BRIGADE_CHIEF_CHAT_MAX_ITERATIONS",
+            dotenv,
+            config.get("chief_chat_max_iterations", 6),
+        ),
+        chief_chat_history_window=_env_int(
+            "BRIGADE_CHIEF_CHAT_HISTORY_WINDOW",
+            dotenv,
+            config.get("chief_chat_history_window", 12),
+        ),
+        chief_chat_default_persona=_env(
+            "BRIGADE_CHIEF_CHAT_DEFAULT_PERSONA",
+            dotenv,
+            config.get("chief_chat_default_persona", "auto"),
+        )
+        or "auto",
+        connector_chief_chat_enabled=_env_bool(
+            "BRIGADE_CONNECTOR_CHIEF_CHAT_ENABLED",
+            dotenv,
+            config.get("connector_chief_chat_enabled", False),
+        ),
+        chief_chat_connector_max_iterations=_env_int(
+            "BRIGADE_CHIEF_CHAT_CONNECTOR_MAX_ITERATIONS",
+            dotenv,
+            config.get("chief_chat_connector_max_iterations", 3),
         ),
         allow_json_store=_env_bool(
             "BRIGADE_ALLOW_JSON_STORE",

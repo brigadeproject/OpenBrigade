@@ -11,6 +11,7 @@ from brigade.schemas import (
     Assignment,
     AssignmentStatus,
     ChatMessage,
+    Conversation,
     Goal,
     Mission,
     Team,
@@ -19,6 +20,7 @@ from brigade.schemas import (
     agent_state_from_dict,
     assignment_from_dict,
     chat_message_from_dict,
+    conversation_from_dict,
     goal_from_dict,
     mission_from_dict,
     team_from_dict,
@@ -39,6 +41,7 @@ EMPTY_STATE: dict[str, Any] = {
     "knowledge_documents": [],
     "knowledge_chunks": [],
     "messages": [],
+    "conversations": [],
     "orchestrator_reasoning": [],
     "proposals": [],
     "recurrences": [],
@@ -352,6 +355,84 @@ class JsonStateStore:
         if channel is None:
             return messages
         return [message for message in messages if message.channel == channel]
+
+    def recent_messages(self, channel: str, limit: int = 50) -> list[ChatMessage]:
+        return self.messages(channel)[-max(1, int(limit)) :]
+
+    def upsert_conversation(self, conversation: Conversation) -> None:
+        state = self.load()
+        conversations = [
+            item
+            for item in state.get("conversations", [])
+            if item["thread_id"] != conversation.thread_id
+        ]
+        conversations.append(conversation.to_dict())
+        state["conversations"] = conversations
+        self.save(state)
+
+    def find_conversation(self, thread_id: str) -> Conversation | None:
+        for item in self.load().get("conversations", []):
+            if item["thread_id"] == thread_id:
+                return conversation_from_dict(item)
+        return None
+
+    def conversations(
+        self,
+        operator_username: str | None = None,
+        status: str | None = None,
+    ) -> list[Conversation]:
+        conversations = [
+            conversation_from_dict(item) for item in self.load().get("conversations", [])
+        ]
+        if operator_username is not None:
+            conversations = [
+                item for item in conversations if item.operator_username == operator_username
+            ]
+        if status is not None:
+            conversations = [item for item in conversations if item.status == status]
+        conversations.sort(key=lambda item: item.updated_at, reverse=True)
+        return conversations
+
+    def resolve_active_conversation(
+        self,
+        operator_username: str,
+        persona: str,
+        *,
+        chief_agent_id: str | None = None,
+        team_id: str | None = None,
+        title: str | None = None,
+    ) -> Conversation:
+        for item in self.load().get("conversations", []):
+            if (
+                item["operator_username"] == operator_username
+                and item["persona"] == persona
+                and item.get("status", "active") == "active"
+            ):
+                return conversation_from_dict(item)
+        conversation = Conversation(
+            operator_username=operator_username,
+            persona=persona,
+            chief_agent_id=chief_agent_id,
+            team_id=team_id,
+            title=title,
+        )
+        self.upsert_conversation(conversation)
+        return conversation
+
+    def touch_conversation(self, thread_id: str) -> None:
+        conversation = self.find_conversation(thread_id)
+        if conversation is None:
+            return
+        conversation.updated_at = utc_now_iso()
+        self.upsert_conversation(conversation)
+
+    def set_conversation_summary(self, thread_id: str, summary: str) -> None:
+        conversation = self.find_conversation(thread_id)
+        if conversation is None:
+            return
+        conversation.rolling_summary = summary
+        conversation.updated_at = utc_now_iso()
+        self.upsert_conversation(conversation)
 
     def add_orchestrator_reasoning(self, record: dict[str, Any]) -> None:
         state = self.load()

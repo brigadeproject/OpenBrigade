@@ -378,6 +378,37 @@ class ChatMessage:
         return self.__dict__.copy()
 
 
+@dataclass
+class Conversation:
+    """A durable chief-chat thread binding an operator to one persona.
+
+    ``persona`` is ``"front_desk"`` or ``"chief:<agent_id>"``; a thread keeps
+    one persona for life. Messages live in the chat log under channel
+    ``f"thread:{thread_id}"``."""
+
+    operator_username: str
+    persona: str
+    chief_agent_id: str | None = None
+    team_id: str | None = None
+    status: str = "active"
+    title: str | None = None
+    rolling_summary: str = ""
+    thread_id: str = field(default_factory=lambda: str(uuid4()))
+    created_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = field(default_factory=utc_now_iso)
+
+    def __post_init__(self) -> None:
+        _require_text(self.operator_username, "operator_username")
+        _require_text(self.persona, "persona")
+
+    @property
+    def channel(self) -> str:
+        return f"thread:{self.thread_id}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__.copy()
+
+
 def mission_from_dict(item: dict[str, Any]) -> Mission:
     return Mission(
         statement=item["statement"],
@@ -488,6 +519,21 @@ def user_from_dict(item: dict[str, Any]) -> User:
         username=item["username"],
         role=Role(item.get("role", Role.OBSERVER.value)),
         created_at=item["created_at"],
+    )
+
+
+def conversation_from_dict(item: dict[str, Any]) -> Conversation:
+    return Conversation(
+        operator_username=item["operator_username"],
+        persona=item["persona"],
+        chief_agent_id=item.get("chief_agent_id"),
+        team_id=item.get("team_id"),
+        status=item.get("status", "active"),
+        title=item.get("title"),
+        rolling_summary=item.get("rolling_summary", ""),
+        thread_id=item["thread_id"],
+        created_at=item["created_at"],
+        updated_at=item.get("updated_at", item["created_at"]),
     )
 
 

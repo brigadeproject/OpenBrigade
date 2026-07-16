@@ -27,6 +27,11 @@ from brigade.connectors import (
     process_live_connector_message,
     telegram_reply_sender,
 )
+from brigade.chief_chat import (
+    UnknownPersonaError,
+    available_personas,
+    resolve_persona,
+)
 from brigade.health import check_configured_datastores
 from brigade.markdown import render_markdown_html
 from brigade.providers import (
@@ -1039,6 +1044,86 @@ def create_app(
             "response_markdown": response_markdown,
             "response_html": render_markdown_html(response_markdown),
         }
+
+    def _operator_username(user: User | None) -> str:
+        return user.username if user else "operator"
+
+    def _thread_or_404(thread_id: str):
+        conversation = store.find_conversation(thread_id)
+        if conversation is None:
+            raise HTTPException(status_code=404, detail=f"unknown thread: {thread_id}")
+        return conversation
+
+    @app.get("/api/chat/threads")
+    async def chat_threads(current: AuthResult = auth_dependency) -> dict[str, object]:
+        user = require("chat:read", current)
+        username = _operator_username(user)
+        return {
+            "threads": [item.to_dict() for item in store.conversations(username)],
+            "personas": [item.to_dict() for item in available_personas(store)],
+        }
+
+    @app.post("/api/chat/threads")
+    async def chat_thread_open(
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("chat:write", current)
+        try:
+            persona = resolve_persona(
+                store,
+                payload.get("persona"),
+                default=settings.chief_chat_default_persona,
+            )
+        except UnknownPersonaError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        conversation = store.resolve_active_conversation(
+            _operator_username(user),
+            persona.persona_id,
+            chief_agent_id=persona.chief_agent_id,
+            team_id=persona.team_id,
+            title=payload.get("title") or persona.display_name,
+        )
+        return {**conversation.to_dict(), "channel": conversation.channel}
+
+    @app.get("/api/chat/threads/{thread_id}/messages")
+    async def chat_thread_messages(
+        thread_id: str,
+        limit: int = 100,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        require("chat:read", current)
+        conversation = _thread_or_404(thread_id)
+        return {
+            "thread": conversation.to_dict(),
+            "messages": [
+                message.to_dict()
+                for message in store.recent_messages(conversation.channel, limit=limit)
+            ],
+        }
+
+    @app.post("/api/chat/threads/{thread_id}/persona")
+    async def chat_thread_switch_persona(
+        thread_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        # A thread keeps one persona for life: switching resolves (or creates)
+        # the caller's active thread for the requested persona instead.
+        user = require("chat:write", current)
+        _thread_or_404(thread_id)
+        try:
+            persona = resolve_persona(store, str(payload.get("persona") or ""))
+        except UnknownPersonaError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        conversation = store.resolve_active_conversation(
+            _operator_username(user),
+            persona.persona_id,
+            chief_agent_id=persona.chief_agent_id,
+            team_id=persona.team_id,
+            title=persona.display_name,
+        )
+        return {**conversation.to_dict(), "channel": conversation.channel}
 
     @app.get("/api/settings/effective")
     async def settings_effective(current: AuthResult = auth_dependency) -> dict[str, object]:
