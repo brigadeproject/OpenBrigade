@@ -228,6 +228,79 @@ def test_idempotent_requests_are_deduplicated(tmp_path):
     assert len(provider.calls) == 1
 
 
+def test_web_fetch_tool_fetches_when_enabled(tmp_path, monkeypatch):
+    import io
+
+    import brigade.tools as tools
+
+    class _FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(request, timeout=0):
+        assert request.full_url == "https://example.com/status"
+        return _FakeResponse(b"release notes: all green")
+
+    monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(
+        [
+            _tool_call("web_fetch", url="https://example.com/status"),
+            "The page says all green.",
+        ]
+    )
+
+    result = _turn(store, provider, content="check https://example.com/status")
+
+    assert result["tools_used"] == ["web_fetch"]
+    assert "release notes: all green" in provider.calls[1]["prompt"]
+
+
+def test_web_fetch_absent_when_disabled(tmp_path):
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(["All quiet."])
+    _turn(store, provider, enable_web_fetch=False)
+    assert "web_fetch" not in provider.calls[0]["prompt"]
+
+    enabled = SequencedTestProvider(["All quiet."])
+    _turn(store, enabled, content="again")
+    assert "web_fetch" in enabled.calls[0]["prompt"]
+
+
+def test_list_recurrences_tool_is_team_scoped(tmp_path):
+    from brigade.schemas import build_recurrence
+    from brigade.time import add_seconds_iso, utc_now_iso
+
+    store = _fleet(tmp_path, teams=2)
+    store.add_recurrence(
+        build_recurrence(
+            template={"assignment": "Daily briefing for my team",
+                      "assigned_to": "worker0"},
+            interval_seconds=86400,
+            next_due_at=add_seconds_iso(utc_now_iso(), 3600),
+        )
+    )
+    store.add_recurrence(
+        build_recurrence(
+            template={"assignment": "Other team's job", "assigned_to": "worker1"},
+            interval_seconds=86400,
+            next_due_at=add_seconds_iso(utc_now_iso(), 3600),
+        )
+    )
+    provider = SequencedTestProvider(
+        [_tool_call("list_recurrences"), "One scheduled job."]
+    )
+
+    _turn(store, provider, content="what's scheduled?")
+
+    observed = provider.calls[1]["prompt"]
+    assert "Daily briefing for my team" in observed
+    assert "Other team's job" not in observed
+
+
 def test_history_window_carries_prior_turns(tmp_path):
     store = _fleet(tmp_path)
     provider = SequencedTestProvider(["Noted, the demo is Friday."])

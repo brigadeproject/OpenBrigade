@@ -51,7 +51,13 @@ from brigade.services import (
 )
 from brigade.store import StateStore
 from brigade.time import parse_utc_iso, utc_now, utc_now_iso
-from brigade.tools import ToolRegistry, ToolResult, ToolSpec, native_tool_specs
+from brigade.tools import (
+    ToolRegistry,
+    ToolResult,
+    ToolSpec,
+    _web_fetch,
+    native_tool_specs,
+)
 
 LOGGER = logging.getLogger("brigade.chief_chat")
 
@@ -353,6 +359,31 @@ def _tool_usage_summary(context: ChatToolContext, arguments: dict[str, Any]) -> 
     return ToolResult(True, compact_json({"days": days, "by_model": totals}))
 
 
+def _tool_list_recurrences(
+    context: ChatToolContext, arguments: dict[str, Any]
+) -> ToolResult:
+    scope = context.scope_ids()
+    jobs = []
+    for recurrence in context.store.recurrences():
+        template = recurrence.get("template") or {}
+        target = str(template.get("assigned_to") or "")
+        if scope is not None and target not in scope:
+            continue
+        jobs.append(
+            {
+                "recurrence_id": recurrence.get("recurrence_id"),
+                "enabled": recurrence.get("enabled", True),
+                "assigned_to": target,
+                "assignment": str(template.get("assignment") or "")[:160],
+                "interval_seconds": recurrence.get("interval_seconds"),
+                "next_due_at": recurrence.get("next_due_at"),
+                "delivers_briefing": isinstance(template.get("deliver_to"), dict),
+                "last_materialized_at": recurrence.get("last_materialized_at"),
+            }
+        )
+    return ToolResult(True, compact_json({"count": len(jobs), "scheduled_jobs": jobs}))
+
+
 def _tool_remember(context: ChatToolContext, arguments: dict[str, Any]) -> ToolResult:
     note = str(arguments.get("note") or "").strip()
     if not note:
@@ -384,7 +415,7 @@ def search_episode_summaries(
     return matches
 
 
-def chief_query_registry() -> ToolRegistry:
+def chief_query_registry(*, include_web_fetch: bool = True) -> ToolRegistry:
     """Read-only query tools for chat turns. Argument descriptions matter:
     ``native_tool_specs`` marks an argument required unless its description
     contains the word "optional"."""
@@ -480,6 +511,29 @@ def chief_query_registry() -> ToolRegistry:
     )
     registry.register(
         ToolSpec(
+            name="list_recurrences",
+            description=(
+                "List scheduled jobs (recurrences) you can see: what runs, "
+                "for whom, how often, and when it fires next."
+            ),
+            argument_schema={},
+        ),
+        _tool_list_recurrences,
+    )
+    if include_web_fetch:
+        registry.register(
+            ToolSpec(
+                name="web_fetch",
+                description="Fetch a small HTTP(S) text response for reference.",
+                argument_schema={
+                    "url": "http or https URL",
+                    "max_chars": "optional integer",
+                },
+            ),
+            _web_fetch,
+        )
+    registry.register(
+        ToolSpec(
             name="remember",
             description=(
                 "Save a durable note to your curated memory (operator "
@@ -552,6 +606,12 @@ CHIEF_CHAT_ACTION_DOCS = [
     '{"type":"set_priority","assignment_id":"...","priority":"high"}',
     '{"type":"attach_guidance","assignment_id":"...","message":"..."}',
     '{"type":"retry_blocked_assignment","assignment_id":"..."}',
+    '{"type":"create_recurrence","agent_id":"...","assignment":"...",'
+    '"interval_seconds":86400,"next_due_at":"optional UTC ISO start",'
+    '"deliver_briefing":true}'
+    " — a scheduled job; interval_seconds 86400 = daily; deliver_briefing "
+    "posts each run's finished summary back into this conversation.",
+    '{"type":"set_recurrence_enabled","recurrence_id":"...","enabled":false}',
 ]
 
 
@@ -736,6 +796,7 @@ def run_chief_chat_turn(
     max_iterations: int = 6,
     history_window: int = 12,
     idempotency_key: str | None = None,
+    enable_web_fetch: bool = True,
 ) -> dict[str, Any]:
     """One operator message -> one chief answer, via a bounded tool loop.
 
@@ -790,12 +851,13 @@ def run_chief_chat_turn(
                     None if persona.is_front_desk else set(persona.managed_agent_ids)
                 ),
                 by=operator,
+                conversation_channel=channel,
             ),
         )
         store.touch_conversation(thread.thread_id)
         return result
 
-    registry = chief_query_registry()
+    registry = chief_query_registry(include_web_fetch=enable_web_fetch)
     context = ChatToolContext(store=store, persona=persona, operator=operator)
     tools = native_tool_specs(registry)
     memory = build_chat_memory(
@@ -1136,6 +1198,7 @@ def run_connector_chief_chat(
     default_persona: str = "auto",
     max_iterations: int = 6,
     history_window: int = 12,
+    enable_web_fetch: bool = True,
 ) -> ConnectorChatReply:
     """One connector message -> one chief-chat reply. Handles control commands
     (persona switching, /who, /new) before any model call; otherwise continues
@@ -1164,6 +1227,7 @@ def run_connector_chief_chat(
         provider=provider,
         max_iterations=max_iterations,
         history_window=history_window,
+        enable_web_fetch=enable_web_fetch,
         idempotency_key=(
             f"{incoming.provider}:{incoming.external_message_id}"
             if incoming.external_message_id

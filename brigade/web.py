@@ -191,6 +191,7 @@ def create_app(
                 default_persona=settings.chief_chat_default_persona,
                 max_iterations=max_iterations,
                 history_window=settings.chief_chat_history_window,
+                enable_web_fetch=settings.chief_chat_web_fetch_enabled,
             )
 
         return _turn
@@ -1185,6 +1186,7 @@ def create_app(
             provider=provider,
             max_iterations=settings.chief_chat_max_iterations,
             history_window=settings.chief_chat_history_window,
+            enable_web_fetch=settings.chief_chat_web_fetch_enabled,
             idempotency_key=payload.get("idempotency_key") or f"web-chief:{uuid4()}",
         )
 

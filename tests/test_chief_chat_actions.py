@@ -240,6 +240,134 @@ def test_attach_guidance_records_and_audits(tmp_path):
     assert "chief_chat_attach_guidance" in _audit_actions(store)
 
 
+def test_create_recurrence_staged_confirmed_and_delivered_to_thread(tmp_path):
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(
+        [
+            _propose(
+                [
+                    {
+                        "type": "create_recurrence",
+                        "agent_id": "worker0",
+                        "assignment": "Daily team briefing",
+                        "interval_seconds": 86400,
+                        "deliver_briefing": True,
+                    }
+                ]
+            )
+        ]
+    )
+    staged = _turn(store, provider, content="brief me daily")
+    assert staged["status"] == "proposed"
+    assert store.recurrences() == []
+
+    applied = _turn(store, SequencedTestProvider([]), content="confirm")
+    assert applied["status"] == "applied"
+    created = applied["actions_applied"][0]
+    assert created["type"] == "create_recurrence"
+    assert created["delivers_briefing"] is True
+
+    recurrence = store.recurrences()[0]
+    assert recurrence["interval_seconds"] == 86400
+    template = recurrence["template"]
+    assert template["assigned_to"] == "worker0"
+    # Briefings land back in the very thread the operator asked from.
+    assert template["deliver_to"]["channel"] == staged["conversation_id"]
+    assert template["deliver_to"]["operator"] == "owner"
+    assert template["deliver_to"]["agent_id"] == "chief0"
+    assert "chief_chat_create_recurrence" in _audit_actions(store)
+
+
+def test_create_recurrence_validation_and_scope(tmp_path):
+    store = _fleet(tmp_path, teams=2)
+    managed = {"chief0", "worker0"}
+
+    result = apply_chief_chat_actions(
+        store,
+        [
+            {"type": "create_recurrence", "agent_id": "worker1",
+             "assignment": "x", "interval_seconds": 86400},
+            {"type": "create_recurrence", "agent_id": "worker0",
+             "assignment": "x", "interval_seconds": 30},
+            {"type": "create_recurrence", "agent_id": "worker0",
+             "assignment": "x", "interval_seconds": 86400,
+             "next_due_at": "tomorrow-ish"},
+            {"type": "create_recurrence", "agent_id": "worker0",
+             "assignment": "", "interval_seconds": 86400},
+        ],
+        chief_id="chief0",
+        managed_agent_ids=managed,
+        by="owner",
+    )
+    assert result["applied"] == []
+    reasons = " ".join(item["reason"] for item in result["rejected"])
+    assert "not on your team" in reasons
+    assert "at least 300" in reasons
+    assert "not a UTC ISO timestamp" in reasons
+    assert "missing assignment" in reasons
+    assert store.recurrences() == []
+
+    # deliver_briefing without a conversation channel degrades to no delivery.
+    ok = apply_chief_chat_actions(
+        store,
+        [{"type": "create_recurrence", "agent_id": "worker0",
+          "assignment": "weekly report", "interval_seconds": 604800,
+          "deliver_briefing": True}],
+        chief_id="chief0",
+        managed_agent_ids=managed,
+        by="owner",
+        conversation_channel=None,
+    )
+    assert ok["applied"][0]["delivers_briefing"] is False
+
+
+def test_set_recurrence_enabled_toggles_and_scope_checks(tmp_path):
+    from brigade.schemas import build_recurrence
+    from brigade.time import add_seconds_iso
+    from brigade.time import utc_now_iso as now_iso
+
+    store = _fleet(tmp_path, teams=2)
+    mine = store.add_recurrence(
+        build_recurrence(
+            template={"assignment": "mine", "assigned_to": "worker0"},
+            interval_seconds=86400,
+            next_due_at=add_seconds_iso(now_iso(), 3600),
+        )
+    )
+    theirs = store.add_recurrence(
+        build_recurrence(
+            template={"assignment": "theirs", "assigned_to": "worker1"},
+            interval_seconds=86400,
+            next_due_at=add_seconds_iso(now_iso(), 3600),
+        )
+    )
+
+    result = apply_chief_chat_actions(
+        store,
+        [
+            {"type": "set_recurrence_enabled",
+             "recurrence_id": mine["recurrence_id"], "enabled": False},
+            {"type": "set_recurrence_enabled",
+             "recurrence_id": theirs["recurrence_id"], "enabled": False},
+            {"type": "set_recurrence_enabled",
+             "recurrence_id": "missing", "enabled": False},
+        ],
+        chief_id="chief0",
+        managed_agent_ids={"chief0", "worker0"},
+        by="owner",
+    )
+
+    assert [item["recurrence_id"] for item in result["applied"]] == [
+        mine["recurrence_id"]
+    ]
+    reasons = " ".join(item["reason"] for item in result["rejected"])
+    assert "outside your team" in reasons
+    assert "unknown recurrence" in reasons
+    by_id = {item["recurrence_id"]: item for item in store.recurrences()}
+    assert by_id[mine["recurrence_id"]]["enabled"] is False
+    assert by_id[theirs["recurrence_id"]]["enabled"] is True
+
+
 def test_route_stage_and_confirm_flow(tmp_path, monkeypatch):
     import asyncio
 

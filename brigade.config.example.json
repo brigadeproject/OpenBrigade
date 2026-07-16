@@ -55,6 +55,7 @@
   "chief_chat_max_iterations": 6,
   "chief_chat_history_window": 12,
   "chief_chat_default_persona": "auto",
+  "chief_chat_web_fetch_enabled": true,
   "connector_chief_chat_enabled": false,
   "chief_chat_connector_max_iterations": 3
 }

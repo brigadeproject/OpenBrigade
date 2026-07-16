@@ -253,13 +253,25 @@ brigade connector approvals reject --provider google_chat --external-user users/
 
 Release 1.1 lets operators converse with the brigade in natural language through
 **Crew Chiefs**. A chief behaves like a modern agent: it runs a multi-turn tool
-loop over read-only query tools (`list_tasks`, `team_status`, `search_episodes`,
-`usage_summary`, …) to answer from live and historical state, keeps long-term
-memory (conversation continuity, episodic recall, curated notes), and stages
-state-changing actions (`create_assignment`, `cancel_assignment`, `set_priority`,
-`attach_guidance`, `retry_blocked_assignment`) for the operator to confirm in
-chat. Each conversation talks to one persona: a team's Crew Chief (scoped to that
-chief's agents) or the fleet-wide **front desk** (the orchestrator's view).
+loop over query tools (`list_tasks`, `team_status`, `search_episodes`,
+`usage_summary`, `list_recurrences`, `web_fetch`, …) to answer from live and
+historical state, keeps long-term memory (conversation continuity, episodic
+recall, curated notes), and stages state-changing actions (`create_assignment`,
+`cancel_assignment`, `set_priority`, `attach_guidance`,
+`retry_blocked_assignment`, `create_recurrence`, `set_recurrence_enabled`) for
+the operator to confirm in chat. Each conversation talks to one persona: a
+team's Crew Chief (scoped to that chief's agents) or the fleet-wide **front
+desk** (the orchestrator's view).
+
+Chiefs can schedule their own recurring jobs: "brief me every morning" stages a
+`create_recurrence` (propose→confirm) that the orchestrator's existing
+recurrence engine materializes each due slot. With `deliver_briefing` set, the
+finished run's summary is posted back into the conversation thread it was
+created from — and to the operator Telegram when
+`BRIGADE_OPERATOR_TELEGRAM_CHAT_ID` is configured. Chiefs can also fetch small
+HTTP(S) text responses mid-conversation with the same `web_fetch` tool
+assignment agents already have (`BRIGADE_CHIEF_CHAT_WEB_FETCH_ENABLED=false`
+keeps chat turns fully offline).
 
 Threads are durable and identity-keyed, so the mobile SPA and an approved
 Telegram user with the same username share one conversation. Web/mobile use the

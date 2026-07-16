@@ -43,7 +43,7 @@ from brigade.schemas import (
     extract_json_object,
 )
 from brigade.store import StateStore
-from brigade.time import utc_now_iso
+from brigade.time import parse_utc_iso, utc_now_iso
 from brigade.workspace import write_heartbeat_assignment
 
 LOGGER = logging.getLogger("brigade.services")
@@ -231,6 +231,7 @@ SAFE_CONFIG_KEYS = {
     "chief_chat_max_iterations": int,
     "chief_chat_history_window": int,
     "chief_chat_default_persona": str,
+    "chief_chat_web_fetch_enabled": bool,
     "connector_chief_chat_enabled": bool,
     "chief_chat_connector_max_iterations": int,
 }
@@ -1704,6 +1705,8 @@ CHIEF_CHAT_ACTION_TYPES = frozenset(
         "attach_guidance",
         "set_priority",
         "retry_blocked_assignment",
+        "create_recurrence",
+        "set_recurrence_enabled",
     }
 )
 
@@ -1715,6 +1718,7 @@ def apply_chief_chat_actions(
     chief_id: str | None,
     managed_agent_ids: set[str] | None,
     by: str = "operator",
+    conversation_channel: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Operator-confirmed actions proposed by a crew chief in chat.
 
@@ -1735,6 +1739,19 @@ def apply_chief_chat_actions(
             if action_type == "create_assignment":
                 result = _apply_chief_create_assignment(
                     store, action, chief_id=chief_id, managed=managed_agent_ids
+                )
+            elif action_type == "create_recurrence":
+                result = _apply_chief_create_recurrence(
+                    store,
+                    action,
+                    chief_id=chief_id,
+                    managed=managed_agent_ids,
+                    by=by,
+                    conversation_channel=conversation_channel,
+                )
+            elif action_type == "set_recurrence_enabled":
+                result = _apply_chief_set_recurrence_enabled(
+                    store, action, managed=managed_agent_ids
                 )
             elif action_type == "retry_blocked_assignment":
                 _chief_scoped_assignment(store, action, managed=managed_agent_ids)
@@ -1765,6 +1782,11 @@ def apply_chief_chat_actions(
                 _chief_scoped_assignment(store, action, managed=managed_agent_ids)
                 result = _apply_chat_set_priority(store, action, by=by)
             applied.append(result)
+            audit_ref = str(
+                result.get("assignment_id") or action.get("assignment_id") or ""
+            )
+            if not audit_ref and result.get("recurrence_id"):
+                audit_ref = f"recurrence:{result['recurrence_id']}"
             _record_operator_event(
                 store,
                 action=f"chief_chat_{action_type}",
@@ -1772,9 +1794,7 @@ def apply_chief_chat_actions(
                     f"{action_type} applied via chief chat "
                     f"({chief_id or 'front_desk'}) by {by}"
                 ),
-                assignment_id=str(
-                    result.get("assignment_id") or action.get("assignment_id") or ""
-                ),
+                assignment_id=audit_ref,
                 agent_id=chief_id,
                 by=by,
                 payload={"chief_id": chief_id, "action": action},
@@ -1851,6 +1871,117 @@ def _apply_chief_create_assignment(
         "agent_id": resolved,
         "priority": priority.value,
         "status": persisted.status.value,
+    }
+
+
+MIN_RECURRENCE_INTERVAL_SECONDS = 300
+
+
+def _apply_chief_create_recurrence(
+    store: StateStore,
+    action: dict[str, Any],
+    *,
+    chief_id: str | None,
+    managed: set[str] | None,
+    by: str,
+    conversation_channel: str | None,
+) -> dict[str, Any]:
+    """Operator-confirmed scheduled job. The recurrence engine (efficiency.py)
+    materializes the template each due slot; when ``deliver_briefing`` is set
+    the finished output is posted back into this conversation's thread."""
+    from brigade.schemas import build_recurrence
+    from brigade.time import add_seconds_iso
+
+    agent_id = str(action.get("agent_id") or chief_id or "").strip()
+    assignment_text = str(action.get("assignment") or "").strip()
+    if not assignment_text:
+        raise ValueError("create_recurrence is missing assignment")
+    resolved = _resolve_agent_id(store, agent_id) if agent_id else None
+    if resolved is None:
+        raise ValueError(f"create_recurrence targets unknown agent {agent_id}")
+    if managed is not None and resolved not in managed:
+        raise ValueError(f"create_recurrence targets {resolved}, who is not on your team")
+    try:
+        interval_seconds = int(action.get("interval_seconds") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("create_recurrence interval_seconds must be an integer") from exc
+    if interval_seconds < MIN_RECURRENCE_INTERVAL_SECONDS:
+        raise ValueError(
+            "create_recurrence interval_seconds must be at least "
+            f"{MIN_RECURRENCE_INTERVAL_SECONDS} (got {interval_seconds})"
+        )
+    next_due_at = str(action.get("next_due_at") or "").strip()
+    if next_due_at:
+        try:
+            parse_utc_iso(next_due_at)
+        except ValueError as exc:
+            raise ValueError(
+                f"create_recurrence next_due_at is not a UTC ISO timestamp: {next_due_at}"
+            ) from exc
+    else:
+        next_due_at = add_seconds_iso(utc_now_iso(), interval_seconds)
+    template: dict[str, Any] = {
+        "assignment": assignment_text,
+        "assigned_to": resolved,
+        "priority": str(action.get("priority") or Priority.NORMAL.value),
+    }
+    if action.get("deliver_briefing") and conversation_channel:
+        template["deliver_to"] = {
+            "channel": conversation_channel,
+            "operator": by,
+            "agent_id": chief_id or "front_desk",
+        }
+    recurrence = build_recurrence(
+        template=template,
+        interval_seconds=interval_seconds,
+        next_due_at=next_due_at,
+    )
+    persisted = store.add_recurrence(recurrence)
+    return {
+        "type": "create_recurrence",
+        "recurrence_id": persisted.get("recurrence_id"),
+        "agent_id": resolved,
+        "interval_seconds": interval_seconds,
+        "next_due_at": next_due_at,
+        "delivers_briefing": "deliver_to" in template,
+    }
+
+
+def _apply_chief_set_recurrence_enabled(
+    store: StateStore,
+    action: dict[str, Any],
+    *,
+    managed: set[str] | None,
+) -> dict[str, Any]:
+    recurrence_id = str(action.get("recurrence_id") or "").strip()
+    if not recurrence_id:
+        raise ValueError("set_recurrence_enabled is missing recurrence_id")
+    enabled = action.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("set_recurrence_enabled needs enabled true/false")
+    recurrence = next(
+        (
+            item
+            for item in store.recurrences()
+            if str(item.get("recurrence_id")) == recurrence_id
+        ),
+        None,
+    )
+    if recurrence is None:
+        raise ValueError(f"unknown recurrence: {recurrence_id}")
+    target = str((recurrence.get("template") or {}).get("assigned_to") or "")
+    if managed is not None and target not in managed:
+        raise ValueError(
+            f"recurrence {recurrence_id} is outside your team (assigned to {target})"
+        )
+    recurrence = dict(recurrence)
+    recurrence["enabled"] = enabled
+    recurrence["updated_at"] = utc_now_iso()
+    store.update_recurrence(recurrence)
+    return {
+        "type": "set_recurrence_enabled",
+        "recurrence_id": recurrence_id,
+        "enabled": enabled,
     }
 
 
@@ -2337,6 +2468,7 @@ def build_settings_payload(
         "chief_chat_max_iterations": settings.chief_chat_max_iterations,
         "chief_chat_history_window": settings.chief_chat_history_window,
         "chief_chat_default_persona": settings.chief_chat_default_persona,
+        "chief_chat_web_fetch_enabled": settings.chief_chat_web_fetch_enabled,
         "connector_chief_chat_enabled": settings.connector_chief_chat_enabled,
         "chief_chat_connector_max_iterations": settings.chief_chat_connector_max_iterations,
         "editable_keys": sorted(SAFE_CONFIG_KEYS),

@@ -90,6 +90,7 @@ class Settings:
     chief_chat_max_iterations: int = 6
     chief_chat_history_window: int = 12
     chief_chat_default_persona: str = "auto"
+    chief_chat_web_fetch_enabled: bool = True
     connector_chief_chat_enabled: bool = False
     chief_chat_connector_max_iterations: int = 3
     allow_json_store: bool = False
@@ -567,6 +568,11 @@ def load_settings(
             config.get("chief_chat_default_persona", "auto"),
         )
         or "auto",
+        chief_chat_web_fetch_enabled=_env_bool(
+            "BRIGADE_CHIEF_CHAT_WEB_FETCH_ENABLED",
+            dotenv,
+            config.get("chief_chat_web_fetch_enabled", True),
+        ),
         connector_chief_chat_enabled=_env_bool(
             "BRIGADE_CONNECTOR_CHIEF_CHAT_ENABLED",
             dotenv,
