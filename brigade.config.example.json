@@ -50,5 +50,11 @@
   "connector_rate_limit_window_seconds": 60,
   "connector_max_inbound_chars": 4000,
   "connector_max_outbound_chars": 3500,
-  "connector_max_body_bytes": 1048576
+  "connector_max_body_bytes": 1048576,
+  "chief_chat_enabled": true,
+  "chief_chat_max_iterations": 6,
+  "chief_chat_history_window": 12,
+  "chief_chat_default_persona": "auto",
+  "connector_chief_chat_enabled": false,
+  "chief_chat_connector_max_iterations": 3
 }

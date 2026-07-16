@@ -73,10 +73,44 @@ type Message = {
   recipient: string;
   content: string;
   created_at: string;
+  metadata?: Record<string, unknown>;
 };
 
 type ChatPayload = {
   messages: Message[];
+};
+
+type PersonaInfo = {
+  persona_id: string;
+  kind: string;
+  display_name: string;
+  chief_agent_id?: string | null;
+  team_id?: string | null;
+};
+
+type ChatThread = {
+  thread_id: string;
+  persona: string;
+  chief_agent_id?: string | null;
+  team_id?: string | null;
+  status: string;
+  title?: string | null;
+  channel?: string;
+};
+
+type ThreadsPayload = {
+  threads: ChatThread[];
+  personas: PersonaInfo[];
+};
+
+type ThreadMessagesPayload = {
+  thread: ChatThread;
+  messages: Message[];
+};
+
+type ThreadTurnResult = {
+  status: string;
+  conversation_id?: string;
 };
 
 type ProposalRecord = {
@@ -392,6 +426,238 @@ function ChatTab({
   canChat: boolean;
   note: (text: string, isError?: boolean) => void;
 }) {
+  const [advanced, setAdvanced] = useState(false);
+  return (
+    <div className="m-chat">
+      <div className="m-chat-modebar">
+        <button
+          className={`m-chip ${advanced ? "" : "on"}`}
+          onClick={() => setAdvanced(false)}
+        >
+          Chiefs
+        </button>
+        <button
+          className={`m-chip ${advanced ? "on" : ""}`}
+          onClick={() => setAdvanced(true)}
+        >
+          Advanced
+        </button>
+      </div>
+      {advanced ? (
+        <LegacyChatTab api={api} cockpit={cockpit} canChat={canChat} note={note} />
+      ) : (
+        <ChiefChatTab api={api} canChat={canChat} note={note} />
+      )}
+    </div>
+  );
+}
+
+function ChiefChatTab({
+  api,
+  canChat,
+  note,
+}: {
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  canChat: boolean;
+  note: (text: string, isError?: boolean) => void;
+}) {
+  const [personas, setPersonas] = useState<PersonaInfo[]>([]);
+  const [persona, setPersona] = useState<string>("");
+  const [thread, setThread] = useState<ChatThread | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [draft, setDraft] = useState("");
+  const [pending, setPending] = useState(false);
+  const feedRef = useRef<HTMLDivElement | null>(null);
+
+  // Load the persona list once; default to the first (front desk).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const payload = await api<ThreadsPayload>("/api/chat/threads");
+        if (cancelled) {
+          return;
+        }
+        setPersonas(payload.personas || []);
+        setPersona((current) => current || payload.personas?.[0]?.persona_id || "");
+      } catch (error) {
+        note(errorMessage(error), true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [api, note]);
+
+  // Resolve (get-or-create) the thread whenever the persona changes.
+  useEffect(() => {
+    if (!persona) {
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const opened = await api<ChatThread>("/api/chat/threads", {
+          method: "POST",
+          json: { persona },
+        });
+        if (!cancelled) {
+          setThread(opened);
+        }
+      } catch (error) {
+        note(errorMessage(error), true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [api, persona, note]);
+
+  const loadMessages = useCallback(async () => {
+    if (!thread) {
+      return;
+    }
+    try {
+      const payload = await api<ThreadMessagesPayload>(
+        `/api/chat/threads/${encodeURIComponent(thread.thread_id)}/messages`,
+      );
+      setMessages(payload.messages || []);
+    } catch (error) {
+      note(errorMessage(error), true);
+    }
+  }, [api, thread, note]);
+
+  useEffect(() => {
+    if (!thread) {
+      setMessages([]);
+      return;
+    }
+    loadMessages();
+    const timer = window.setInterval(loadMessages, 10000);
+    return () => window.clearInterval(timer);
+  }, [thread, loadMessages]);
+
+  useEffect(() => {
+    const feed = feedRef.current;
+    if (feed) {
+      feed.scrollTop = feed.scrollHeight;
+    }
+  }, [messages.length, pending]);
+
+  const pendingProposal = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const kind = messages[index].metadata?.kind;
+      if (kind === "chief_chat_proposal_resolved") {
+        return false;
+      }
+      if (kind === "chief_chat_proposal") {
+        return true;
+      }
+    }
+    return false;
+  }, [messages]);
+
+  const sendContent = useCallback(
+    async (content: string) => {
+      if (!thread || !content.trim() || pending) {
+        return;
+      }
+      setPending(true);
+      try {
+        await api(`/api/chat/threads/${encodeURIComponent(thread.thread_id)}/messages`, {
+          method: "POST",
+          json: { content, idempotency_key: randomId("mobile-chief") },
+        });
+        setDraft("");
+        await loadMessages();
+      } catch (error) {
+        note(errorMessage(error), true);
+      } finally {
+        setPending(false);
+      }
+    },
+    [api, thread, pending, loadMessages, note],
+  );
+
+  function isMine(message: Message) {
+    return message.metadata?.kind === "chief_chat_request";
+  }
+
+  return (
+    <>
+      <div className="m-persona-picker">
+        {personas.map((item) => (
+          <button
+            key={item.persona_id}
+            className={`m-chip ${persona === item.persona_id ? "on" : ""}`}
+            onClick={() => setPersona(item.persona_id)}
+          >
+            {item.kind === "front_desk" ? "Front desk" : item.display_name}
+          </button>
+        ))}
+      </div>
+      <div className="m-chat-feed" ref={feedRef}>
+        {messages.length === 0 && <p className="m-muted">No messages yet.</p>}
+        {messages.slice(-80).map((item) => (
+          <div key={item.message_id} className={`m-msg ${isMine(item) ? "me" : "them"}`}>
+            {item.content}
+            <span className="m-msg-meta">
+              {item.sender} · {formatTime(item.created_at)}
+            </span>
+          </div>
+        ))}
+        {pending && <div className="m-pending">waiting for reply…</div>}
+      </div>
+      {pendingProposal && (
+        <div className="m-proposal-actions">
+          <button
+            className="m-btn primary"
+            disabled={!canChat || pending}
+            onClick={() => sendContent("confirm")}
+          >
+            Confirm
+          </button>
+          <button
+            className="m-btn"
+            disabled={!canChat || pending}
+            onClick={() => sendContent("cancel")}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+      <div className="m-compose">
+        <textarea
+          className="m-textarea"
+          rows={1}
+          value={draft}
+          disabled={!canChat || pending || !thread}
+          placeholder={canChat ? "Ask your chief…" : "Token lacks chat permission"}
+          onChange={(event) => setDraft(event.target.value)}
+        />
+        <button
+          className="m-btn primary"
+          disabled={!canChat || pending || !draft.trim() || !thread}
+          onClick={() => sendContent(draft)}
+        >
+          {pending ? "…" : "Send"}
+        </button>
+      </div>
+    </>
+  );
+}
+
+function LegacyChatTab({
+  api,
+  cockpit,
+  canChat,
+  note,
+}: {
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  cockpit: CockpitPayload | null;
+  canChat: boolean;
+  note: (text: string, isError?: boolean) => void;
+}) {
   const [target, setTarget] = useState(ORCHESTRATOR);
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
@@ -508,7 +774,7 @@ function ChatTab({
   }
 
   return (
-    <div className="m-chat">
+    <>
       <div className="m-chat-target">
         <select
           className="m-select"
@@ -582,7 +848,7 @@ function ChatTab({
           {pending ? "…" : "Send"}
         </button>
       </div>
-    </div>
+    </>
   );
 }
 

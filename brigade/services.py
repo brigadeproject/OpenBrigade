@@ -227,6 +227,12 @@ SAFE_CONFIG_KEYS = {
     "blocker_resolution_enabled": bool,
     "recurrence_detection_threshold": int,
     "recurrence_lookback_days": int,
+    "chief_chat_enabled": bool,
+    "chief_chat_max_iterations": int,
+    "chief_chat_history_window": int,
+    "chief_chat_default_persona": str,
+    "connector_chief_chat_enabled": bool,
+    "chief_chat_connector_max_iterations": int,
 }
 
 # Keys an operator can change live from the Telemetry page. These are layered onto
@@ -2327,6 +2333,12 @@ def build_settings_payload(
         "connector_max_inbound_chars": settings.connector_max_inbound_chars,
         "connector_max_outbound_chars": settings.connector_max_outbound_chars,
         "connector_max_body_bytes": settings.connector_max_body_bytes,
+        "chief_chat_enabled": settings.chief_chat_enabled,
+        "chief_chat_max_iterations": settings.chief_chat_max_iterations,
+        "chief_chat_history_window": settings.chief_chat_history_window,
+        "chief_chat_default_persona": settings.chief_chat_default_persona,
+        "connector_chief_chat_enabled": settings.connector_chief_chat_enabled,
+        "chief_chat_connector_max_iterations": settings.chief_chat_connector_max_iterations,
         "editable_keys": sorted(SAFE_CONFIG_KEYS),
     }
 

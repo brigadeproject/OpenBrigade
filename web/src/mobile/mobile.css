@@ -410,6 +410,56 @@ details.m-details pre {
   flex: 1;
 }
 
+.m-chat-modebar {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--c-panel);
+  border-bottom: 1px solid var(--c-divider);
+}
+
+.m-persona-picker {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--c-inset);
+  border-bottom: 1px solid var(--c-divider);
+}
+
+button.m-chip {
+  flex: none;
+  padding: 6px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--c-divider);
+  background: var(--c-panel);
+  color: var(--c-text-faint);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+button.m-chip.on {
+  background: linear-gradient(180deg, rgba(91, 157, 255, 0.32), rgba(44, 90, 166, 0.38));
+  color: var(--c-text);
+  border-color: transparent;
+  box-shadow: var(--bevel-out);
+}
+
+.m-proposal-actions {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--c-inset);
+  border-top: 1px solid var(--c-divider);
+}
+
+.m-proposal-actions > button {
+  flex: 1;
+}
+
 .m-chat-feed {
   flex: 1;
   min-height: 0;

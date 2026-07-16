@@ -249,6 +249,34 @@ brigade connector approvals approve --provider telegram --external-user 123 --us
 brigade connector approvals reject --provider google_chat --external-user users/alice --reason "not recognized"
 ```
 
+### Chief chat (release 1.1)
+
+Release 1.1 lets operators converse with the brigade in natural language through
+**Crew Chiefs**. A chief behaves like a modern agent: it runs a multi-turn tool
+loop over read-only query tools (`list_tasks`, `team_status`, `search_episodes`,
+`usage_summary`, …) to answer from live and historical state, keeps long-term
+memory (conversation continuity, episodic recall, curated notes), and stages
+state-changing actions (`create_assignment`, `cancel_assignment`, `set_priority`,
+`attach_guidance`, `retry_blocked_assignment`) for the operator to confirm in
+chat. Each conversation talks to one persona: a team's Crew Chief (scoped to that
+chief's agents) or the fleet-wide **front desk** (the orchestrator's view).
+
+Threads are durable and identity-keyed, so the mobile SPA and an approved
+Telegram user with the same username share one conversation. Web/mobile use the
+thread routes:
+
+- `GET/POST /api/chat/threads` — list personas/threads, get-or-create by persona
+- `GET/POST /api/chat/threads/{id}/messages` — read history, send a turn
+
+Routing external connectors through chief chat is opt-in and off by default while
+it soaks (`BRIGADE_CONNECTOR_CHIEF_CHAT_ENABLED=true`). Once on, an approved
+connector user switches persona with control commands: `/frontdesk`,
+`/chief <team-or-agent>`, `/who`, and `/new`. Telegram runs the turn out of band
+(the webhook returns immediately and the reply is posted when the turn
+finishes); Google Chat runs synchronously with a tighter iteration cap. See the
+`BRIGADE_CHIEF_CHAT_*` settings in `.env.example`, including the
+`BRIGADE_OLLAMA_NUM_CTX` sizing note — loop prompts grow ~1-2KB per iteration.
+
 OpenAI, OpenAI/Codex, Anthropic/Claude, and Gemini routes continue to use LiteLLM. API keys remain
 supported through `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`. Claude is API-key
 only for RC. OpenAI/Codex and Gemini OAuth credentials can be imported or manually exchanged and
