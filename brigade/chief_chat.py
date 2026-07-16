@@ -988,6 +988,196 @@ def _maybe_refresh_summary(
         LOGGER.warning("chief_chat_summary_refresh_failed", exc_info=True)
 
 
+# --- connector routing --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ControlCommand:
+    verb: str  # "frontdesk" | "chief" | "who" | "new"
+    argument: str = ""
+
+
+def parse_control_command(text: str) -> ControlCommand | None:
+    """Recognize the four connector control commands. Anything else — including
+    an unknown /slash — returns None and is treated as ordinary chat.
+
+    NL persona detection is deliberately out of scope for 1.1: switching
+    personas over a connector is commands only."""
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None
+    parts = stripped[1:].split(maxsplit=1)
+    if not parts:
+        return None
+    verb = parts[0].lower()
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    if verb in {"frontdesk", "front_desk", "front-desk"}:
+        return ControlCommand("frontdesk")
+    if verb == "chief":
+        return ControlCommand("chief", argument)
+    if verb == "who":
+        return ControlCommand("who")
+    if verb == "new":
+        return ControlCommand("new")
+    return None
+
+
+def _persona_agent_label(persona: Persona) -> str:
+    return persona.chief_agent_id or FRONT_DESK_PERSONA
+
+
+def _current_connector_conversation(
+    store: StateStore, username: str, *, default_persona: str
+) -> Conversation:
+    """The operator's current connector thread is their most-recently-touched
+    active conversation, so persona switches (which touch the target) and mobile
+    SPA activity on the same thread both steer it. Falls back to a fresh thread
+    for the default persona."""
+    active = store.conversations(username, status="active")
+    if active:
+        return active[0]
+    persona = resolve_persona(store, None, default=default_persona)
+    return store.resolve_active_conversation(
+        username,
+        persona.persona_id,
+        chief_agent_id=persona.chief_agent_id,
+        team_id=persona.team_id,
+        title=persona.display_name,
+    )
+
+
+def _switch_persona_conversation(
+    store: StateStore, username: str, persona: Persona
+) -> Conversation:
+    conversation = store.resolve_active_conversation(
+        username,
+        persona.persona_id,
+        chief_agent_id=persona.chief_agent_id,
+        team_id=persona.team_id,
+        title=persona.display_name,
+    )
+    store.touch_conversation(conversation.thread_id)
+    return conversation
+
+
+def _handle_control_command(
+    store: StateStore,
+    username: str,
+    command: ControlCommand,
+    *,
+    default_persona: str,
+) -> "ConnectorChatReply":
+    from brigade.connectors import ConnectorChatReply
+
+    if command.verb == "who":
+        conversation = _current_connector_conversation(
+            store, username, default_persona=default_persona
+        )
+        try:
+            persona = resolve_persona(store, conversation.persona)
+        except UnknownPersonaError:
+            persona = resolve_persona(store, None, default=default_persona)
+        return ConnectorChatReply(
+            f"You're talking to {persona.display_name}.", _persona_agent_label(persona)
+        )
+
+    if command.verb == "new":
+        conversation = _current_connector_conversation(
+            store, username, default_persona=default_persona
+        )
+        try:
+            persona = resolve_persona(store, conversation.persona)
+        except UnknownPersonaError:
+            persona = resolve_persona(store, None, default=default_persona)
+        conversation.status = "archived"
+        store.upsert_conversation(conversation)
+        fresh = _switch_persona_conversation(store, username, persona)
+        return ConnectorChatReply(
+            f"Started a fresh conversation with {persona.display_name}.",
+            _persona_agent_label(persona),
+        )
+
+    # frontdesk / chief -> switch persona
+    if command.verb == "chief" and not command.argument:
+        chiefs = [item for item in available_personas(store) if item.kind == "chief"]
+        listing = ", ".join(item.display_name for item in chiefs) or "none configured"
+        return ConnectorChatReply(
+            f"Available chiefs: {listing}. Use /chief <name> to switch.",
+            FRONT_DESK_PERSONA,
+        )
+    requested = "front_desk" if command.verb == "frontdesk" else command.argument
+    try:
+        persona = resolve_persona(store, requested)
+    except UnknownPersonaError as exc:
+        return ConnectorChatReply(f"Sorry — {exc}", FRONT_DESK_PERSONA)
+    _switch_persona_conversation(store, username, persona)
+    return ConnectorChatReply(
+        f"Switched to {persona.display_name}. What do you need?",
+        _persona_agent_label(persona),
+    )
+
+
+def _reply_text_from_result(store: StateStore, result: dict[str, Any]) -> str:
+    message_id = result.get("response_message_id")
+    channel = result.get("conversation_id")
+    if message_id and channel:
+        for message in reversed(store.messages(str(channel))):
+            if message.message_id == message_id:
+                return message.content
+    return str(result.get("summary") or "…")
+
+
+def run_connector_chief_chat(
+    store: StateStore,
+    incoming: Any,
+    username: str,
+    *,
+    provider: ModelProvider,
+    default_persona: str = "auto",
+    max_iterations: int = 6,
+    history_window: int = 12,
+) -> "ConnectorChatReply":
+    """One connector message -> one chief-chat reply. Handles control commands
+    (persona switching, /who, /new) before any model call; otherwise continues
+    the operator's current thread. ``incoming`` is an IncomingConnectorMessage.
+    """
+    from brigade.connectors import ConnectorChatReply
+
+    command = parse_control_command(incoming.text)
+    if command is not None:
+        return _handle_control_command(
+            store, username, command, default_persona=default_persona
+        )
+
+    conversation = _current_connector_conversation(
+        store, username, default_persona=default_persona
+    )
+    try:
+        persona = resolve_persona(store, conversation.persona)
+    except UnknownPersonaError:
+        persona = resolve_persona(store, None, default=default_persona)
+        conversation = _switch_persona_conversation(store, username, persona)
+    store.touch_conversation(conversation.thread_id)
+    result = run_chief_chat_turn(
+        store,
+        thread=conversation,
+        persona=persona,
+        operator=username,
+        content=incoming.text,
+        provider=provider,
+        max_iterations=max_iterations,
+        history_window=history_window,
+        idempotency_key=(
+            f"{incoming.provider}:{incoming.external_message_id}"
+            if incoming.external_message_id
+            else None
+        ),
+    )
+    return ConnectorChatReply(
+        _reply_text_from_result(store, result), _persona_agent_label(persona)
+    )
+
+
 def _budget_exhausted_answer(observations: list[dict[str, Any]]) -> str:
     if not observations:
         return (

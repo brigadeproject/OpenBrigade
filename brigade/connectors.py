@@ -109,6 +109,21 @@ OutboundSender = Callable[[IncomingConnectorMessage, str], ConnectorResult]
 HttpPost = Callable[[str, bytes, dict[str, str]], dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class ConnectorChatReply:
+    """Reply produced by a chief-chat connector turn: the text to deliver and
+    the persona/agent id it came from (for the outbound audit)."""
+
+    text: str
+    agent_id: str
+
+
+# A chat_turn takes the store, the inbound message, and the resolved operator
+# username, runs a full chief-chat turn (persisting its own thread history),
+# and returns the reply to deliver.
+ConnectorChatTurn = Callable[[StateStore, IncomingConnectorMessage, str], ConnectorChatReply]
+
+
 def handle_telegram_update(
     store: StateStore,
     payload: dict[str, Any],
@@ -176,6 +191,7 @@ def process_live_connector_message(
     rate_limiter: ConnectorRateLimiter | None = None,
     max_inbound_chars: int = 4000,
     max_outbound_chars: int = 3500,
+    chat_turn: ConnectorChatTurn | None = None,
 ) -> ConnectorResult:
     validation = _validate_live_inbound(
         store,
@@ -205,6 +221,19 @@ def process_live_connector_message(
             **(incoming.metadata or {}),
         },
     )
+
+    # Chief-chat routing: only for approved identities with a real username, so
+    # the multi-turn thread is tied to a stable operator. Everything else falls
+    # through to the legacy single-shot default_agent path.
+    if chat_turn is not None and identity.get("username"):
+        return _run_connector_chat_turn(
+            store,
+            incoming,
+            username=username,
+            chat_turn=chat_turn,
+            outbound_sender=outbound_sender,
+            max_outbound_chars=max_outbound_chars,
+        )
 
     agent = next((item for item in store.agents() if item.agent_id == default_agent), None)
     if agent is None:
@@ -245,31 +274,15 @@ def process_live_connector_message(
         return ConnectorResult(incoming.provider, "blocked", incoming.channel, reason=reason)
 
     response_text = response.text.strip()
-    if not response_text:
-        reason = "empty model response"
-        store.add_alert(f"{incoming.provider} connector blocked outbound reply: {reason}")
-        _record_audit(
-            store,
-            incoming,
-            direction="outbound",
-            status="blocked",
-            reason=reason,
-            agent_id=default_agent,
-        )
-        return ConnectorResult(incoming.provider, "blocked", incoming.channel, reason=reason)
-    if len(response_text) > max_outbound_chars:
-        reason = f"outbound reply too large: {len(response_text)} chars"
-        store.add_alert(f"{incoming.provider} connector blocked outbound reply: {reason}")
-        _record_audit(
-            store,
-            incoming,
-            direction="outbound",
-            status="blocked",
-            reason=reason,
-            agent_id=default_agent,
-            metadata={"content_length": len(response_text)},
-        )
-        return ConnectorResult(incoming.provider, "blocked", incoming.channel, reason=reason)
+    gated = _gate_outbound_text(
+        store,
+        incoming,
+        response_text,
+        agent_id=default_agent,
+        max_outbound_chars=max_outbound_chars,
+    )
+    if gated is not None:
+        return gated
 
     response_message = ChatMessage(
         channel=incoming.channel,
@@ -322,6 +335,65 @@ def process_live_connector_message(
         }
     )
 
+    return _send_connector_outbound(
+        store,
+        incoming,
+        response_text,
+        agent_id=default_agent,
+        outbound_sender=outbound_sender,
+        message_id=response_message.message_id,
+    )
+
+
+def _gate_outbound_text(
+    store: StateStore,
+    incoming: IncomingConnectorMessage,
+    response_text: str,
+    *,
+    agent_id: str,
+    max_outbound_chars: int,
+) -> ConnectorResult | None:
+    """Shared outbound moderation: block empty or oversize replies before they
+    leave the system. Returns a blocked ConnectorResult, or None to proceed."""
+    if not response_text:
+        reason = "empty model response"
+        store.add_alert(f"{incoming.provider} connector blocked outbound reply: {reason}")
+        _record_audit(
+            store,
+            incoming,
+            direction="outbound",
+            status="blocked",
+            reason=reason,
+            agent_id=agent_id,
+        )
+        return ConnectorResult(incoming.provider, "blocked", incoming.channel, reason=reason)
+    if len(response_text) > max_outbound_chars:
+        reason = f"outbound reply too large: {len(response_text)} chars"
+        store.add_alert(f"{incoming.provider} connector blocked outbound reply: {reason}")
+        _record_audit(
+            store,
+            incoming,
+            direction="outbound",
+            status="blocked",
+            reason=reason,
+            agent_id=agent_id,
+            metadata={"content_length": len(response_text)},
+        )
+        return ConnectorResult(incoming.provider, "blocked", incoming.channel, reason=reason)
+    return None
+
+
+def _send_connector_outbound(
+    store: StateStore,
+    incoming: IncomingConnectorMessage,
+    response_text: str,
+    *,
+    agent_id: str,
+    outbound_sender: OutboundSender,
+    message_id: str | None,
+) -> ConnectorResult:
+    """Shared delivery tail: send via the outbound sender, audit, and shape the
+    ConnectorResult identically for the default and chief-chat paths."""
     outbound = outbound_sender(incoming, response_text)
     LOGGER.info(
         "connector_live_message_processed",
@@ -329,7 +401,7 @@ def process_live_connector_message(
             "provider": incoming.provider,
             "channel": incoming.channel,
             "status": outbound.status,
-            "agent_id": default_agent,
+            "agent_id": agent_id,
         },
     )
     _record_audit(
@@ -338,9 +410,9 @@ def process_live_connector_message(
         direction="outbound",
         status=outbound.status,
         reason=outbound.reason,
-        agent_id=default_agent,
+        agent_id=agent_id,
         metadata={
-            "message_id": response_message.message_id,
+            "message_id": message_id,
             "content_length": len(response_text),
         },
     )
@@ -348,9 +420,55 @@ def process_live_connector_message(
         incoming.provider,
         "complete" if outbound.status == "sent" else outbound.status,
         incoming.channel,
-        message_id=response_message.message_id,
+        message_id=message_id,
         reason=outbound.reason,
         response_body=outbound.response_body,
+    )
+
+
+def _run_connector_chat_turn(
+    store: StateStore,
+    incoming: IncomingConnectorMessage,
+    *,
+    username: str,
+    chat_turn: ConnectorChatTurn,
+    outbound_sender: OutboundSender,
+    max_outbound_chars: int,
+) -> ConnectorResult:
+    """Run a multi-turn chief-chat turn for an approved connector identity and
+    deliver its reply through the shared outbound gates. The chat turn persists
+    its own thread history, so this only gates + sends + audits."""
+    try:
+        reply = chat_turn(store, incoming, username)
+    except RuntimeError as exc:
+        reason = str(exc)
+        store.add_alert(f"{incoming.provider} connector chief chat failed: {reason}")
+        _record_audit(
+            store,
+            incoming,
+            direction="outbound",
+            status="blocked",
+            reason=reason,
+            agent_id="chief_chat",
+        )
+        return ConnectorResult(incoming.provider, "blocked", incoming.channel, reason=reason)
+    response_text = reply.text.strip()
+    gated = _gate_outbound_text(
+        store,
+        incoming,
+        response_text,
+        agent_id=reply.agent_id,
+        max_outbound_chars=max_outbound_chars,
+    )
+    if gated is not None:
+        return gated
+    return _send_connector_outbound(
+        store,
+        incoming,
+        response_text,
+        agent_id=reply.agent_id,
+        outbound_sender=outbound_sender,
+        message_id=None,
     )
 
 

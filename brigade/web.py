@@ -33,6 +33,7 @@ from brigade.chief_chat import (
     available_personas,
     resolve_persona,
     run_chief_chat_turn,
+    run_connector_chief_chat,
 )
 from brigade.health import check_configured_datastores
 from brigade.markdown import render_markdown_html
@@ -99,7 +100,7 @@ def create_app(
     telegram_http_post: HttpPost | None = None,
 ):
     try:
-        from fastapi import Depends, FastAPI, Header, HTTPException
+        from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
         from fastapi.responses import HTMLResponse, StreamingResponse
         from fastapi.staticfiles import StaticFiles
         from starlette.datastructures import MutableHeaders
@@ -107,6 +108,12 @@ def create_app(
         raise RuntimeError(
             "install the web extra to run the gateway: pip install -e '.[web]'"
         ) from exc
+
+    # FastAPI resolves route-handler annotations via get_type_hints against this
+    # module's globals, but the web extra is imported lazily inside this
+    # function. Expose BackgroundTasks at module scope so the annotation on the
+    # Telegram webhook resolves instead of being treated as a query parameter.
+    globals().setdefault("BackgroundTasks", BackgroundTasks)
 
     settings = settings or load_settings()
     store = store or open_state_store(settings)
@@ -169,6 +176,25 @@ def create_app(
             raise HTTPException(status_code=403, detail=f"missing permission: {permission}")
         return current.user
 
+    def _connector_chat_turn(max_iterations: int):
+        """Build a ConnectorChatTurn bound to this app's settings, or None when
+        connector chief chat is disabled (the default single-shot path)."""
+        if not (settings.connector_chief_chat_enabled and settings.chief_chat_enabled):
+            return None
+
+        def _turn(turn_store, incoming, username):
+            return run_connector_chief_chat(
+                turn_store,
+                incoming,
+                username,
+                provider=provider_from_settings(settings),
+                default_persona=settings.chief_chat_default_persona,
+                max_iterations=max_iterations,
+                history_window=settings.chief_chat_history_window,
+            )
+
+        return _turn
+
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
         return {"ok": True, "service": "brigade_web"}
@@ -176,6 +202,7 @@ def create_app(
     @app.post("/api/connectors/telegram/webhook")
     async def telegram_webhook(
         payload: dict[str, Any],
+        background_tasks: BackgroundTasks,
         x_telegram_secret: str | None = Header(
             default=None,
             alias="X-Telegram-Bot-Api-Secret-Token",
@@ -208,9 +235,7 @@ def create_app(
             raise HTTPException(status_code=413, detail="telegram webhook body too large")
         if not settings.telegram_bot_token:
             raise HTTPException(status_code=503, detail="telegram bot token is not configured")
-        result = process_live_connector_message(
-            store,
-            incoming,
+        connector_kwargs = dict(
             default_agent=settings.telegram_default_agent,
             model_provider=provider_from_settings(settings),
             outbound_sender=telegram_reply_sender(
@@ -222,6 +247,20 @@ def create_app(
             max_inbound_chars=settings.connector_max_inbound_chars,
             max_outbound_chars=settings.connector_max_outbound_chars,
         )
+        chat_turn = _connector_chat_turn(settings.chief_chat_max_iterations)
+        if chat_turn is not None:
+            # The chief-chat loop can run several model calls; do it out of band
+            # so the webhook returns 200 fast and telegram_reply_sender posts the
+            # reply when the turn finishes.
+            background_tasks.add_task(
+                process_live_connector_message,
+                store,
+                incoming,
+                chat_turn=chat_turn,
+                **connector_kwargs,
+            )
+            return {"ok": True, "status": "accepted", "provider": "telegram"}
+        result = process_live_connector_message(store, incoming, **connector_kwargs)
         if result.status == "rate_limited":
             raise HTTPException(status_code=429, detail=result.reason or "rate limit exceeded")
         if result.status == "rejected":
@@ -258,6 +297,8 @@ def create_app(
                 )
             )
             raise HTTPException(status_code=413, detail="google chat webhook body too large")
+        # Google Chat needs a synchronous response body, so the chief-chat loop
+        # runs inline with a tighter iteration cap to stay under webhook timeouts.
         result = process_live_connector_message(
             store,
             incoming,
@@ -268,6 +309,7 @@ def create_app(
             rate_limiter=connector_rate_limiter or _connector_rate_limiter(settings),
             max_inbound_chars=settings.connector_max_inbound_chars,
             max_outbound_chars=settings.connector_max_outbound_chars,
+            chat_turn=_connector_chat_turn(settings.chief_chat_connector_max_iterations),
         )
         if result.status == "rate_limited":
             raise HTTPException(status_code=429, detail=result.reason or "rate limit exceeded")
