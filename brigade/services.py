@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from brigade.config import Settings
 from brigade.health import HealthCheck
 from brigade.orchestrator import (
     _active_policy_summaries,
+    _resolve_agent_id,
     apply_orchestrator_actions,
     build_orchestration_telemetry,
     orchestration_event,
@@ -582,12 +584,17 @@ def _classify_chat_confirmation(content: str) -> str | None:
     return None
 
 
-def _pending_chat_proposal(store: StateStore, channel: str) -> dict[str, Any] | None:
+def _pending_chat_proposal(
+    store: StateStore,
+    channel: str,
+    *,
+    kind_prefix: str = "orchestrator_chat",
+) -> dict[str, Any] | None:
     for message in reversed(store.messages(channel)):
         kind = message.metadata.get("kind")
-        if kind == "orchestrator_chat_proposal_resolved":
+        if kind == f"{kind_prefix}_proposal_resolved":
             return None
-        if kind == "orchestrator_chat_proposal":
+        if kind == f"{kind_prefix}_proposal":
             return message.metadata
     return None
 
@@ -790,16 +797,19 @@ def _stage_chat_proposal(
     sender: str,
     request: ChatMessage,
     response: Any,
+    agent_id: str = "orchestrator",
+    kind_prefix: str = "orchestrator_chat",
 ) -> dict[str, Any]:
     response_text = _format_action_proposal(summary, actions)
     response_message = ChatMessage(
         channel=channel,
-        sender="orchestrator",
+        sender=agent_id,
         recipient=sender,
         content=response_text,
         metadata={
-            "kind": "orchestrator_chat_proposal",
+            "kind": f"{kind_prefix}_proposal",
             "conversation_id": channel,
+            "agent_id": agent_id,
             "actions": actions,
             "summary": summary,
             "provider": response.provider,
@@ -815,7 +825,7 @@ def _stage_chat_proposal(
         {
             "usage_id": str(uuid4()),
             "assignment_id": None,
-            "agent_id": "orchestrator",
+            "agent_id": agent_id,
             "provider": response.provider,
             "model": response.model,
             "route_type": response.route_type,
@@ -825,7 +835,7 @@ def _stage_chat_proposal(
             "estimated_cost_usd": response.estimated_cost_usd,
             "recorded_at": utc_now_iso(),
             "conversation_id": channel,
-            "source": "orchestrator_chat",
+            "source": kind_prefix,
         }
     )
     return {
@@ -834,7 +844,7 @@ def _stage_chat_proposal(
         "summary": summary,
         "request_message_id": request.message_id,
         "response_message_id": response_message.message_id,
-        "agent_id": "orchestrator",
+        "agent_id": agent_id,
         "actions_proposed": actions,
         "provider": response.provider,
         "model": response.model,
@@ -850,10 +860,16 @@ def _resolve_chat_proposal(
     channel: str,
     sender: str,
     request: ChatMessage,
+    agent_id: str = "orchestrator",
+    kind_prefix: str = "orchestrator_chat",
+    apply: Callable[[list[dict[str, Any]]], dict[str, list[dict[str, Any]]]] | None = None,
 ) -> dict[str, Any]:
     actions = pending.get("actions") or []
     if decision == "confirm":
-        result = apply_orchestrator_chat_actions(store, actions, by=sender)
+        if apply is None:
+            result = apply_orchestrator_chat_actions(store, actions, by=sender)
+        else:
+            result = apply(actions)
         response_text = _format_action_result(result)
         status = "applied"
     else:
@@ -862,12 +878,13 @@ def _resolve_chat_proposal(
         status = "declined"
     response_message = ChatMessage(
         channel=channel,
-        sender="orchestrator",
+        sender=agent_id,
         recipient=sender,
         content=response_text,
         metadata={
-            "kind": "orchestrator_chat_proposal_resolved",
+            "kind": f"{kind_prefix}_proposal_resolved",
             "conversation_id": channel,
+            "agent_id": agent_id,
             "decision": decision,
             "result": result,
         },
@@ -879,7 +896,7 @@ def _resolve_chat_proposal(
         "summary": _summarize(response_text),
         "request_message_id": request.message_id,
         "response_message_id": response_message.message_id,
-        "agent_id": "orchestrator",
+        "agent_id": agent_id,
         "actions_applied": result["applied"],
         "actions_rejected": result["rejected"],
     }
@@ -1498,6 +1515,7 @@ CHAT_EXTENDED_ACTION_TYPES = frozenset(
     {
         "cancel_assignment",
         "cancel_assignments_where",
+        "set_priority",
         "set_routing_policy",
         "retire_policy",
         "write_note",
@@ -1531,6 +1549,8 @@ def apply_orchestrator_chat_actions(
                 applied.append(_apply_chat_cancel_assignment(store, action, by=by))
             elif action_type == "cancel_assignments_where":
                 applied.append(_apply_chat_cancel_assignments_where(store, action, by=by))
+            elif action_type == "set_priority":
+                applied.append(_apply_chat_set_priority(store, action, by=by))
             elif action_type == "set_routing_policy":
                 applied.append(_apply_chat_set_routing_policy(store, action, by=by))
             elif action_type == "retire_policy":
@@ -1553,6 +1573,19 @@ def _apply_chat_cancel_assignment(
     reason = str(action.get("reason") or "cancelled via orchestrator chat")
     result = cancel_assignment(store, assignment_id, reason=reason, by=by, force=True)
     return {"type": "cancel_assignment", **result}
+
+
+def _apply_chat_set_priority(
+    store: StateStore, action: dict[str, Any], *, by: str
+) -> dict[str, Any]:
+    assignment_id = str(action.get("assignment_id") or "").strip()
+    priority = str(action.get("priority") or "").strip()
+    if not assignment_id:
+        raise ValueError("set_priority is missing assignment_id")
+    if not priority:
+        raise ValueError("set_priority is missing priority")
+    result = update_assignment_fields(store, assignment_id, priority=priority, by=by)
+    return {"type": "set_priority", "priority": priority, **result}
 
 
 def _apply_chat_cancel_assignments_where(
@@ -1656,6 +1689,163 @@ def _apply_chat_update_system_prompt(store: StateStore, action: dict[str, Any]) 
         raise ValueError("update_system_prompt is missing content")
     write_orchestrator_system_prompt(store, content)
     return {"type": "update_system_prompt", "content": content}
+
+
+CHIEF_CHAT_ACTION_TYPES = frozenset(
+    {
+        "create_assignment",
+        "cancel_assignment",
+        "attach_guidance",
+        "set_priority",
+        "retry_blocked_assignment",
+    }
+)
+
+
+def apply_chief_chat_actions(
+    store: StateStore,
+    actions: list[dict[str, Any]],
+    *,
+    chief_id: str | None,
+    managed_agent_ids: set[str] | None,
+    by: str = "operator",
+) -> dict[str, list[dict[str, Any]]]:
+    """Operator-confirmed actions proposed by a crew chief in chat.
+
+    Every action is validated against the chief's managed agents
+    (``managed_agent_ids=None`` is the unrestricted front desk) before it
+    touches state; anything outside the vocabulary or the team is rejected
+    with a reason instead of applied."""
+    applied: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for action in actions:
+        action_type = str(action.get("type") or "").strip()
+        try:
+            if action_type not in CHIEF_CHAT_ACTION_TYPES:
+                raise ValueError(
+                    f"unsupported chief chat action type: {action_type or '<missing>'}"
+                )
+            if action_type == "create_assignment":
+                result = _apply_chief_create_assignment(
+                    store, action, chief_id=chief_id, managed=managed_agent_ids
+                )
+            elif action_type == "retry_blocked_assignment":
+                _chief_scoped_assignment(store, action, managed=managed_agent_ids)
+                sub = apply_orchestrator_actions(store, [action])
+                if sub["rejected"]:
+                    raise ValueError(str(sub["rejected"][0].get("reason")))
+                if sub["skipped"]:
+                    skipped.extend(sub["skipped"])
+                    continue
+                result = sub["applied"][0]
+            elif action_type == "cancel_assignment":
+                _chief_scoped_assignment(store, action, managed=managed_agent_ids)
+                result = _apply_chat_cancel_assignment(store, action, by=by)
+            elif action_type == "attach_guidance":
+                target = _chief_scoped_assignment(store, action, managed=managed_agent_ids)
+                message = str(action.get("message") or "").strip()
+                if not message:
+                    raise ValueError("attach_guidance is missing message")
+                guidance = attach_operator_guidance(
+                    store,
+                    target.assignment_id,
+                    operator=by,
+                    message=message,
+                    conversation_id=action.get("conversation_id"),
+                )
+                result = {"type": "attach_guidance", **guidance}
+            else:  # set_priority
+                _chief_scoped_assignment(store, action, managed=managed_agent_ids)
+                result = _apply_chat_set_priority(store, action, by=by)
+            applied.append(result)
+            _record_operator_event(
+                store,
+                action=f"chief_chat_{action_type}",
+                summary=(
+                    f"{action_type} applied via chief chat "
+                    f"({chief_id or 'front_desk'}) by {by}"
+                ),
+                assignment_id=str(
+                    result.get("assignment_id") or action.get("assignment_id") or ""
+                ),
+                agent_id=chief_id,
+                by=by,
+                payload={"chief_id": chief_id, "action": action},
+            )
+        except (AssignmentActionError, ValueError) as exc:
+            rejected.append({"action": action, "reason": str(exc)})
+    return {"applied": applied, "rejected": rejected, "skipped": skipped}
+
+
+def _chief_scoped_assignment(
+    store: StateStore,
+    action: dict[str, Any],
+    *,
+    managed: set[str] | None,
+) -> Assignment:
+    assignment_id = str(action.get("assignment_id") or "").strip()
+    if not assignment_id:
+        raise ValueError(f"{action.get('type')} is missing assignment_id")
+    target = store.find_assignment(assignment_id)
+    if target is None:
+        raise ValueError(f"unknown assignment: {assignment_id}")
+    if managed is not None and target.assigned_to not in managed:
+        raise ValueError(
+            f"assignment {assignment_id} is outside your team "
+            f"(assigned to {target.assigned_to})"
+        )
+    return target
+
+
+def _apply_chief_create_assignment(
+    store: StateStore,
+    action: dict[str, Any],
+    *,
+    chief_id: str | None,
+    managed: set[str] | None,
+) -> dict[str, Any]:
+    agent_id = str(action.get("agent_id") or "").strip()
+    assignment_text = str(action.get("assignment") or "").strip()
+    if not agent_id:
+        raise ValueError("create_assignment is missing agent_id")
+    if not assignment_text:
+        raise ValueError("create_assignment is missing assignment")
+    resolved = _resolve_agent_id(store, agent_id)
+    if resolved is None:
+        raise ValueError(f"create_assignment targets unknown agent {agent_id}")
+    if managed is not None and resolved not in managed:
+        raise ValueError(
+            f"create_assignment targets {resolved}, who is not on your team"
+        )
+    try:
+        priority = Priority(str(action.get("priority") or Priority.NORMAL.value))
+    except ValueError as exc:
+        raise ValueError(f"unsupported priority: {action.get('priority')}") from exc
+    assignment = Assignment(
+        assignment=assignment_text,
+        assigned_to=resolved,
+        created_by=chief_id or "front_desk",
+        source="chief_chat",
+        priority=priority,
+        goal_statement=(
+            str(action.get("goal_statement")).strip()
+            if action.get("goal_statement") is not None
+            else None
+        ),
+        assignment_rationale=str(
+            action.get("rationale") or "Operator-confirmed chief chat action."
+        ),
+        created_by_role="crew_chief" if chief_id else "orchestrator",
+    )
+    persisted = store.add_assignment(assignment)
+    return {
+        "type": "create_assignment",
+        "assignment_id": persisted.assignment_id,
+        "agent_id": resolved,
+        "priority": priority.value,
+        "status": persisted.status.value,
+    }
 
 
 def _record_operator_event(
@@ -2662,6 +2852,7 @@ def _orchestrator_chat_prompt(
                 '{"type":"set_routing_policy","assignment_kind":"failure_analysis",'
                 '"target_team_id":"...","statement":"..."}'
             ),
+            '{"type":"set_priority","assignment_id":"...","priority":"high"}',
             '{"type":"retire_policy","policy_id":"..."}',
             '{"type":"write_note","content":"...","append":true}',
             '{"type":"update_system_prompt","content":"..."}',

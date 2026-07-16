@@ -28,9 +28,11 @@ from brigade.connectors import (
     telegram_reply_sender,
 )
 from brigade.chief_chat import (
+    CHIEF_CHAT_KIND_PREFIX,
     UnknownPersonaError,
     available_personas,
     resolve_persona,
+    run_chief_chat_turn,
 )
 from brigade.health import check_configured_datastores
 from brigade.markdown import render_markdown_html
@@ -57,6 +59,8 @@ from brigade.services import (
     AssignmentActionError,
     ProposalAlreadyDecidedError,
     UnknownProposalError,
+    _classify_chat_confirmation,
+    _pending_chat_proposal,
     attach_operator_guidance,
     build_chat_payload,
     build_cockpit_payload,
@@ -1101,6 +1105,46 @@ def create_app(
                 for message in store.recent_messages(conversation.channel, limit=limit)
             ],
         }
+
+    @app.post("/api/chat/threads/{thread_id}/messages")
+    async def chat_thread_send(
+        thread_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("chat:write", current)
+        if not settings.chief_chat_enabled:
+            raise HTTPException(status_code=503, detail="chief chat is disabled")
+        conversation = _thread_or_404(thread_id)
+        username = _operator_username(user)
+        if conversation.operator_username != username:
+            raise HTTPException(status_code=403, detail="not your thread")
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="content is required")
+        try:
+            persona = resolve_persona(store, conversation.persona)
+        except UnknownPersonaError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # Confirming staged actions changes task state; gate it like the
+        # task-mutation routes rather than like plain chat.
+        pending = _pending_chat_proposal(
+            store, conversation.channel, kind_prefix=CHIEF_CHAT_KIND_PREFIX
+        )
+        if pending is not None and _classify_chat_confirmation(content) == "confirm":
+            require("task:write", current)
+        provider = _provider_from_payload(payload, settings)
+        return run_chief_chat_turn(
+            store,
+            thread=conversation,
+            persona=persona,
+            operator=username,
+            content=content,
+            provider=provider,
+            max_iterations=settings.chief_chat_max_iterations,
+            history_window=settings.chief_chat_history_window,
+            idempotency_key=payload.get("idempotency_key") or f"web-chief:{uuid4()}",
+        )
 
     @app.post("/api/chat/threads/{thread_id}/persona")
     async def chat_thread_switch_persona(

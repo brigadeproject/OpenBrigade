@@ -74,6 +74,36 @@ class ToolRegistry:
             return ToolResult(False, str(exc))
 
 
+def native_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
+    """Convert registry specs to the OpenAI/Ollama function-tool format."""
+    specs = []
+    for spec in registry.specs():
+        properties = {
+            name: {"description": description}
+            for name, description in spec.argument_schema.items()
+        }
+        required = [
+            name
+            for name, description in spec.argument_schema.items()
+            if "optional" not in str(description).lower()
+        ]
+        specs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                    },
+                },
+            }
+        )
+    return specs
+
+
 def default_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(

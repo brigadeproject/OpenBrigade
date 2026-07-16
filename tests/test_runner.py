@@ -195,10 +195,9 @@ def test_non_complete_status_with_missing_file_claims_is_annotated(tmp_path):
 
 
 def test_native_tool_specs_conversion():
-    from brigade.runner import _native_tool_specs
-    from brigade.tools import default_tool_registry
+    from brigade.tools import default_tool_registry, native_tool_specs
 
-    specs = _native_tool_specs(default_tool_registry())
+    specs = native_tool_specs(default_tool_registry())
     by_name = {spec["function"]["name"]: spec for spec in specs}
     assert "write_file" in by_name
     write_file = by_name["write_file"]["function"]

@@ -36,6 +36,7 @@ from brigade.tools import (
     ToolContext,
     ToolRegistry,
     default_tool_registry,
+    native_tool_specs,
 )
 from brigade.workspace import (
     HeartbeatValidationError,
@@ -432,7 +433,7 @@ def _complete_assignment_with_tools(
     responses: list[ModelResponse] = []
     observations: list[dict[str, Any]] = []
     context = ToolContext(agent=agent, assignment=assignment, store=store)
-    native_tools = _native_tool_specs(registry)
+    native_tools = native_tool_specs(registry)
     completion_rejections = 0
     dispatched_tools: set[str] = set()
     for _ in range(MAX_AGENT_ITERATIONS):
@@ -1031,36 +1032,6 @@ def _handle_heartbeat_validation_failure(
         transcript_path=assignment.transcript_path,
         cycle_count=assignment.cycle_count,
     )
-
-
-def _native_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
-    """Convert registry specs to the OpenAI/Ollama function-tool format."""
-    specs = []
-    for spec in registry.specs():
-        properties = {
-            name: {"description": description}
-            for name, description in spec.argument_schema.items()
-        }
-        required = [
-            name
-            for name, description in spec.argument_schema.items()
-            if "optional" not in str(description).lower()
-        ]
-        specs.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": spec.name,
-                    "description": spec.description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    },
-                },
-            }
-        )
-    return specs
 
 
 def _locked_complete_with_retries(
