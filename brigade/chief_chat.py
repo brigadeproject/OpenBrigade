@@ -15,6 +15,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
+from brigade.connectors import ConnectorChatReply, IncomingConnectorMessage
 from brigade.prompt_floors import (
     CREW_CHIEF_CHAT_PROMPT,
     CREW_CHIEF_SYSTEM_PROMPT,
@@ -560,7 +561,8 @@ def _tool_manifest(registry: ToolRegistry) -> list[str]:
         arguments = ", ".join(
             f"{name} ({description})" for name, description in spec.argument_schema.items()
         )
-        lines.append(f"- {spec.name}: {spec.description}" + (f" Args: {arguments}" if arguments else ""))
+        suffix = f" Args: {arguments}" if arguments else ""
+        lines.append(f"- {spec.name}: {spec.description}{suffix}")
     return lines
 
 
@@ -1066,9 +1068,7 @@ def _handle_control_command(
     command: ControlCommand,
     *,
     default_persona: str,
-) -> "ConnectorChatReply":
-    from brigade.connectors import ConnectorChatReply
-
+) -> ConnectorChatReply:
     if command.verb == "who":
         conversation = _current_connector_conversation(
             store, username, default_persona=default_persona
@@ -1091,7 +1091,7 @@ def _handle_control_command(
             persona = resolve_persona(store, None, default=default_persona)
         conversation.status = "archived"
         store.upsert_conversation(conversation)
-        fresh = _switch_persona_conversation(store, username, persona)
+        _switch_persona_conversation(store, username, persona)
         return ConnectorChatReply(
             f"Started a fresh conversation with {persona.display_name}.",
             _persona_agent_label(persona),
@@ -1129,20 +1129,17 @@ def _reply_text_from_result(store: StateStore, result: dict[str, Any]) -> str:
 
 def run_connector_chief_chat(
     store: StateStore,
-    incoming: Any,
+    incoming: IncomingConnectorMessage,
     username: str,
     *,
     provider: ModelProvider,
     default_persona: str = "auto",
     max_iterations: int = 6,
     history_window: int = 12,
-) -> "ConnectorChatReply":
+) -> ConnectorChatReply:
     """One connector message -> one chief-chat reply. Handles control commands
     (persona switching, /who, /new) before any model call; otherwise continues
-    the operator's current thread. ``incoming`` is an IncomingConnectorMessage.
-    """
-    from brigade.connectors import ConnectorChatReply
-
+    the operator's current thread."""
     command = parse_control_command(incoming.text)
     if command is not None:
         return _handle_control_command(

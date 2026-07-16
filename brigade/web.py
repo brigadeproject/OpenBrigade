@@ -11,6 +11,14 @@ from uuid import uuid4
 
 from brigade import __version__
 from brigade.auth import AuthResult, issue_token, verify_token
+from brigade.chief_chat import (
+    CHIEF_CHAT_KIND_PREFIX,
+    UnknownPersonaError,
+    available_personas,
+    resolve_persona,
+    run_chief_chat_turn,
+    run_connector_chief_chat,
+)
 from brigade.config import Settings, load_settings
 from brigade.connectors import (
     ConnectorRateLimiter,
@@ -26,14 +34,6 @@ from brigade.connectors import (
     parse_telegram_update,
     process_live_connector_message,
     telegram_reply_sender,
-)
-from brigade.chief_chat import (
-    CHIEF_CHAT_KIND_PREFIX,
-    UnknownPersonaError,
-    available_personas,
-    resolve_persona,
-    run_chief_chat_turn,
-    run_connector_chief_chat,
 )
 from brigade.health import check_configured_datastores
 from brigade.markdown import render_markdown_html
