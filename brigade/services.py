@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -1227,6 +1227,13 @@ def build_alert_feed(
         if not message:
             continue
         created_at = record.get("created_at")
+        # The Postgres store hands back datetimes where the JSON store has ISO
+        # strings; normalize so the feed stays json.dumps-safe (the ops-room
+        # SSE stream bypasses FastAPI's encoder) and comparisons stay uniform.
+        if isinstance(created_at, datetime):
+            created_at = created_at.astimezone(timezone.utc).isoformat()
+        elif created_at is not None:
+            created_at = str(created_at)
         entry = grouped.get(message)
         if entry is None:
             entry = {

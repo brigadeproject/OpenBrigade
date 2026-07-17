@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 
 from brigade.services import build_alert_feed
@@ -47,6 +48,22 @@ def test_feed_dedupes_repeats_with_counts(tmp_path):
     assert by_message["dispatch starvation"]["last_seen"] >= by_message[
         "dispatch starvation"
     ]["first_seen"]
+
+
+def test_feed_normalizes_datetime_created_at(tmp_path, monkeypatch):
+    # The Postgres store returns datetime objects for created_at where the
+    # JSON store has ISO strings; the feed must stay json.dumps-safe because
+    # the ops-room SSE stream serializes it without FastAPI's encoder.
+    store = _store(tmp_path)
+    store.add_alert("mixed timestamp types")
+    records = [
+        {"message": "mixed timestamp types", "created_at": utc_now()},
+        {"message": "mixed timestamp types", "created_at": utc_now().isoformat()},
+    ]
+    monkeypatch.setattr(store, "alert_records", lambda: records)
+    feed = build_alert_feed(store)
+    assert feed[0]["count"] == 2
+    json.dumps(feed)  # raises TypeError if a datetime leaks through
 
 
 def test_feed_ages_out_stale_alerts(tmp_path):
