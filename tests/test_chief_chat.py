@@ -70,6 +70,9 @@ def test_parse_chief_chat_reply_variants():
 
     assert parse_chief_chat_reply("All quiet on the team.").kind == "text"
     assert parse_chief_chat_reply('{"status":"tool_call"}').kind == "invalid"
+    # Reasoning-only completions arrive as empty text; retry, don't store them.
+    assert parse_chief_chat_reply("").kind == "invalid"
+    assert parse_chief_chat_reply("  \n").kind == "invalid"
     # A propose_actions envelope without valid actions degrades to prose.
     empty = parse_chief_chat_reply('{"status":"propose_actions","summary":"hm","actions":[]}')
     assert empty.kind == "text"
@@ -114,6 +117,30 @@ def test_tool_call_then_answer(tmp_path):
     assert len(usage) == 2
     # The turn left an episode behind.
     assert store.episodes()[-1]["source"] == "chief_chat"
+
+
+def test_empty_reply_retries_then_answers(tmp_path):
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(["", "All quiet on the team."])
+
+    result = _turn(store, provider)
+
+    assert result["status"] == "complete"
+    assert result["iterations"] == 2
+    messages = store.messages(result["conversation_id"])
+    assert messages[-1].content == "All quiet on the team."
+
+
+def test_all_empty_replies_still_persist_a_response(tmp_path):
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(["", "", ""])
+
+    result = _turn(store, provider, max_iterations=3)
+
+    assert result["status"] == "complete"
+    messages = store.messages(result["conversation_id"])
+    assert messages[-1].metadata["kind"] == "chief_chat_response"
+    assert messages[-1].content.strip()
 
 
 def test_chief_scope_blocks_other_teams_tasks(tmp_path):

@@ -567,6 +567,10 @@ def parse_chief_chat_reply(text: str) -> ChiefChatReply:
     anything that is not a well-formed protocol object is ordinary prose
     (same fallthrough philosophy as the orchestrator chat parser)."""
     stripped = text.strip()
+    if not stripped:
+        # Reasoning models occasionally spend the whole completion on hidden
+        # reasoning and emit no visible text; retry instead of storing it.
+        return ChiefChatReply(kind="invalid", reason="the reply was empty")
     candidate = extract_json_object(stripped)
     if not candidate.startswith("{"):
         return ChiefChatReply(kind="text", text=stripped)
@@ -951,7 +955,7 @@ def run_chief_chat_turn(
             final_text = reply.text
         break
 
-    if final_text is None:
+    if final_text is None or not final_text.strip():
         final_text = _budget_exhausted_answer(observations)
     if response is None:  # pragma: no cover - budget >= 1 always completes once
         raise RuntimeError("chief chat turn produced no model response")
