@@ -10,6 +10,21 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from brigade.kb import parse_kb_id, provenance_edges
+
+# kb_id kind -> (Neo4j label, identifying property). Drives the generic
+# relationship merge so the Neo4j mirror and the KB graph API share one edge
+# definition (brigade.kb.provenance_edges).
+KB_NEO4J_SCHEMA: dict[str, tuple[str, str]] = {
+    "doc": ("Document", "document_id"),
+    "chunk": ("Chunk", "chunk_id"),
+    "agent": ("Agent", "agent_id"),
+    "task": ("Task", "assignment_id"),
+    "goal": ("Goal", "statement"),
+    "team": ("Team", "team_id"),
+    "decision": ("Decision", "decision_id"),
+}
+
 HASH_FALLBACK_VECTOR_SIZE = 64
 DEFAULT_OLLAMA_EMBEDDING_VECTOR_SIZE = 768
 
@@ -399,11 +414,13 @@ class Neo4jProvenanceStore:
                 "created_at": record.get("created_at"),
             },
         )
-        if node_type == "chunk" and metadata.get("document_id"):
-            self._link_document_chunk(
-                document_id=str(metadata["document_id"]),
-                chunk_id=node_id,
-                chunk_index=metadata.get("chunk_index"),
+        if node_type == "chunk":
+            self._cypher(
+                """
+                merge (c:Chunk {chunk_id: $chunk_id})
+                set c.chunk_index = $chunk_index
+                """,
+                {"chunk_id": node_id, "chunk_index": metadata.get("chunk_index")},
             )
         elif node_type == "document":
             self._cypher(
@@ -411,122 +428,54 @@ class Neo4jProvenanceStore:
                 {"document_id": node_id},
             )
         elif node_type == "task":
-            self._link_task_record(node_id, metadata)
+            self._cypher(
+                """
+                merge (t:Task {assignment_id: $assignment_id})
+                set t.status = $status,
+                    t.assignment = $assignment,
+                    t.updated_at = $updated_at
+                """,
+                {
+                    "assignment_id": node_id,
+                    "status": metadata.get("status"),
+                    "assignment": metadata.get("assignment"),
+                    "updated_at": metadata.get("updated_at"),
+                },
+            )
         elif node_type == "decision":
-            self._link_decision_record(node_id, metadata)
+            self._cypher(
+                "merge (:Decision {decision_id: $decision_id})",
+                {"decision_id": node_id},
+            )
         elif node_type == "team":
-            self._link_team_record(node_id, metadata)
+            self._cypher(
+                "merge (:Team {team_id: $team_id})",
+                {"team_id": node_id},
+            )
+        for edge in provenance_edges(record):
+            if edge["rel"] == "DESCRIBES":
+                continue
+            self._merge_edge(edge)
 
-    def _link_document_chunk(
-        self,
-        *,
-        document_id: str,
-        chunk_id: str,
-        chunk_index: object | None,
-    ) -> None:
+    def _merge_edge(self, edge: dict[str, str]) -> None:
+        source_kind, source_id = parse_kb_id(edge["source"])
+        target_kind, target_id = parse_kb_id(edge["target"])
+        source_schema = KB_NEO4J_SCHEMA.get(source_kind)
+        target_schema = KB_NEO4J_SCHEMA.get(target_kind)
+        if source_schema is None or target_schema is None:
+            return
+        source_label, source_key = source_schema
+        target_label, target_key = target_schema
+        # Labels/keys/rel come from fixed internal maps, never user input, so
+        # interpolation is safe (Cypher cannot parameterize labels/rel types).
         self._cypher(
-            """
-            merge (d:Document {document_id: $document_id})
-            merge (c:Chunk {chunk_id: $chunk_id})
-            set c.chunk_index = $chunk_index
-            merge (d)-[:HAS_CHUNK]->(c)
+            f"""
+            merge (s:{source_label} {{{source_key}: $source_id}})
+            merge (t:{target_label} {{{target_key}: $target_id}})
+            merge (s)-[:{edge["rel"]}]->(t)
             """,
-            {
-                "document_id": document_id,
-                "chunk_id": chunk_id,
-                "chunk_index": chunk_index,
-            },
+            {"source_id": source_id, "target_id": target_id},
         )
-
-    def _link_task_record(self, assignment_id: str, metadata: dict[str, Any]) -> None:
-        self._cypher(
-            """
-            merge (t:Task {assignment_id: $assignment_id})
-            set t.status = $status,
-                t.assignment = $assignment,
-                t.updated_at = $updated_at
-            """,
-            {
-                "assignment_id": assignment_id,
-                "status": metadata.get("status"),
-                "assignment": metadata.get("assignment"),
-                "updated_at": metadata.get("updated_at"),
-            },
-        )
-        agent_id = metadata.get("assigned_to")
-        if agent_id:
-            self._cypher(
-                """
-                merge (t:Task {assignment_id: $assignment_id})
-                merge (a:Agent {agent_id: $agent_id})
-                merge (t)-[:ASSIGNED_TO]->(a)
-                """,
-                {"assignment_id": assignment_id, "agent_id": str(agent_id)},
-            )
-        goal_statement = metadata.get("goal_statement")
-        if goal_statement:
-            self._cypher(
-                """
-                merge (t:Task {assignment_id: $assignment_id})
-                merge (g:Goal {statement: $goal_statement})
-                merge (t)-[:SUPPORTS_GOAL]->(g)
-                """,
-                {
-                    "assignment_id": assignment_id,
-                    "goal_statement": str(goal_statement),
-                },
-            )
-
-    def _link_decision_record(self, decision_id: str, metadata: dict[str, Any]) -> None:
-        self._cypher(
-            "merge (:Decision {decision_id: $decision_id})",
-            {"decision_id": decision_id},
-        )
-        for assignment_id in metadata.get("assignment_ids") or []:
-            self._cypher(
-                """
-                merge (d:Decision {decision_id: $decision_id})
-                merge (t:Task {assignment_id: $assignment_id})
-                merge (d)-[:CREATED_ASSIGNMENT]->(t)
-                """,
-                {
-                    "decision_id": decision_id,
-                    "assignment_id": str(assignment_id),
-                },
-            )
-
-    def _link_team_record(self, team_id: str, metadata: dict[str, Any]) -> None:
-        self._cypher(
-            "merge (:Team {team_id: $team_id})",
-            {"team_id": team_id},
-        )
-        for member_id in metadata.get("members") or []:
-            self._cypher(
-                """
-                merge (t:Team {team_id: $team_id})
-                merge (a:Agent {agent_id: $agent_id})
-                merge (t)-[:HAS_MEMBER]->(a)
-                """,
-                {"team_id": team_id, "agent_id": str(member_id)},
-            )
-        if metadata.get("crew_chief_id"):
-            self._cypher(
-                """
-                merge (t:Team {team_id: $team_id})
-                merge (a:Agent {agent_id: $agent_id})
-                merge (t)-[:LED_BY]->(a)
-                """,
-                {"team_id": team_id, "agent_id": str(metadata["crew_chief_id"])},
-            )
-        if metadata.get("parent_team_id"):
-            self._cypher(
-                """
-                merge (child:Team {team_id: $team_id})
-                merge (parent:Team {team_id: $parent_team_id})
-                merge (child)-[:CHILD_OF]->(parent)
-                """,
-                {"team_id": team_id, "parent_team_id": str(metadata["parent_team_id"])},
-            )
 
     def _count_relationships(self) -> int:
         results = self._cypher("match ()-[r]->() return count(r) as count", {})

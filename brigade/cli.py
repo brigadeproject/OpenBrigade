@@ -42,7 +42,7 @@ from brigade.db import (
 from brigade.export import export_training_data
 from brigade.finance import build_model_routing_decision
 from brigade.health import HealthCheck, check_configured_datastores
-from brigade.knowledge import ingest_local_document
+from brigade.knowledge import ingest_local_document, store_ingest_result
 from brigade.logging import configure_json_logging
 from brigade.memory import (
     append_daily_memory,
@@ -3976,19 +3976,13 @@ def _ingest_document(
     document_type: str,
     path: str,
 ) -> dict[str, object]:
-    document, chunks, episode, provenance = ingest_local_document(
+    result = ingest_local_document(
         title=title,
         source=source,
         document_type=document_type,
         content_path=path,
     )
-    store.add_knowledge_document(document.to_dict())
-    for chunk in chunks:
-        store.add_knowledge_chunk(chunk)
-    store.add_episode(episode)
-    for record in provenance:
-        store.add_provenance_record(record)
-    return document.to_dict()
+    return store_ingest_result(store, result)
 
 
 def _resolve_actor(
