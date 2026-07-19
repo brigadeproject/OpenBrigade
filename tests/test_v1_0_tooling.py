@@ -753,3 +753,86 @@ def test_shared_prefix_cannot_escape_shared_root(tmp_path):
     )
     assert not result.ok
     assert "escapes" in result.output
+
+
+# --- web_fetch SSRF guard -----------------------------------------------------------
+
+
+def _fetch(url: str, monkeypatch=None):
+    from brigade.tools import _web_fetch
+
+    return _web_fetch(None, {"url": url})
+
+
+def test_web_fetch_refuses_loopback_and_private_literals():
+    for url in (
+        "http://127.0.0.1:8080/admin",
+        "http://localhost/",
+        "http://10.0.0.5/state",
+        "http://192.168.1.1/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/",
+    ):
+        result = _fetch(url)
+        assert not result.ok, url
+        assert "refused" in result.output or "did not resolve" in result.output
+
+
+def test_web_fetch_refuses_hostname_resolving_to_private_space(monkeypatch):
+    import brigade.tools as tools
+
+    monkeypatch.setattr(
+        tools.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("10.20.30.40", 80))],
+    )
+    result = _fetch("http://internal.example.com/secrets")
+    assert not result.ok
+    assert "non-public address 10.20.30.40" in result.output
+
+
+def test_web_fetch_allows_public_hosts(monkeypatch):
+    import io
+
+    import brigade.tools as tools
+
+    monkeypatch.setattr(
+        tools.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+
+    class _FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class _FakeOpener:
+        def open(self, request, timeout=0):
+            assert request.full_url == "https://example.com/notes"
+            return _FakeResponse(b"public content")
+
+    monkeypatch.setattr(
+        tools.urllib.request, "build_opener", lambda *handlers: _FakeOpener()
+    )
+    result = _fetch("https://example.com/notes")
+    assert result.ok
+    assert result.output == "public content"
+
+
+def test_web_fetch_redirect_to_private_space_is_blocked():
+    import urllib.error
+
+    import pytest
+
+    from brigade.tools import _PublicOnlyRedirectHandler
+
+    handler = _PublicOnlyRedirectHandler()
+    with pytest.raises(urllib.error.URLError, match="redirect blocked"):
+        handler.redirect_request(
+            None, None, 302, "Found", {}, "http://169.254.169.254/latest/meta-data/"
+        )
+    with pytest.raises(urllib.error.URLError, match="non-http"):
+        handler.redirect_request(None, None, 302, "Found", {}, "file:///etc/passwd")

@@ -267,11 +267,15 @@ def test_web_fetch_tool_fetches_when_enabled(tmp_path, monkeypatch):
         def __exit__(self, *args):
             return False
 
-    def fake_urlopen(request, timeout=0):
-        assert request.full_url == "https://example.com/status"
-        return _FakeResponse(b"release notes: all green")
+    class _FakeOpener:
+        def open(self, request, timeout=0):
+            assert request.full_url == "https://example.com/status"
+            return _FakeResponse(b"release notes: all green")
 
-    monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(tools, "_private_address_reason", lambda url: None)
+    monkeypatch.setattr(
+        tools.urllib.request, "build_opener", lambda *handlers: _FakeOpener()
+    )
     store = _fleet(tmp_path)
     provider = SequencedTestProvider(
         [
