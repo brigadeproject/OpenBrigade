@@ -4081,3 +4081,253 @@ button.danger:disabled {
     max-height: 280px;
   }
 }
+
+/* ---- Knowledge Base tab ------------------------------------------------- */
+
+.ob-kb {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(240px, 0.6fr) minmax(0, 1.5fr) minmax(260px, 0.7fr);
+  gap: 10px;
+}
+
+.ob-kb-rail,
+.ob-kb-graph-panel,
+.ob-kb-inspector {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ob-kb-stats {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--c-divider);
+}
+
+.ob-kb-refresh {
+  min-height: 22px;
+  font-size: 10px;
+}
+
+.ob-kb-search {
+  flex: none;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--c-divider);
+}
+
+.ob-kb-search input {
+  width: 100%;
+  min-height: 28px;
+  font-size: 11px;
+}
+
+.ob-kb-search-results {
+  margin-top: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ob-kb-browse-switch {
+  flex: none;
+  margin: 8px 10px 0;
+}
+
+.ob-kb-browse {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ob-kb-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 6px 8px;
+  text-align: left;
+  background: var(--c-panel-2);
+  border-radius: 4px;
+  box-shadow: var(--bevel-out);
+  cursor: pointer;
+}
+
+.ob-kb-row:hover {
+  background: var(--c-inset);
+}
+
+.ob-kb-row.selected {
+  outline: 1px solid var(--c-accent);
+}
+
+.ob-kb-row-sub {
+  margin-left: 14px;
+  width: calc(100% - 14px);
+}
+
+.ob-kb-row-title {
+  font: 600 11px var(--font);
+  color: var(--c-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.ob-kb-row-meta {
+  font: 10px var(--font-mono);
+  color: var(--c-text-faint);
+}
+
+.ob-kb-memory-agent {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ob-kb-graph-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ob-kb-graph {
+  flex: 1;
+  min-height: 420px;
+}
+
+.ob-kb-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  font: 11px var(--font);
+  color: var(--c-text-faint);
+  text-align: center;
+}
+
+.ob-kb-loading {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 11px var(--font);
+  color: var(--c-text-faint);
+}
+
+.ob-kb-inspector-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.ob-kb-inspector-id {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.ob-kb-inspector-id code {
+  font: 10px var(--font-mono);
+  color: var(--c-text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ob-kb-inspector-title {
+  margin: 0;
+  font: 700 13px var(--font);
+  color: var(--c-text);
+}
+
+.ob-kb-fields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 10px;
+  margin: 0;
+  width: 100%;
+}
+
+.ob-kb-fields dt {
+  font: 700 9px var(--font);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--c-text-faint);
+}
+
+.ob-kb-fields dd {
+  margin: 0;
+  font: 11px var(--font);
+  color: var(--c-text-dim);
+  overflow-wrap: anywhere;
+}
+
+.ob-kb-subhead {
+  font: 700 9px var(--font);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--c-text-faint);
+  margin-top: 4px;
+}
+
+.ob-kb-chunk-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.ob-kb-pre {
+  width: 100%;
+  max-height: 320px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  background: var(--c-inset);
+  border-radius: 4px;
+  box-shadow: var(--bevel-in);
+  font: 10px/1.5 var(--font-mono);
+  color: var(--c-text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ob-kb-link {
+  padding: 0;
+  background: none;
+  border: none;
+  box-shadow: none;
+  font: 11px var(--font);
+  color: var(--c-accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+@media (max-width: 1180px) {
+  .ob-kb {
+    grid-template-columns: 1fr;
+    grid-auto-rows: minmax(280px, auto);
+    overflow-y: auto;
+  }
+}

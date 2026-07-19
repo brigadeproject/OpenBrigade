@@ -1,6 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
+
+// Lazy so the cytoscape bundle only loads when the Knowledge Base tab opens.
+const KnowledgeView = lazy(() => import("./knowledge"));
 
 const OPS_ROOM_FALLBACK_ROOMS: OpsRoomRoom[] = [
   { id: "orchestrator", label: "Orchestrator", domains: [], kind: "orchestrator", fixed_agent_id: "orchestrator" },
@@ -24,6 +27,7 @@ const TAB_VIEWS = [
   { id: "brigade", label: "Brigade" },
   { id: "agents", label: "Agents & Teams" },
   { id: "proposals", label: "Proposals" },
+  { id: "knowledge", label: "Knowledge Base" },
   { id: "telemetry", label: "Telemetry" },
 ] as const;
 
@@ -808,6 +812,10 @@ function App() {
             onRefresh={refreshAll}
             setStatus={setStatus}
           />
+        ) : view === "knowledge" ? (
+          <Suspense fallback={<div className="ob-kb-loading">Loading knowledge base…</div>}>
+            <KnowledgeView api={api} setStatus={setStatus} />
+          </Suspense>
         ) : view === "proposals" ? (
           <ProposalsView
             proposals={proposals}
@@ -1009,7 +1017,6 @@ function TabStrip({
           {tab.label}
         </button>
       ))}
-      <span className="ob-tab disabled" aria-disabled="true">Knowledge Base</span>
       <span className="ob-tab-add" aria-hidden="true">+</span>
       <div className="ob-tab-right">
         {warnings.length > 0 && (
