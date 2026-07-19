@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -13,8 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from brigade.knowledge import ingest_text, store_ingest_result
 from brigade.schemas import Agent, Assignment, AssignmentKind, AssignmentStatus, Priority
 from brigade.store import StateStore
+from brigade.time import utc_now_iso
 
 
 @dataclass(frozen=True)
@@ -175,8 +178,17 @@ def default_tool_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="web_fetch",
-            description="Fetch a small HTTP(S) text response for reference.",
-            argument_schema={"url": "http or https URL", "max_chars": "optional integer"},
+            description=(
+                "Fetch a small HTTP(S) text response for reference. Pass "
+                "save_to_knowledge true to keep the page in the shared knowledge base."
+            ),
+            argument_schema={
+                "url": "http or https URL",
+                "max_chars": "optional integer",
+                "save_to_knowledge": (
+                    "optional boolean; store the fetched page as a knowledge document"
+                ),
+            },
         ),
         _web_fetch,
     )
@@ -465,8 +477,11 @@ class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+WEB_FETCH_SAVE_MIN_CHARS = 500
+WEB_FETCH_SAVE_MAX_CHARS = 60_000
+
+
 def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-    del context
     url = _required_text(arguments, "url")
     if not (url.startswith("https://") or url.startswith("http://")):
         return ToolResult(False, "url must start with http:// or https://")
@@ -474,19 +489,84 @@ def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     if reason is not None:
         return ToolResult(False, f"web_fetch refused: {reason}")
     max_chars = min(int(arguments.get("max_chars") or 4000), 12_000)
+    store = getattr(context, "store", None)
+    save_requested = bool(arguments.get("save_to_knowledge")) and store is not None
+    autosave = False
+    if store is not None and not save_requested:
+        try:
+            autosave = bool((store.runtime_overrides() or {}).get("web_fetch_autosave"))
+        except RuntimeError:
+            autosave = False
+    read_cap = WEB_FETCH_SAVE_MAX_CHARS if (save_requested or autosave) else max_chars
     request = urllib.request.Request(url, headers={"User-Agent": "OpenBrigade/1.0"})
     opener = urllib.request.build_opener(_PublicOnlyRedirectHandler())
     try:
         with opener.open(request, timeout=20) as response:
-            body = response.read(max_chars + 1).decode("utf-8", errors="replace")
+            body = response.read(read_cap + 1).decode("utf-8", errors="replace")
+            final_url = response.geturl() if hasattr(response, "geturl") else url
     except urllib.error.URLError as exc:
         return ToolResult(False, f"web_fetch failed: {exc}")
     truncated = body[:max_chars]
-    return ToolResult(
-        True,
-        truncated,
-        {"detail": "truncated" if len(body) > max_chars else "complete"},
+    metadata: dict[str, Any] = {
+        "detail": "truncated" if len(body) > max_chars else "complete"
+    }
+    should_save = save_requested or (autosave and len(body) >= WEB_FETCH_SAVE_MIN_CHARS)
+    if should_save:
+        # A failed save must never fail the fetch the model asked for.
+        try:
+            metadata.update(
+                _save_fetched_page(
+                    store,
+                    url=url,
+                    body=body[:WEB_FETCH_SAVE_MAX_CHARS],
+                    final_url=final_url,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            metadata["knowledge_save"] = f"failed: {exc}"
+    return ToolResult(True, truncated, metadata)
+
+
+def _save_fetched_page(
+    store: StateStore,
+    *,
+    url: str,
+    body: str,
+    final_url: str,
+) -> dict[str, Any]:
+    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    for document in store.knowledge_documents():
+        doc_metadata = document.get("metadata") or {}
+        if (
+            doc_metadata.get("source_url") == url
+            and doc_metadata.get("content_hash") == content_hash
+        ):
+            return {
+                "knowledge_save": "skipped-duplicate",
+                "saved_document_id": document.get("document_id"),
+            }
+    content_dir = store.data_dir / "knowledge" / "web"
+    content_dir.mkdir(parents=True, exist_ok=True)
+    content_path = content_dir / f"{content_hash}.txt"
+    content_path.write_text(body, encoding="utf-8")
+    parsed = urllib.parse.urlparse(url)
+    title = f"{parsed.netloc}{parsed.path}".rstrip("/") or url
+    result = ingest_text(
+        title=title,
+        source=url,
+        document_type="web",
+        content=body,
+        content_path=str(content_path),
+        extra_metadata={
+            "content_type": "web",
+            "source_url": url,
+            "http_final_url": final_url,
+            "fetched_at": utc_now_iso(),
+            "content_hash": content_hash,
+        },
     )
+    saved = store_ingest_result(store, result)
+    return {"knowledge_save": "saved", "saved_document_id": saved["document_id"]}
 
 
 # Delegated tasks carry no idempotency key, so a planner re-run cheerfully
