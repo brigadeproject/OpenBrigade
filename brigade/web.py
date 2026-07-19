@@ -42,6 +42,7 @@ from brigade.providers import (
     probe_model_inventory,
     provider_from_settings,
 )
+from brigade.knowledge_web import register_knowledge_routes
 from brigade.rbac import ROLE_PERMISSIONS, can
 from brigade.schemas import (
     Agent,
@@ -1264,6 +1265,14 @@ def create_app(
         )
         store.add_user(user)
         return user.to_dict()
+
+    register_knowledge_routes(
+        app,
+        store=store,
+        settings=settings,
+        require=require,
+        auth_dependency=auth_dependency,
+    )
 
     static_root = _static_root()
     if static_root.exists():
