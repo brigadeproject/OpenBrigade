@@ -273,9 +273,15 @@ def register_knowledge_routes(
 
         labels: dict[str, str] = {}
         documents = store.knowledge_documents()
+        titles: dict[str, str] = {}
         for item in documents:
-            labels[make_kb_id("doc", str(item.get("document_id")))] = _clip(
-                item.get("title"), 60
+            doc_id = str(item.get("document_id"))
+            titles[doc_id] = str(item.get("title") or "")
+            labels[make_kb_id("doc", doc_id)] = _clip(item.get("title"), 60)
+        for chunk in store.knowledge_chunks():
+            title = titles.get(str(chunk.get("document_id")), "")
+            labels[make_kb_id("chunk", str(chunk.get("chunk_id")))] = _clip(
+                f"{title} · chunk {chunk.get('chunk_index')}", 60
             )
 
         def add_node(kb_id: str) -> bool:

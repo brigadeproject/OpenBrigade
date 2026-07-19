@@ -47,6 +47,17 @@ Memory archive creates:
 - Qdrant records with agent/source/date metadata.
 - Provenance records tying the episode back to its source.
 
+## Unified Knowledge Base View (1.2)
+
+All memory layers are inspectable through `/api/knowledge/*` and the GUI Knowledge Base tab.
+Items are addressed by `kb_id` URIs (see LIBRARY_SYSTEMS.md). Per-agent memory files
+(`MEMORY.md`, `CHAT_MEMORY.md`, `memory/<date>-MEMORY.md`) are exposed as live virtual nodes
+(`agent:<id>` −HAS_MEMORY→ `memory:<id>/<file>`) read straight from the workspace — they are not
+copied into the database, so the existing file-edit API remains the single write path. Knowledge
+chunks are embedded in the `brigade_chunks` Qdrant collection alongside episode vectors, and the
+graph view shows structural provenance edges plus view-time `SIMILAR_TO` edges from Qdrant
+nearest-neighbor lookups.
+
 ## Retrieval and Inspection
 
 Current operator inspection commands:
