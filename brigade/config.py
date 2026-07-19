@@ -50,6 +50,7 @@ class Settings:
     redis_url: str | None = None
     qdrant_url: str | None = None
     qdrant_collection: str = "brigade_episodes"
+    qdrant_chunk_collection: str = "brigade_chunks"
     ollama_embedding_base_url: str | None = None
     ollama_embedding_model: str = "nomic-embed-text:latest"
     ollama_embedding_vector_size: int = 768
@@ -403,6 +404,12 @@ def load_settings(
             config.get("qdrant_collection", "brigade_episodes"),
         )
         or "brigade_episodes",
+        qdrant_chunk_collection=_env(
+            "BRIGADE_QDRANT_CHUNK_COLLECTION",
+            dotenv,
+            config.get("qdrant_chunk_collection", "brigade_chunks"),
+        )
+        or "brigade_chunks",
         ollama_embedding_base_url=_env(
             "BRIGADE_OLLAMA_EMBEDDING_BASE_URL",
             dotenv,

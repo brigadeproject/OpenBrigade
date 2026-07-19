@@ -31,7 +31,7 @@ from brigade.connectors import (
     parse_allowlist,
     reject_external_identity,
 )
-from brigade.datastores import Neo4jProvenanceStore, QdrantEpisodeStore
+from brigade.datastores import Neo4jProvenanceStore, QdrantChunkStore, QdrantEpisodeStore
 from brigade.db import (
     MigrationApplyError,
     apply_migrations,
@@ -852,6 +852,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     upload.add_argument("--type", default="upload", help="Document type label. Default: upload.")
     knowledge_sub.add_parser("list", help="List stored knowledge documents.")
+    backfill = knowledge_sub.add_parser(
+        "backfill-embeddings",
+        help="Embed stored knowledge chunks into the Qdrant chunk collection.",
+        description=(
+            "Embed every stored knowledge chunk into the Qdrant chunk collection, "
+            "skipping chunks that already have points. Use --recreate to drop the "
+            "collection and re-embed everything."
+        ),
+    )
+    backfill.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Chunks to embed per Ollama request. Default: 32.",
+    )
+    backfill.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Drop the chunk collection before backfilling.",
+    )
 
     memory = subcommands.add_parser(
         "memory",
@@ -2116,6 +2136,17 @@ def _main(argv: Sequence[str] | None = None) -> int:
         _require_permission(store, settings, actor, "knowledge:read")
         print(json.dumps(store.knowledge_documents(), indent=2, sort_keys=True))
         return 0
+
+    if args.command == "knowledge" and args.knowledge_command == "backfill-embeddings":
+        _require_permission(store, settings, actor, "knowledge:write")
+        summary = _backfill_chunk_embeddings(
+            store,
+            settings,
+            batch_size=max(1, args.batch_size),
+            recreate=args.recreate,
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0 if summary.get("ok") else 1
 
     if args.command == "memory" and args.memory_command == "append":
         _require_permission(store, settings, actor, "memory:write")
@@ -3983,6 +4014,46 @@ def _ingest_document(
         content_path=path,
     )
     return store_ingest_result(store, result)
+
+
+def _backfill_chunk_embeddings(
+    store: StateStore,
+    settings: Settings,
+    *,
+    batch_size: int,
+    recreate: bool,
+) -> dict[str, object]:
+    chunk_store = QdrantChunkStore(
+        settings.qdrant_url,
+        collection=settings.qdrant_chunk_collection,
+        embedding_base_url=settings.ollama_embedding_base_url,
+        embedding_model=settings.ollama_embedding_model,
+        embedding_vector_size=settings.ollama_embedding_vector_size,
+    )
+    if not chunk_store.available():
+        return {"ok": False, "reason": "qdrant is not configured"}
+    chunks = store.knowledge_chunks()
+    try:
+        if recreate:
+            chunk_store.drop_collection()
+            existing: set[str] = set()
+        else:
+            existing = chunk_store.existing_ids()
+    except RuntimeError as exc:
+        return {"ok": False, "reason": str(exc)}
+    pending = [chunk for chunk in chunks if str(chunk.get("chunk_id")) not in existing]
+    results = chunk_store.upsert_chunks(pending, batch_size=batch_size)
+    failures = [result.detail for result in results if not result.ok]
+    return {
+        "ok": not failures,
+        "collection": chunk_store.collection,
+        "embedding_model": chunk_store.embedding_model,
+        "total_chunks": len(chunks),
+        "already_indexed": len(chunks) - len(pending),
+        "embedded": len(results) - len(failures),
+        "failed": len(failures),
+        "failures": failures[:10],
+    }
 
 
 def _resolve_actor(

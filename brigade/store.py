@@ -7,7 +7,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from brigade.config import Settings
-from brigade.datastores import Neo4jProvenanceStore, QdrantEpisodeStore
+from brigade.datastores import Neo4jProvenanceStore, QdrantChunkStore, QdrantEpisodeStore
 from brigade.db import ensure_schema
 from brigade.schemas import (
     Agent,
@@ -233,6 +233,14 @@ class StateStore(Protocol):
     def episodes(self) -> list[dict[str, Any]]: ...
 
     def search_episodes(self, query: str, limit: int = 3) -> list[dict[str, Any]]: ...
+
+    def search_chunks(self, query: str, limit: int = 5) -> list[dict[str, Any]]: ...
+
+    def chunk_neighbors(self, chunk_id: str, limit: int = 8) -> list[dict[str, Any]]: ...
+
+    def episode_neighbors(self, episode_id: str, limit: int = 8) -> list[dict[str, Any]]: ...
+
+    def qdrant_collection_stats(self) -> dict[str, object]: ...
 
     def add_provenance_record(self, record: dict[str, Any]) -> None: ...
 
@@ -532,6 +540,7 @@ class PostgresStateStore:
         redis_url: str | None = None,
         qdrant_url: str | None = None,
         qdrant_collection: str = "brigade_episodes",
+        qdrant_chunk_collection: str = "brigade_chunks",
         ollama_embedding_base_url: str | None = None,
         ollama_embedding_model: str | None = None,
         ollama_embedding_vector_size: int | None = None,
@@ -544,6 +553,13 @@ class PostgresStateStore:
         self._qdrant = QdrantEpisodeStore(
             qdrant_url,
             collection=qdrant_collection,
+            embedding_base_url=ollama_embedding_base_url,
+            embedding_model=ollama_embedding_model,
+            embedding_vector_size=ollama_embedding_vector_size,
+        )
+        self._qdrant_chunks = QdrantChunkStore(
+            qdrant_url,
+            collection=qdrant_chunk_collection,
             embedding_base_url=ollama_embedding_base_url,
             embedding_model=ollama_embedding_model,
             embedding_vector_size=ollama_embedding_vector_size,
@@ -1153,6 +1169,11 @@ class PostgresStateStore:
                 json.dumps(chunk, sort_keys=True),
             ),
         )
+        result = self._qdrant_chunks.upsert_chunk(chunk)
+        if self._qdrant_chunks.available() and not result.ok:
+            self.add_alert(
+                f"qdrant chunk write failed for {chunk['chunk_id']}: {result.detail}"
+            )
 
     def knowledge_chunks(self, document_id: str | None = None) -> list[dict[str, Any]]:
         sql = "select record from brigade_knowledge_chunks"
@@ -1839,6 +1860,29 @@ class PostgresStateStore:
             self._add_alert_postgres(f"qdrant episode search failed: {exc}")
             return []
 
+    def search_chunks(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        try:
+            return self._qdrant_chunks.search_chunks(query, limit=limit)
+        except RuntimeError as exc:
+            self._add_alert_postgres(f"qdrant chunk search failed: {exc}")
+            return []
+
+    def chunk_neighbors(self, chunk_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        return self._qdrant_chunks.neighbors(chunk_id, limit=limit)
+
+    def episode_neighbors(self, episode_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        return self._qdrant.neighbors(episode_id, limit=limit)
+
+    def qdrant_collection_stats(self) -> dict[str, object]:
+        return {
+            "configured": self._qdrant.available(),
+            "embedding_model": self._qdrant.embedding_model,
+            "episode_collection": self._qdrant.collection,
+            "episode_points": self._qdrant.count(),
+            "chunk_collection": self._qdrant_chunks.collection,
+            "chunk_points": self._qdrant_chunks.count(),
+        }
+
     def add_provenance_record(self, record: dict[str, Any]) -> None:
         self._execute(
             """
@@ -2290,6 +2334,7 @@ def open_state_store(settings: Settings) -> StateStore:
             redis_url=settings.redis_url,
             qdrant_url=settings.qdrant_url,
             qdrant_collection=settings.qdrant_collection,
+            qdrant_chunk_collection=settings.qdrant_chunk_collection,
             ollama_embedding_base_url=settings.ollama_embedding_base_url,
             ollama_embedding_model=settings.ollama_embedding_model,
             ollama_embedding_vector_size=settings.ollama_embedding_vector_size,

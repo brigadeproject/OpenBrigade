@@ -627,6 +627,29 @@ class JsonStateStore:
                 break
         return matches
 
+    def search_chunks(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        terms = [term.lower() for term in query.split() if len(term) >= 3]
+        matches = []
+        for chunk in self.knowledge_chunks():
+            text = str(chunk.get("text") or "").lower()
+            if terms and not any(term in text for term in terms):
+                continue
+            matches.append({"score": None, "payload": chunk})
+            if len(matches) >= limit:
+                break
+        return matches
+
+    def chunk_neighbors(self, chunk_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        del chunk_id, limit
+        return []
+
+    def episode_neighbors(self, episode_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        del episode_id, limit
+        return []
+
+    def qdrant_collection_stats(self) -> dict[str, object]:
+        return {"configured": False}
+
     def add_provenance_record(self, record: dict[str, Any]) -> None:
         state = self.load()
         state.setdefault("provenance_records", []).append(record)

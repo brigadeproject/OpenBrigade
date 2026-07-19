@@ -1789,3 +1789,64 @@ def test_cli_daemon_drains_on_sigterm(tmp_path, monkeypatch, capsys):
     assert payload["drained"] is True
     assert payload["cycles"] >= 1
     assert elapsed < 30
+
+
+def test_backfill_chunk_embeddings_skips_existing_points(tmp_path, monkeypatch):
+    from brigade.cli import _backfill_chunk_embeddings
+    from brigade.datastores import QdrantCollectionStore
+
+    store = JsonStateStore(tmp_path / "state.json")
+    for index in range(3):
+        store.add_knowledge_chunk(
+            {
+                "chunk_id": f"chunk-{index}",
+                "kb_id": f"chunk:chunk-{index}",
+                "document_id": "doc-1",
+                "chunk_index": index,
+                "text": f"chunk body {index}",
+                "created_at": "2026-07-19T00:00:00Z",
+            }
+        )
+
+    puts: list[str] = []
+
+    def fake_request(self, method, path, payload=None):
+        if path.endswith("/points/scroll"):
+            return {
+                "result": {
+                    "points": [{"id": "chunk-0"}],
+                    "next_page_offset": None,
+                }
+            }
+        if method == "GET":
+            raise RuntimeError("missing collection")
+        if method == "PUT" and path.endswith("points?wait=true"):
+            puts.append(payload["points"][0]["id"])
+        return {}
+
+    monkeypatch.setattr(QdrantCollectionStore, "_request", fake_request)
+
+    settings = Settings(
+        config_path=tmp_path / "brigade.toml",
+        data_dir=tmp_path / ".brigade",
+        qdrant_url="http://qdrant",
+    )
+    summary = _backfill_chunk_embeddings(store, settings, batch_size=2, recreate=False)
+
+    assert summary["ok"] is True
+    assert summary["total_chunks"] == 3
+    assert summary["already_indexed"] == 1
+    assert summary["embedded"] == 2
+    assert sorted(puts) == ["chunk-1", "chunk-2"]
+
+
+def test_backfill_chunk_embeddings_requires_qdrant(tmp_path):
+    from brigade.cli import _backfill_chunk_embeddings
+
+    store = JsonStateStore(tmp_path / "state.json")
+    settings = Settings(config_path=tmp_path / "brigade.toml", data_dir=tmp_path / ".brigade")
+
+    summary = _backfill_chunk_embeddings(store, settings, batch_size=8, recreate=False)
+
+    assert summary["ok"] is False
+    assert "not configured" in summary["reason"]

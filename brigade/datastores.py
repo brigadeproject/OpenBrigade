@@ -63,6 +63,18 @@ class OllamaEmbeddingClient:
         data = self._post_json("/api/embeddings", {"model": self.model, "prompt": text})
         return _coerce_vector(data.get("embedding"))
 
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        try:
+            data = self._post_json("/api/embed", {"model": self.model, "input": texts})
+            embeddings = data.get("embeddings")
+            if isinstance(embeddings, list) and len(embeddings) == len(texts):
+                return [_coerce_vector(item) for item in embeddings]
+        except RuntimeError:
+            pass
+        return [self.embed(text) for text in texts]
+
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -84,11 +96,16 @@ class OllamaEmbeddingClient:
         return decoded
 
 
-class QdrantEpisodeStore:
+class QdrantCollectionStore:
+    """Shared Qdrant machinery for one embedded collection.
+
+    Subclasses give the collection its payload semantics (episodes, chunks).
+    """
+
     def __init__(
         self,
         url: str | None,
-        collection: str = "brigade_episodes",
+        collection: str,
         *,
         embedding_base_url: str | None = None,
         embedding_model: str | None = None,
@@ -106,13 +123,21 @@ class QdrantEpisodeStore:
     def available(self) -> bool:
         return bool(self.url)
 
-    def upsert_episode(self, episode: dict[str, Any]) -> ExternalWriteResult:
+    def _upsert_point(
+        self,
+        point_id: str,
+        text: str,
+        payload: dict[str, Any],
+        *,
+        detail: str,
+        vector: list[float] | None = None,
+    ) -> ExternalWriteResult:
         if not self.url:
             return ExternalWriteResult("qdrant", False, "not configured")
         try:
-            vector = self._episode_vector(episode)
+            if vector is None:
+                vector = self._query_vector(text)
             self._ensure_collection(len(vector))
-            point_id = str(episode["episode_id"])
             self._request(
                 "PUT",
                 f"/collections/{self.collection}/points?wait=true",
@@ -121,14 +146,75 @@ class QdrantEpisodeStore:
                         {
                             "id": point_id,
                             "vector": vector,
-                            "payload": episode,
+                            "payload": payload,
                         }
                     ]
                 },
             )
         except (KeyError, RuntimeError) as exc:
             return ExternalWriteResult("qdrant", False, str(exc))
-        return ExternalWriteResult("qdrant", True, f"upserted episode {episode['episode_id']}")
+        return ExternalWriteResult("qdrant", True, detail)
+
+    def count(self) -> int | None:
+        if not self.url:
+            return None
+        try:
+            result = self._request(
+                "POST",
+                f"/collections/{self.collection}/points/count",
+                {"exact": True},
+            )
+        except RuntimeError:
+            return None
+        count = ((result or {}).get("result") or {}).get("count")
+        return int(count) if isinstance(count, (int, float)) else None
+
+    def existing_ids(self, page_size: int = 256) -> set[str]:
+        """All point ids in the collection (paged scroll, ids only)."""
+        ids: set[str] = set()
+        if not self.url:
+            return ids
+        offset: Any = None
+        while True:
+            body: dict[str, Any] = {
+                "limit": page_size,
+                "with_payload": False,
+                "with_vector": False,
+            }
+            if offset is not None:
+                body["offset"] = offset
+            result = self._request(
+                "POST", f"/collections/{self.collection}/points/scroll", body
+            )
+            payload = (result or {}).get("result") or {}
+            points = payload.get("points") or []
+            ids.update(str(point.get("id")) for point in points if isinstance(point, dict))
+            offset = payload.get("next_page_offset")
+            if offset is None or not points:
+                return ids
+
+    def neighbors(self, point_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        if not self.url:
+            return []
+        try:
+            result = self._request(
+                "POST",
+                f"/collections/{self.collection}/points/recommend",
+                {
+                    "positive": [point_id],
+                    "limit": limit,
+                    "with_payload": True,
+                    "with_vector": False,
+                },
+            )
+        except RuntimeError:
+            return []
+        return _score_payload_rows((result or {}).get("result"))
+
+    def drop_collection(self) -> None:
+        if not self.url:
+            return
+        self._request("DELETE", f"/collections/{self.collection}")
 
     def health(self) -> ExternalWriteResult:
         if not self.url:
@@ -167,7 +253,7 @@ class QdrantEpisodeStore:
             "points": points,
         }
 
-    def search_episodes(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
+    def search(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
         if not self.url:
             return []
         vector = self._query_vector(query)
@@ -177,32 +263,13 @@ class QdrantEpisodeStore:
             f"/collections/{self.collection}/points/search",
             {"vector": vector, "limit": limit, "with_payload": True, "with_vector": False},
         )
-        points = (result or {}).get("result") or []
-        if not isinstance(points, list):
-            return []
-        return [
-            {
-                "score": point.get("score"),
-                "payload": point.get("payload") or {},
-            }
-            for point in points
-            if isinstance(point, dict)
-        ]
+        return _score_payload_rows((result or {}).get("result"))
 
     @property
     def embedding_model(self) -> str:
         if self._embedding_client is None:
             return "hash-fallback"
         return self._embedding_client.model
-
-    def _episode_vector(self, episode: dict[str, Any]) -> list[float]:
-        text = _episode_embedding_text(episode)
-        if self._embedding_client is None:
-            return _text_vector(text)
-        vector = self._embedding_client.embed(text)
-        if not vector:
-            raise RuntimeError("ollama embedding response was empty")
-        return vector
 
     def _query_vector(self, query: str) -> list[float]:
         if self._embedding_client is None:
@@ -252,6 +319,122 @@ class QdrantEpisodeStore:
         except urllib.error.URLError as exc:
             raise RuntimeError(f"qdrant request failed: {exc}") from exc
         return json.loads(body) if body else None
+
+
+class QdrantEpisodeStore(QdrantCollectionStore):
+    def __init__(
+        self,
+        url: str | None,
+        collection: str = "brigade_episodes",
+        *,
+        embedding_base_url: str | None = None,
+        embedding_model: str | None = None,
+        embedding_vector_size: int | None = None,
+    ) -> None:
+        super().__init__(
+            url,
+            collection,
+            embedding_base_url=embedding_base_url,
+            embedding_model=embedding_model,
+            embedding_vector_size=embedding_vector_size,
+        )
+
+    def upsert_episode(self, episode: dict[str, Any]) -> ExternalWriteResult:
+        try:
+            point_id = str(episode["episode_id"])
+        except KeyError as exc:
+            return ExternalWriteResult("qdrant", False, str(exc))
+        return self._upsert_point(
+            point_id,
+            _episode_embedding_text(episode),
+            episode,
+            detail=f"upserted episode {point_id}",
+        )
+
+    def search_episodes(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
+        return self.search(query, limit)
+
+
+class QdrantChunkStore(QdrantCollectionStore):
+    def __init__(
+        self,
+        url: str | None,
+        collection: str = "brigade_chunks",
+        *,
+        embedding_base_url: str | None = None,
+        embedding_model: str | None = None,
+        embedding_vector_size: int | None = None,
+    ) -> None:
+        super().__init__(
+            url,
+            collection,
+            embedding_base_url=embedding_base_url,
+            embedding_model=embedding_model,
+            embedding_vector_size=embedding_vector_size,
+        )
+
+    def upsert_chunk(
+        self, chunk: dict[str, Any], *, vector: list[float] | None = None
+    ) -> ExternalWriteResult:
+        try:
+            point_id = str(chunk["chunk_id"])
+            text = str(chunk["text"])
+        except KeyError as exc:
+            return ExternalWriteResult("qdrant", False, str(exc))
+        payload = {
+            "chunk_id": point_id,
+            "kb_id": chunk.get("kb_id") or f"chunk:{point_id}",
+            "document_id": chunk.get("document_id"),
+            "chunk_index": chunk.get("chunk_index"),
+            "source": chunk.get("source"),
+            "text": text,
+            "created_at": chunk.get("created_at"),
+        }
+        return self._upsert_point(
+            point_id,
+            text,
+            payload,
+            detail=f"upserted chunk {point_id}",
+            vector=vector,
+        )
+
+    def search_chunks(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        return self.search(query, limit)
+
+    def upsert_chunks(
+        self, chunks: list[dict[str, Any]], *, batch_size: int = 32
+    ) -> list[ExternalWriteResult]:
+        results: list[ExternalWriteResult] = []
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start : start + batch_size]
+            texts = [str(chunk.get("text") or "") for chunk in batch]
+            vectors: list[list[float]]
+            if self._embedding_client is not None:
+                try:
+                    vectors = self._embedding_client.embed_batch(texts)
+                except RuntimeError as exc:
+                    results.extend(
+                        ExternalWriteResult("qdrant", False, str(exc)) for _ in batch
+                    )
+                    continue
+            else:
+                vectors = [_text_vector(text) for text in texts]
+            for chunk, vector in zip(batch, vectors):
+                results.append(self.upsert_chunk(chunk, vector=vector))
+        return results
+
+
+def _score_payload_rows(result: Any) -> list[dict[str, Any]]:
+    if not isinstance(result, list):
+        return []
+    return [
+        {
+            "score": point.get("score"),
+            "payload": point.get("payload") or {},
+        }
+        for point in result
+        if isinstance(point, dict)
+    ]
 
 
 def _episode_embedding_text(episode: dict[str, Any]) -> str:

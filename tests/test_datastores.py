@@ -216,3 +216,106 @@ def test_neo4j_provenance_links_document_chunks_tasks_and_teams() -> None:
     assert "SUPPORTS_GOAL" in statements
     assert "HAS_MEMBER" in statements
     assert "LED_BY" in statements
+
+
+def test_qdrant_chunk_store_upserts_kb_payload() -> None:
+    from brigade.datastores import QdrantChunkStore
+
+    store = QdrantChunkStore("http://qdrant")
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_request(method: str, path: str, payload: dict[str, object] | None = None):
+        calls.append((method, path, payload))
+        if method == "GET":
+            raise RuntimeError("missing collection")
+        return {}
+
+    store._request = fake_request
+
+    result = store.upsert_chunk(
+        {
+            "chunk_id": "chunk-1",
+            "kb_id": "chunk:chunk-1",
+            "document_id": "doc-1",
+            "chunk_index": 0,
+            "text": "chunk body text",
+            "source": "unit-test",
+            "created_at": "2026-07-19T00:00:00Z",
+        }
+    )
+
+    assert result.ok
+    assert store.collection == "brigade_chunks"
+    point = calls[-1][2]["points"][0]
+    assert point["id"] == "chunk-1"
+    assert point["payload"]["kb_id"] == "chunk:chunk-1"
+    assert point["payload"]["document_id"] == "doc-1"
+    assert len(point["vector"]) == HASH_FALLBACK_VECTOR_SIZE
+
+
+def test_qdrant_chunk_store_neighbors_and_count() -> None:
+    from brigade.datastores import QdrantChunkStore
+
+    store = QdrantChunkStore("http://qdrant")
+
+    def fake_request(method: str, path: str, payload: dict[str, object] | None = None):
+        if path.endswith("/points/recommend"):
+            assert payload["positive"] == ["chunk-1"]
+            return {
+                "result": [
+                    {"score": 0.92, "payload": {"chunk_id": "chunk-2", "kb_id": "chunk:chunk-2"}}
+                ]
+            }
+        if path.endswith("/points/count"):
+            return {"result": {"count": 7}}
+        return {}
+
+    store._request = fake_request
+
+    rows = store.neighbors("chunk-1", limit=4)
+    assert rows == [
+        {"score": 0.92, "payload": {"chunk_id": "chunk-2", "kb_id": "chunk:chunk-2"}}
+    ]
+    assert store.count() == 7
+
+
+def test_qdrant_chunk_store_batch_upsert_uses_hash_fallback() -> None:
+    from brigade.datastores import QdrantChunkStore
+
+    store = QdrantChunkStore("http://qdrant")
+    puts: list[dict[str, object]] = []
+
+    def fake_request(method: str, path: str, payload: dict[str, object] | None = None):
+        if method == "GET":
+            return {"result": {"config": {"params": {"vectors": {"size": HASH_FALLBACK_VECTOR_SIZE}}}}}
+        if method == "PUT" and path.endswith("points?wait=true"):
+            puts.append(payload)
+        return {}
+
+    store._request = fake_request
+
+    chunks = [
+        {"chunk_id": f"chunk-{index}", "text": f"body {index}", "chunk_index": index}
+        for index in range(3)
+    ]
+    results = store.upsert_chunks(chunks, batch_size=2)
+
+    assert all(result.ok for result in results)
+    assert len(puts) == 3
+
+
+def test_ollama_embed_batch_single_request(monkeypatch) -> None:
+    client = OllamaEmbeddingClient("http://ollama:11435", "nomic-embed-text:latest")
+    requests: list[dict[str, object]] = []
+
+    def fake_post(path: str, payload: dict[str, object]):
+        requests.append(payload)
+        return {"embeddings": [[0.1, 0.2], [0.3, 0.4]]}
+
+    monkeypatch.setattr(client, "_post_json", fake_post)
+
+    vectors = client.embed_batch(["one", "two"])
+
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
+    assert len(requests) == 1
+    assert requests[0]["input"] == ["one", "two"]
