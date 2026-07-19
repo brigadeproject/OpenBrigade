@@ -443,14 +443,22 @@ def build_chat_status_context(store: StateStore, agent_id: str) -> dict[str, Any
                 {
                     "assignment_id": item.assignment_id,
                     "assigned_to": item.assigned_to,
+                    "assignment": item.assignment[:160],
                     "blockers": item.blockers,
                     "last_error": item.last_error,
                     "consecutive_failures": item.consecutive_failures,
                 }
                 for item in blocked
             ],
+            # Titles ride along so a chief can name blocked work to the
+            # operator instead of citing bare UUIDs.
             "awaiting_human": [
-                item.assignment_id for item in blocked if item.awaiting_human
+                {
+                    "assignment_id": item.assignment_id,
+                    "assignment": item.assignment[:160],
+                }
+                for item in blocked
+                if item.awaiting_human
             ],
             "team_alerts": team_alerts,
         }

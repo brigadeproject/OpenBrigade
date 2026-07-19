@@ -207,8 +207,28 @@ def test_chief_chat_context_contains_live_state(tmp_path):
     assert ada_load["specialties"] == ["python"]
     assert context["blockers"][0]["assignment_id"] == blocked.assignment_id
     assert context["blockers"][0]["blockers"] == ["missing module"]
+    assert context["blockers"][0]["assignment"] == "Fix the importer"
     assert context["awaiting_human"] == []
     assert any(blocked.assignment_id in alert for alert in context["team_alerts"])
+
+
+def test_chief_chat_context_names_awaiting_human_work(tmp_path):
+    store = _store(tmp_path)
+    blocked = _blocked(store)
+    blocked.register_failure(
+        "needs a decision", blockers=["credentials"], awaiting_human=True
+    )
+    store.update_assignment(blocked)
+
+    context = build_chat_status_context(store, "sage")
+
+    # objects, not bare UUIDs — a chief must be able to name the work
+    assert context["awaiting_human"] == [
+        {
+            "assignment_id": blocked.assignment_id,
+            "assignment": "Fix the importer",
+        }
+    ]
 
 
 def test_worker_chat_context_contains_own_state_only(tmp_path):
