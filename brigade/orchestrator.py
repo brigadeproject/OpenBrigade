@@ -171,11 +171,19 @@ class OrchestrationConfig:
 
     # Keys an operator may override live (Redis-backed). Kept in sync with
     # services.RUNTIME_OVERRIDE_KEYS — only these fields are layered per cycle.
+    # (max_agent_iterations is also overridable but is consumed by the runner,
+    # not this config.)
     RUNTIME_OVERRIDE_FIELDS = (
         "proactive_mode",
         "proactive_creation_enabled",
         "max_proactive_creations_per_cycle",
+        "cadence_seconds",
+        "stale_work_seconds",
     )
+    # Override keys whose public name differs from the config field.
+    RUNTIME_OVERRIDE_ALIASES = {
+        "cadence_seconds": "orchestrator_cadence_seconds",
+    }
 
     def with_overrides(self, overrides: Mapping[str, Any] | None) -> OrchestrationConfig:
         """Layer operator runtime overrides onto this config (live, no restart).
@@ -188,9 +196,10 @@ class OrchestrationConfig:
             return self
         updates: dict[str, Any] = {}
         for key in self.RUNTIME_OVERRIDE_FIELDS:
-            if key not in overrides:
+            public_key = self.RUNTIME_OVERRIDE_ALIASES.get(key, key)
+            if public_key not in overrides:
                 continue
-            value = overrides[key]
+            value = overrides[public_key]
             if value is None:
                 continue
             current = getattr(self, key)

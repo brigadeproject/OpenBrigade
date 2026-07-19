@@ -37,6 +37,13 @@ def check_configured_datastores(settings: Settings) -> list[HealthCheck]:
     return checks
 
 
+def check_embedding_surface(settings: Settings) -> HealthCheck:
+    """Reachability of the embedding endpoint (a dedicated Ollama instance)."""
+    if not settings.ollama_embedding_base_url:
+        return HealthCheck(name="embedding", ok=False, detail="not configured")
+    return _check_uri("embedding", settings.ollama_embedding_base_url)
+
+
 def _check_uri(name: str, uri: str) -> HealthCheck:
     parsed = urlparse(uri)
     host = parsed.hostname

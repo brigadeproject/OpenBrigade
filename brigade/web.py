@@ -35,7 +35,7 @@ from brigade.connectors import (
     process_live_connector_message,
     telegram_reply_sender,
 )
-from brigade.health import check_configured_datastores
+from brigade.health import check_configured_datastores, check_embedding_surface
 from brigade.markdown import render_markdown_html
 from brigade.providers import (
     available_model_options,
@@ -379,6 +379,7 @@ def create_app(
             store,
             settings,
             datastore_checks=check_configured_datastores(settings),
+            embedding_check=check_embedding_surface(settings),
             started_at=started_at,
             uptime_seconds=int(time.monotonic() - started_monotonic),
         )

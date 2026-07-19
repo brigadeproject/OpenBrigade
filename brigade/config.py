@@ -24,6 +24,7 @@ class Settings:
     log_level: str = "INFO"
     orchestrator_cadence_seconds: int = 900
     stale_work_seconds: int = 86_400
+    max_agent_iterations: int = 10
     hung_task_seconds: int = 1800
     auto_recover_enabled: bool = True
     max_auto_reissue: int = 2
@@ -275,6 +276,11 @@ def load_settings(
             "BRIGADE_STALE_WORK_SECONDS",
             dotenv,
             config.get("stale_work_seconds", 86_400),
+        ),
+        max_agent_iterations=_env_int(
+            "BRIGADE_MAX_AGENT_ITERATIONS",
+            dotenv,
+            config.get("max_agent_iterations", 10),
         ),
         hung_task_seconds=_env_int(
             "BRIGADE_HUNG_TASK_SECONDS",

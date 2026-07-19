@@ -202,6 +202,7 @@ SAFE_CONFIG_KEYS = {
     "log_level": str,
     "orchestrator_cadence_seconds": int,
     "stale_work_seconds": int,
+    "max_agent_iterations": int,
     "proactive_mode": str,
     "proactive_creation_enabled": bool,
     "max_proactive_proposals_per_cycle": int,
@@ -244,6 +245,16 @@ RUNTIME_OVERRIDE_KEYS = {
     "proactive_mode": str,
     "proactive_creation_enabled": bool,
     "max_proactive_creations_per_cycle": int,
+    "orchestrator_cadence_seconds": int,
+    "stale_work_seconds": int,
+    "max_agent_iterations": int,
+}
+# Floors for integer runtime overrides where zero (or near-zero) would wedge
+# the daemon: a 0s cadence busy-loops, a 0 iteration budget starves every agent.
+RUNTIME_OVERRIDE_MINIMUMS = {
+    "orchestrator_cadence_seconds": 30,
+    "stale_work_seconds": 300,
+    "max_agent_iterations": 1,
 }
 
 VALID_PROACTIVE_MODES = ("off", "propose", "create")
@@ -2314,6 +2325,7 @@ def build_cockpit_payload(
     datastore_checks: list[HealthCheck],
     started_at: str,
     uptime_seconds: int,
+    embedding_check: HealthCheck | None = None,
 ) -> dict[str, Any]:
     dashboard = build_dashboard_payload_data(store)
     ops_room = build_ops_room_payload(store)
@@ -2377,6 +2389,13 @@ def build_cockpit_payload(
             {"name": check.name, "ok": check.ok, "detail": check.detail}
             for check in datastore_checks
         ],
+        "embedding": {
+            "provider": "ollama" if settings.ollama_embedding_base_url else None,
+            "model": settings.ollama_embedding_model,
+            "base_url": settings.ollama_embedding_base_url,
+            "ok": embedding_check.ok if embedding_check else None,
+            "detail": embedding_check.detail if embedding_check else None,
+        },
         "models": {
             "default_provider": settings.default_provider,
             "default_model": settings.default_model,
@@ -2414,8 +2433,15 @@ def build_settings_payload(
         "config_hash": config_file_hash(settings.config_path),
         "data_dir": str(settings.data_dir),
         "log_level": settings.log_level,
-        "orchestrator_cadence_seconds": settings.orchestrator_cadence_seconds,
-        "stale_work_seconds": settings.stale_work_seconds,
+        "orchestrator_cadence_seconds": overrides.get(
+            "orchestrator_cadence_seconds", settings.orchestrator_cadence_seconds
+        ),
+        "stale_work_seconds": overrides.get(
+            "stale_work_seconds", settings.stale_work_seconds
+        ),
+        "max_agent_iterations": overrides.get(
+            "max_agent_iterations", settings.max_agent_iterations
+        ),
         "proactive_mode": overrides.get("proactive_mode", settings.proactive_mode),
         "proactive_creation_enabled": overrides.get(
             "proactive_creation_enabled", settings.proactive_creation_enabled
@@ -2568,8 +2594,9 @@ def _coerce_runtime_value(key: str, value: Any) -> Any:
             number = int(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{key} expects an integer") from exc
-        if number < 0:
-            raise ValueError(f"{key} must be >= 0")
+        minimum = RUNTIME_OVERRIDE_MINIMUMS.get(key, 0)
+        if number < minimum:
+            raise ValueError(f"{key} must be >= {minimum}")
         return number
     text = str(value).strip()
     if key == "proactive_mode" and text not in VALID_PROACTIVE_MODES:

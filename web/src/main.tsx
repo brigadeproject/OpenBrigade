@@ -265,6 +265,13 @@ type CockpitPayload = {
   };
   alerts: AlertRecord[];
   datastores: { name: string; ok: boolean; detail: string }[];
+  embedding?: {
+    provider?: string | null;
+    model?: string | null;
+    base_url?: string | null;
+    ok?: boolean | null;
+    detail?: string | null;
+  } | null;
   models: {
     default_provider: string;
     default_model: string;
@@ -1197,6 +1204,60 @@ function TelemetryView({
     creationDraft !== proactiveCreationEnabled ||
     maxDraft !== String(maxProactivePerCycle);
 
+  const cadenceSetting = Number(settings?.orchestrator_cadence_seconds ?? 900);
+  const staleSetting = Number(settings?.stale_work_seconds ?? 86_400);
+  const iterationsSetting = Number(settings?.max_agent_iterations ?? 10);
+  const [cadenceDraft, setCadenceDraft] = useState(String(cadenceSetting));
+  const [staleDraft, setStaleDraft] = useState(String(staleSetting));
+  const [iterationsDraft, setIterationsDraft] = useState(String(iterationsSetting));
+  const [savingRuntime, setSavingRuntime] = useState(false);
+
+  useEffect(() => {
+    setCadenceDraft(String(cadenceSetting));
+    setStaleDraft(String(staleSetting));
+    setIterationsDraft(String(iterationsSetting));
+  }, [cadenceSetting, staleSetting, iterationsSetting]);
+
+  const runtimeDirty =
+    cadenceDraft !== String(cadenceSetting) ||
+    staleDraft !== String(staleSetting) ||
+    iterationsDraft !== String(iterationsSetting);
+
+  const saveRuntime = async () => {
+    const cadence = Number.parseInt(cadenceDraft, 10);
+    const stale = Number.parseInt(staleDraft, 10);
+    const iterations = Number.parseInt(iterationsDraft, 10);
+    if (!Number.isFinite(cadence) || cadence < 30) {
+      setStatus("Orchestrator cadence must be at least 30 seconds");
+      return;
+    }
+    if (!Number.isFinite(stale) || stale < 300) {
+      setStatus("Stale work threshold must be at least 300 seconds");
+      return;
+    }
+    if (!Number.isFinite(iterations) || iterations < 1) {
+      setStatus("Max tool iterations must be at least 1");
+      return;
+    }
+    setSavingRuntime(true);
+    try {
+      const next = await api<SettingsPayload>("/api/settings/runtime", {
+        method: "PUT",
+        json: {
+          orchestrator_cadence_seconds: cadence,
+          stale_work_seconds: stale,
+          max_agent_iterations: iterations,
+        },
+      });
+      onSettingsChange(next);
+      setStatus("Runtime settings saved — applies on the next orchestrator cycle.");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      setSavingRuntime(false);
+    }
+  };
+
   const saveProactive = async () => {
     const parsedMax = Number.parseInt(maxDraft, 10);
     if (!Number.isFinite(parsedMax) || parsedMax < 0) {
@@ -1252,21 +1313,35 @@ function TelemetryView({
     { key: "Default provider", value: settingValue("default_provider") },
     { key: "Default model", value: settingValue("default_model") },
     { key: "Log level", value: settingValue("log_level") },
-    {
-      key: "Orchestrator cadence",
-      value: settings?.orchestrator_cadence_seconds != null
-        ? `${settingValue("orchestrator_cadence_seconds")}s`
-        : "—",
-    },
     { key: "Store backend", value: settingValue("store_backend") },
     { key: "Config hash", value: settingValue("config_hash") },
     { key: "API version", value: settingValue("api_version") },
   ];
 
+  const embedding = cockpit?.embedding || null;
+  const embeddingProvider = embedding?.provider
+    ? embedding.provider.charAt(0).toUpperCase() + embedding.provider.slice(1)
+    : null;
   const storageRows: { key: string; value: React.ReactNode }[] = [
     { key: "Data directory", value: settingValue("data_dir") },
     { key: "Secret store", value: settingValue("secret_store_path") },
     { key: "Ollama base URL", value: settingValue("ollama_base_url") },
+    {
+      key: `Embedding — ${embeddingProvider ?? "unconfigured"}`,
+      value: embedding?.base_url ? (
+        <>
+          {embedding.base_url}{" "}
+          <span
+            className={`ob-badge ${embedding.ok ? "ok" : "warn"}`}
+            title={embedding.detail || undefined}
+          >
+            {embedding.ok == null ? "—" : embedding.ok ? "UP" : "DOWN"}
+          </span>
+        </>
+      ) : (
+        "not configured"
+      ),
+    },
     { key: "Config path", value: settingValue("config_path") },
   ];
 
@@ -1318,112 +1393,175 @@ function TelemetryView({
       </div>
 
       <div className="ob-telemetry-panels">
-        <div className="ob-panel ob-tele-panel">
-          <div className="ob-panel-head">
-            <span className="ob-panel-title">Model Availability</span>
-            <span className={`ob-badge ${availableModels ? "ok" : "warn"}`}>
-              {models ? `${availableModels}/${options.length}` : "—"}
-            </span>
-          </div>
-          <div className="ob-tele-list">
-            {options.length === 0 && <p className="muted">No models reported.</p>}
-            {options.map((opt) => (
-              <TelemetryRow
-                key={`${opt.provider}:${opt.model}`}
-                tone={opt.available ? "ok" : opt.configured ? "warn" : "bad"}
-                name={opt.label}
-                badge={opt.is_default ? <span className="ob-badge subtle">DEFAULT</span> : null}
-                detail={`${opt.provider} · ${opt.route_type}${opt.detail ? ` · ${opt.detail}` : ""}`}
-                tag={opt.available ? "AVAILABLE" : opt.configured ? "CONFIGURED" : "OFFLINE"}
-              />
-            ))}
-          </div>
-        </div>
-
-        <div className="ob-panel ob-tele-panel">
-          <div className="ob-panel-head">
-            <span className="ob-panel-title">Infrastructure</span>
-            <span className={`ob-badge ${allStoresOk ? "ok" : "warn"}`}>
-              {datastores.length ? `${okStores}/${datastores.length} OK` : "—"}
-            </span>
-          </div>
-          <div className="ob-tele-list">
-            {datastores.length === 0 && <p className="muted">No datastores configured.</p>}
-            {datastores.map((store) => (
-              <TelemetryRow
-                key={store.name}
-                tone={store.ok ? "ok" : "bad"}
-                name={store.name}
-                detail={store.detail}
-                tag={store.ok ? "UP" : "DOWN"}
-              />
-            ))}
-          </div>
-        </div>
-
-        <div className="ob-panel ob-tele-panel">
-          <div className="ob-panel-head">
-            <span className="ob-panel-title">Local Inference</span>
-            <span className={`ob-badge ${infBusy ? "warn" : "ok"}`}>
-              {localInference?.status ? localInference.status.toUpperCase() : "—"}
-            </span>
-          </div>
-          <div className="ob-sys-rows">
-            <div className="ob-sys-row">
-              <span>Status</span>
-              <span className="ob-sys-val">{localInference?.status || "—"}</span>
+        <div className="ob-tele-col">
+          <div className="ob-panel ob-tele-panel">
+            <div className="ob-panel-head">
+              <span className="ob-panel-title">Model Availability</span>
+              <span className={`ob-badge ${availableModels ? "ok" : "warn"}`}>
+                {models ? `${availableModels}/${options.length}` : "—"}
+              </span>
             </div>
-            <div className="ob-sys-row">
-              <span>Holder</span>
-              <span className="ob-sys-val">{localInference?.holder || "idle"}</span>
+            <div className="ob-tele-list">
+              {options.length === 0 && <p className="muted">No models reported.</p>}
+              {options.map((opt) => (
+                <TelemetryRow
+                  key={`${opt.provider}:${opt.model}`}
+                  tone={opt.available ? "ok" : opt.configured ? "warn" : "bad"}
+                  name={opt.label}
+                  badge={opt.is_default ? <span className="ob-badge subtle">DEFAULT</span> : null}
+                  detail={`${opt.provider} · ${opt.route_type}${opt.detail ? ` · ${opt.detail}` : ""}`}
+                  tag={opt.available ? "AVAILABLE" : opt.configured ? "CONFIGURED" : "OFFLINE"}
+                />
+              ))}
             </div>
-            <div className="ob-sys-row">
-              <span>Cloud jobs</span>
-              <span className="ob-sys-val">{cloudJobs.length}</span>
+          </div>
+        </div>
+
+        <div className="ob-tele-col">
+          <div className="ob-panel ob-tele-panel">
+            <div className="ob-panel-head">
+              <span className="ob-panel-title">Infrastructure</span>
+              <span className={`ob-badge ${allStoresOk ? "ok" : "warn"}`}>
+                {datastores.length ? `${okStores}/${datastores.length} OK` : "—"}
+              </span>
             </div>
-            {cloudJobs.slice(0, 4).map((job, idx) => (
-              <div key={job.job_id || idx} className="ob-sys-row">
-                <span>{job.agent_id || job.job_id || `job ${idx + 1}`}</span>
-                <span className="ob-sys-val">
-                  {[job.provider, job.model, job.status].filter(Boolean).join(" · ") || "—"}
-                </span>
+            <div className="ob-tele-list">
+              {datastores.length === 0 && <p className="muted">No datastores configured.</p>}
+              {datastores.map((store) => (
+                <TelemetryRow
+                  key={store.name}
+                  tone={store.ok ? "ok" : "bad"}
+                  name={store.name}
+                  detail={store.detail}
+                  tag={store.ok ? "UP" : "DOWN"}
+                />
+              ))}
+            </div>
+          </div>
+
+          <div className="ob-panel ob-tele-panel">
+            <div className="ob-panel-head">
+              <span className="ob-panel-title">Storage &amp; Config</span>
+            </div>
+            <div className="ob-sys-rows">
+              {storageRows.map((row) => (
+                <div key={row.key} className="ob-sys-row">
+                  <span>{row.key}</span>
+                  <span className="ob-sys-val">{row.value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="ob-panel ob-tele-panel">
+            <div className="ob-panel-head">
+              <span className="ob-panel-title">Local Inference</span>
+              <span className={`ob-badge ${infBusy ? "warn" : "ok"}`}>
+                {localInference?.status ? localInference.status.toUpperCase() : "—"}
+              </span>
+            </div>
+            <div className="ob-sys-rows">
+              <div className="ob-sys-row">
+                <span>Status</span>
+                <span className="ob-sys-val">{localInference?.status || "—"}</span>
               </div>
-            ))}
+              <div className="ob-sys-row">
+                <span>Holder</span>
+                <span className="ob-sys-val">{localInference?.holder || "idle"}</span>
+              </div>
+              <div className="ob-sys-row">
+                <span>Cloud jobs</span>
+                <span className="ob-sys-val">{cloudJobs.length}</span>
+              </div>
+              {cloudJobs.slice(0, 4).map((job, idx) => (
+                <div key={job.job_id || idx} className="ob-sys-row">
+                  <span>{job.agent_id || job.job_id || `job ${idx + 1}`}</span>
+                  <span className="ob-sys-val">
+                    {[job.provider, job.model, job.status].filter(Boolean).join(" · ") || "—"}
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
 
-        <div className="ob-panel ob-tele-panel">
-          <div className="ob-panel-head">
-            <span className="ob-panel-title">Storage &amp; Config</span>
-          </div>
-          <div className="ob-sys-rows">
-            {storageRows.map((row) => (
-              <div key={row.key} className="ob-sys-row">
-                <span>{row.key}</span>
-                <span className="ob-sys-val">{row.value}</span>
+        <div className="ob-tele-col">
+          <div className="ob-panel ob-tele-panel">
+            <div className="ob-panel-head">
+              <span className="ob-panel-title">OpenBrigade Settings</span>
+              {unsafeBind && <span className="ob-badge warn">UNSAFE BIND</span>}
+            </div>
+            <div className="ob-sys-rows">
+              {settingsRows.map((row) => (
+                <div key={row.key} className="ob-sys-row">
+                  <span>{row.key}</span>
+                  <span className="ob-sys-val">{row.value}</span>
+                </div>
+              ))}
+            </div>
+            <div className="ob-tele-controls ob-settings-controls">
+              <p className="ob-tele-control-note">
+                Live runtime overrides — take effect on the next orchestrator cycle,
+                no redeploy.
+              </p>
+              <div className="ob-control-row">
+                <label htmlFor="ob-runtime-cadence">Cadence (s)</label>
+                <input
+                  id="ob-runtime-cadence"
+                  className="ob-mo-input ob-control-number"
+                  type="number"
+                  min={30}
+                  step={1}
+                  value={cadenceDraft}
+                  disabled={!canEdit || savingRuntime}
+                  onChange={(event) => setCadenceDraft(event.target.value)}
+                />
               </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="ob-panel ob-tele-panel">
-          <div className="ob-panel-head">
-            <span className="ob-panel-title">OpenBrigade Settings</span>
-            {unsafeBind && <span className="ob-badge warn">UNSAFE BIND</span>}
-          </div>
-          <div className="ob-sys-rows">
-            {settingsRows.map((row) => (
-              <div key={row.key} className="ob-sys-row">
-                <span>{row.key}</span>
-                <span className="ob-sys-val">{row.value}</span>
+              <div className="ob-control-row">
+                <label htmlFor="ob-runtime-stale">Stale work (s)</label>
+                <input
+                  id="ob-runtime-stale"
+                  className="ob-mo-input ob-control-number"
+                  type="number"
+                  min={300}
+                  step={1}
+                  value={staleDraft}
+                  disabled={!canEdit || savingRuntime}
+                  onChange={(event) => setStaleDraft(event.target.value)}
+                />
               </div>
-            ))}
+              <div className="ob-control-row">
+                <label htmlFor="ob-runtime-iterations">Max tool iterations</label>
+                <input
+                  id="ob-runtime-iterations"
+                  className="ob-mo-input ob-control-number"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={iterationsDraft}
+                  disabled={!canEdit || savingRuntime}
+                  onChange={(event) => setIterationsDraft(event.target.value)}
+                />
+              </div>
+              <div className="ob-control-actions">
+                {!canEdit && (
+                  <span className="muted">Operator or owner role required to edit.</span>
+                )}
+                <button
+                  type="button"
+                  className="ob-mo-btn primary"
+                  disabled={!canEdit || savingRuntime || !runtimeDirty}
+                  onClick={saveRuntime}
+                >
+                  {savingRuntime ? "Saving…" : "Save"}
+                </button>
+              </div>
+            </div>
           </div>
-        </div>
 
-        <div className="ob-panel ob-tele-panel ob-tele-controls">
-          <div className="ob-panel-head">
-            <span className="ob-panel-title">Proactive Continuation</span>
+          <div className="ob-panel ob-tele-panel ob-tele-controls">
+            <div className="ob-panel-head">
+              <span className="ob-panel-title">Proactive Continuation</span>
             {overriddenKeys.length > 0 ? (
               <span className="ob-badge subtle">RUNTIME OVERRIDE</span>
             ) : (
@@ -1486,6 +1624,7 @@ function TelemetryView({
             >
               {savingProactive ? "Saving…" : "Save"}
             </button>
+          </div>
           </div>
         </div>
       </div>

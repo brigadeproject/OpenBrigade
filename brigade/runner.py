@@ -62,7 +62,7 @@ MAX_PROVIDER_RETRIES = 3
 # Tool-call budget per dispatch cycle. After it is spent, one extra no-tools
 # wrap-up completion runs so the cycle ends with a real progress report
 # (a cycle therefore costs at most MAX_AGENT_ITERATIONS + 1 model calls).
-MAX_AGENT_ITERATIONS = int(os.environ.get("BRIGADE_MAX_AGENT_ITERATIONS", "6"))
+MAX_AGENT_ITERATIONS = int(os.environ.get("BRIGADE_MAX_AGENT_ITERATIONS", "10"))
 MAX_COMPLETION_VALIDATION_RETRIES = 2
 # Orchestrator-created planning assignments exist to decompose work into
 # child tasks; completing one without creating any tasks is the planning
@@ -440,7 +440,8 @@ def _complete_assignment_with_tools(
     native_tools = native_tool_specs(registry)
     completion_rejections = 0
     dispatched_tools: set[str] = set()
-    for _ in range(MAX_AGENT_ITERATIONS):
+    iteration_budget = _iteration_budget(store)
+    for _ in range(iteration_budget):
         prompt = build_assignment_prompt(
             agent,
             assignment,
@@ -579,9 +580,21 @@ def _complete_assignment_with_tools(
         responses,
         observations,
         dispatched_tools,
+        iteration_budget=iteration_budget,
         lock_local=lock_local,
     )
     return responses, parsed, observations
+
+
+def _iteration_budget(store: StateStore) -> int:
+    """Tool-call budget for one dispatch cycle, honoring the operator's live
+    runtime override (max_agent_iterations) when one is set."""
+    try:
+        raw = (store.runtime_overrides() or {}).get("max_agent_iterations")
+        override = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        override = 0
+    return override if override >= 1 else MAX_AGENT_ITERATIONS
 
 
 def _wrap_up_exhausted_cycle(
@@ -595,6 +608,7 @@ def _wrap_up_exhausted_cycle(
     observations: list[dict[str, Any]],
     dispatched_tools: set[str],
     *,
+    iteration_budget: int = MAX_AGENT_ITERATIONS,
     lock_local: bool = False,
 ) -> ParsedAgentResponse:
     """One extra no-tools completion after the tool budget is spent, so the
@@ -603,7 +617,7 @@ def _wrap_up_exhausted_cycle(
     re-orients from scratch, burning the budget the same way again."""
     fallback = ParsedAgentResponse(
         status="working",
-        summary=_exhausted_cycle_fallback_summary(observations),
+        summary=_exhausted_cycle_fallback_summary(observations, iteration_budget),
         blockers=[],
     )
     prompt = "\n".join(
@@ -686,12 +700,15 @@ def _wrap_up_exhausted_cycle(
     return parsed
 
 
-def _exhausted_cycle_fallback_summary(observations: list[dict[str, Any]]) -> str:
+def _exhausted_cycle_fallback_summary(
+    observations: list[dict[str, Any]],
+    iteration_budget: int = MAX_AGENT_ITERATIONS,
+) -> str:
     counts = Counter(str(item.get("tool") or "unknown") for item in observations)
     tools = ", ".join(f"{name} x{count}" for name, count in counts.most_common())
     detail = f" (tools used this cycle: {tools})" if tools else ""
     return (
-        f"tool iteration budget exhausted after {MAX_AGENT_ITERATIONS} "
+        f"tool iteration budget exhausted after {iteration_budget} "
         f"iterations{detail}; wrap-up summary unavailable"
     )
 

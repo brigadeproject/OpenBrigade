@@ -2274,12 +2274,13 @@ def _main(argv: Sequence[str] | None = None) -> int:
             except ValueError:  # not the main thread (tests)
                 break
         while (max_cycles is None or completed < max_cycles) and not shutdown.is_set():
+            cycle_config = OrchestrationConfig.from_settings(settings).with_overrides(
+                store.runtime_overrides()
+            )
             run_full_cycle(
                 store,
                 provider=provider,
-                config=OrchestrationConfig.from_settings(settings).with_overrides(
-                    store.runtime_overrides()
-                ),
+                config=cycle_config,
             )
             if not args.no_run_agents and not shutdown.is_set():
                 agent_results.extend(
@@ -2293,7 +2294,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
             completed += 1
             if max_cycles is not None and completed >= max_cycles:
                 break
-            # Event.wait wakes immediately on SIGTERM, unlike time.sleep
+            # Event.wait wakes immediately on SIGTERM, unlike time.sleep.
+            # Re-read the cadence each cycle so a runtime override from the
+            # GUI takes effect without a restart (explicit --sleep-seconds
+            # still wins).
+            if args.sleep_seconds is None:
+                sleep_seconds = cycle_config.cadence_seconds
             if shutdown.wait(sleep_seconds):
                 break
         print(
