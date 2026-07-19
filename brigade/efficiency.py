@@ -19,9 +19,11 @@ from typing import Any
 
 from brigade.orchestrator import orchestration_event, route_to_chief
 from brigade.schemas import (
+    TERMINAL_STATUSES,
     Assignment,
     AssignmentKind,
     AssignmentStatus,
+    ChatMessage,
     Priority,
     build_proposal,
 )
@@ -206,6 +208,7 @@ def materialize_due_recurrences(
                 "idempotency_key": key,
             }
             materialized.append(entry)
+            recurrence["last_assignment_id"] = persisted.assignment_id
             events.append(
                 orchestration_event(
                     EVENT_RECURRENCE_MATERIALIZED,
@@ -232,15 +235,138 @@ def materialize_due_recurrences(
     return {"materialized": materialized, "events": events}
 
 
+EVENT_RECURRENCE_BRIEFING_DELIVERED = "recurrence_briefing_delivered"
+
+
+def deliver_recurrence_briefings(
+    store: StateStore,
+    *,
+    telegram_bot_token: str | None = None,
+    operator_telegram_chat_id: str | None = None,
+) -> dict[str, Any]:
+    """Deliver finished scheduled-briefing output back to the operator.
+
+    A chat-created recurrence carries ``template.deliver_to`` (the operator's
+    chief-chat thread channel and persona). Once its most recently
+    materialized assignment reaches a terminal state, the executive summary
+    lands in that thread — and on the operator Telegram when configured —
+    exactly once per materialization. In-flight work is skipped and retried
+    on a later cycle."""
+    delivered: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    for recurrence in store.recurrences(enabled=True):
+        deliver_to = (recurrence.get("template") or {}).get("deliver_to")
+        if not isinstance(deliver_to, dict) or not deliver_to.get("channel"):
+            continue
+        assignment_id = str(recurrence.get("last_assignment_id") or "")
+        if not assignment_id or assignment_id == recurrence.get(
+            "last_delivered_assignment_id"
+        ):
+            continue
+        summary = _terminal_assignment_summary(store, assignment_id)
+        if summary is None:
+            continue
+        status, text = summary
+        title = str((recurrence.get("template") or {}).get("assignment") or "scheduled job")
+        body = "\n".join(
+            [
+                f"Scheduled briefing — {title[:120]}",
+                f"(task {assignment_id[:8]} finished {status})",
+                "",
+                text or "No summary was produced.",
+            ]
+        )
+        sender = str(deliver_to.get("agent_id") or "front_desk")
+        recipient = str(deliver_to.get("operator") or "operator")
+        store.add_message(
+            ChatMessage(
+                channel=str(deliver_to["channel"]),
+                sender=sender,
+                recipient=recipient,
+                content=body,
+                metadata={
+                    "kind": "chief_chat_briefing",
+                    "conversation_id": str(deliver_to["channel"]),
+                    "agent_id": sender,
+                    "recurrence_id": recurrence.get("recurrence_id"),
+                    "assignment_id": assignment_id,
+                },
+            )
+        )
+        telegram_status = "skipped"
+        if telegram_bot_token and operator_telegram_chat_id:
+            # Imported here: connectors is optional wiring, not a detection
+            # dependency.
+            from brigade.connectors import send_telegram_message
+
+            try:
+                result = send_telegram_message(
+                    telegram_bot_token, chat_id=operator_telegram_chat_id, text=body
+                )
+                telegram_status = getattr(result, "status", "unknown")
+            except Exception as exc:  # pragma: no cover - defensive
+                telegram_status = f"failed: {exc}"
+        recurrence["last_delivered_assignment_id"] = assignment_id
+        recurrence["updated_at"] = utc_now().isoformat()
+        store.update_recurrence(recurrence)
+        entry = {
+            "recurrence_id": recurrence.get("recurrence_id"),
+            "assignment_id": assignment_id,
+            "channel": deliver_to["channel"],
+            "telegram": telegram_status,
+        }
+        delivered.append(entry)
+        events.append(
+            orchestration_event(
+                EVENT_RECURRENCE_BRIEFING_DELIVERED,
+                f"Recurrence {recurrence.get('recurrence_id')} delivered briefing "
+                f"from assignment {assignment_id}.",
+                source="orchestrator_recurrence",
+                decision="delivered",
+                trigger="recurrence_briefing",
+                assignment_id=assignment_id,
+                payload=entry,
+            )
+        )
+    return {"delivered": delivered, "events": events}
+
+
+def _terminal_assignment_summary(
+    store: StateStore, assignment_id: str
+) -> tuple[str, str] | None:
+    """(final status, best summary) once the assignment finished, else None."""
+    active = store.find_assignment(assignment_id)
+    if active is not None:
+        if active.status not in TERMINAL_STATUSES:
+            return None
+        return active.status.value, str(active.progress_summary or "")
+    for entry in store.assignment_history():
+        record = entry.get("record") or {}
+        if str(record.get("assignment_id") or "") == assignment_id:
+            return (
+                str(entry.get("final_status") or "unknown"),
+                str(entry.get("executive_summary") or record.get("progress_summary") or ""),
+            )
+    return None
+
+
 def run_recurrence_step(
     store: StateStore,
     *,
     threshold: int = 3,
     lookback_days: int = 14,
     now: datetime | None = None,
+    telegram_bot_token: str | None = None,
+    operator_telegram_chat_id: str | None = None,
 ) -> dict[str, Any]:
-    """Cycle step 5: materialize due recurrences, then detect new patterns."""
+    """Cycle step 5: materialize due recurrences, deliver finished briefings,
+    then detect new patterns."""
     materialization = materialize_due_recurrences(store, now=now)
+    delivery = deliver_recurrence_briefings(
+        store,
+        telegram_bot_token=telegram_bot_token,
+        operator_telegram_chat_id=operator_telegram_chat_id,
+    )
     detection = detect_recurring_work(
         store,
         threshold=threshold,
@@ -249,8 +375,13 @@ def run_recurrence_step(
     )
     return {
         "materialized": materialization["materialized"],
+        "delivered": delivery["delivered"],
         "proposals": detection["proposals"],
-        "events": [*materialization["events"], *detection["events"]],
+        "events": [
+            *materialization["events"],
+            *delivery["events"],
+            *detection["events"],
+        ],
     }
 
 

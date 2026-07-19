@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
+import socket
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -72,6 +75,36 @@ class ToolRegistry:
             return handler(context, arguments)
         except Exception as exc:
             return ToolResult(False, str(exc))
+
+
+def native_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
+    """Convert registry specs to the OpenAI/Ollama function-tool format."""
+    specs = []
+    for spec in registry.specs():
+        properties = {
+            name: {"description": description}
+            for name, description in spec.argument_schema.items()
+        }
+        required = [
+            name
+            for name, description in spec.argument_schema.items()
+            if "optional" not in str(description).lower()
+        ]
+        specs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                    },
+                },
+            }
+        )
+    return specs
 
 
 def default_tool_registry() -> ToolRegistry:
@@ -396,15 +429,55 @@ def _shell(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     )
 
 
+def _private_address_reason(url: str) -> str | None:
+    """Return why a URL must not be fetched, or None if it looks public.
+
+    Model-directed fetches run inside the deployment network, so anything
+    that resolves to loopback, RFC1918, link-local, or otherwise non-global
+    space (the Docker service mesh, the host, cloud metadata endpoints) is
+    an SSRF vector, not a reference lookup.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    hostname = parsed.hostname
+    if not hostname:
+        return "url has no hostname"
+    try:
+        resolved = socket.getaddrinfo(hostname, parsed.port or 0, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError) as exc:
+        return f"hostname did not resolve: {exc}"
+    for info in resolved:
+        address = ipaddress.ip_address(info[4][0])
+        if not address.is_global:
+            return f"{hostname} resolves to non-public address {address}"
+    return None
+
+
+class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect target so a public URL cannot bounce the
+    fetch into private address space."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.startswith(("https://", "http://")):
+            raise urllib.error.URLError("redirect blocked: non-http(s) target")
+        reason = _private_address_reason(newurl)
+        if reason is not None:
+            raise urllib.error.URLError(f"redirect blocked: {reason}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     del context
     url = _required_text(arguments, "url")
     if not (url.startswith("https://") or url.startswith("http://")):
         return ToolResult(False, "url must start with http:// or https://")
+    reason = _private_address_reason(url)
+    if reason is not None:
+        return ToolResult(False, f"web_fetch refused: {reason}")
     max_chars = min(int(arguments.get("max_chars") or 4000), 12_000)
     request = urllib.request.Request(url, headers={"User-Agent": "OpenBrigade/1.0"})
+    opener = urllib.request.build_opener(_PublicOnlyRedirectHandler())
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with opener.open(request, timeout=20) as response:
             body = response.read(max_chars + 1).decode("utf-8", errors="replace")
     except urllib.error.URLError as exc:
         return ToolResult(False, f"web_fetch failed: {exc}")

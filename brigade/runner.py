@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -36,6 +37,7 @@ from brigade.tools import (
     ToolContext,
     ToolRegistry,
     default_tool_registry,
+    native_tool_specs,
 )
 from brigade.workspace import (
     HeartbeatValidationError,
@@ -57,7 +59,10 @@ LOCAL_INFERENCE_BACKPRESSURE_PREFIXES = (
     "local inference already held by ",
 )
 MAX_PROVIDER_RETRIES = 3
-MAX_AGENT_ITERATIONS = 6
+# Tool-call budget per dispatch cycle. After it is spent, one extra no-tools
+# wrap-up completion runs so the cycle ends with a real progress report
+# (a cycle therefore costs at most MAX_AGENT_ITERATIONS + 1 model calls).
+MAX_AGENT_ITERATIONS = int(os.environ.get("BRIGADE_MAX_AGENT_ITERATIONS", "6"))
 MAX_COMPLETION_VALIDATION_RETRIES = 2
 # Orchestrator-created planning assignments exist to decompose work into
 # child tasks; completing one without creating any tasks is the planning
@@ -432,7 +437,7 @@ def _complete_assignment_with_tools(
     responses: list[ModelResponse] = []
     observations: list[dict[str, Any]] = []
     context = ToolContext(agent=agent, assignment=assignment, store=store)
-    native_tools = _native_tool_specs(registry)
+    native_tools = native_tool_specs(registry)
     completion_rejections = 0
     dispatched_tools: set[str] = set()
     for _ in range(MAX_AGENT_ITERATIONS):
@@ -564,12 +569,131 @@ def _complete_assignment_with_tools(
         observation = result.to_observation(parsed.tool_name or "unknown")
         observation["output"] = _truncate(str(observation["output"]), MAX_OBSERVATION_CHARS)
         observations.append(observation)
-    exhausted = ParsedAgentResponse(
+    parsed = _wrap_up_exhausted_cycle(
+        agent,
+        assignment,
+        store,
+        provider,
+        registry,
+        context,
+        responses,
+        observations,
+        dispatched_tools,
+        lock_local=lock_local,
+    )
+    return responses, parsed, observations
+
+
+def _wrap_up_exhausted_cycle(
+    agent,
+    assignment: Assignment,
+    store: StateStore,
+    provider: ModelProvider,
+    registry: ToolRegistry,
+    context: ToolContext,
+    responses: list[ModelResponse],
+    observations: list[dict[str, Any]],
+    dispatched_tools: set[str],
+    *,
+    lock_local: bool = False,
+) -> ParsedAgentResponse:
+    """One extra no-tools completion after the tool budget is spent, so the
+    cycle ends with the model's own progress report. Without it the generic
+    exhaustion message overwrites progress_summary and the next cycle
+    re-orients from scratch, burning the budget the same way again."""
+    fallback = ParsedAgentResponse(
         status="working",
-        summary=f"tool iteration budget exhausted after {MAX_AGENT_ITERATIONS} iterations",
+        summary=_exhausted_cycle_fallback_summary(observations),
         blockers=[],
     )
-    return responses, exhausted, observations
+    prompt = "\n".join(
+        [
+            build_assignment_prompt(
+                agent,
+                assignment,
+                store,
+                registry,
+                observations=observations,
+            ),
+            "",
+            "TOOL BUDGET EXHAUSTED: you have used every tool iteration for this "
+            "cycle. Do not reply with a tool_call — it will be discarded. Reply "
+            "with a status JSON (working, blocked, or awaiting_human; complete "
+            "only if the assignment is genuinely done) whose summary records "
+            "concrete progress for your next cycle: what you examined, what you "
+            "created or changed (exact file paths), and the immediate next step.",
+        ]
+    )
+    try:
+        response = _locked_complete_with_retries(
+            store,
+            agent.agent_id,
+            provider,
+            prompt,
+            lock_local=lock_local,
+        )
+    except Exception as exc:
+        LOGGER.warning(
+            "agent_wrap_up_failed",
+            extra={
+                "agent_id": agent.agent_id,
+                "assignment_id": assignment.assignment_id,
+                "error": str(exc),
+            },
+        )
+        return fallback
+    responses.append(response)
+    parsed = parse_agent_response(response.text)
+    if parsed.status == "tool_call" or not parsed.summary.strip():
+        return fallback
+    if parsed.status == "complete" and assignment.kind != AssignmentKind.REST:
+        # No retry budget left for completion validation, so a claim that
+        # fails it is downgraded to progress instead of re-asked.
+        if assignment.source in DECOMPOSITION_SOURCES and not (
+            DECOMPOSITION_TOOLS & dispatched_tools
+        ):
+            return replace(
+                parsed,
+                status="working",
+                summary=(
+                    "completion claimed at wrap-up, but this planning assignment "
+                    "created no tasks (no create_subtasks or delegate calls); "
+                    f"treating as progress. Original claim: {parsed.summary}"
+                ),
+            )
+        missing = _missing_claimed_files(parsed.summary, context.workspace, store)
+        if missing:
+            return replace(
+                parsed,
+                status="working",
+                summary=(
+                    "completion claimed at wrap-up, but these files do not exist "
+                    f"in the workspace: {', '.join(missing)}; treating as "
+                    f"progress. Original claim: {parsed.summary}"
+                ),
+            )
+        return parsed
+    if parsed.status in ("working", "blocked", "awaiting_human"):
+        unverified = _missing_claimed_files(parsed.summary, context.workspace, store)
+        if unverified:
+            parsed = replace(
+                parsed,
+                summary=(
+                    f"{parsed.summary} [validator: files mentioned but not "
+                    f"found in workspace: {', '.join(unverified)}]"
+                ),
+            )
+    return parsed
+
+
+def _exhausted_cycle_fallback_summary(observations: list[dict[str, Any]]) -> str:
+    counts = Counter(str(item.get("tool") or "unknown") for item in observations)
+    tools = ", ".join(f"{name} x{count}" for name, count in counts.most_common())
+    detail = f" (tools used this cycle: {tools})" if tools else ""
+    return (
+        f"tool iteration budget exhausted after {MAX_AGENT_ITERATIONS} "
+        f"iterations{detail}; wrap-up summary unavailable"
+    )
 
 
 _FILE_CLAIM_RE = re.compile(
@@ -1031,36 +1155,6 @@ def _handle_heartbeat_validation_failure(
         transcript_path=assignment.transcript_path,
         cycle_count=assignment.cycle_count,
     )
-
-
-def _native_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
-    """Convert registry specs to the OpenAI/Ollama function-tool format."""
-    specs = []
-    for spec in registry.specs():
-        properties = {
-            name: {"description": description}
-            for name, description in spec.argument_schema.items()
-        }
-        required = [
-            name
-            for name, description in spec.argument_schema.items()
-            if "optional" not in str(description).lower()
-        ]
-        specs.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": spec.name,
-                    "description": spec.description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    },
-                },
-            }
-        )
-    return specs
 
 
 def _locked_complete_with_retries(

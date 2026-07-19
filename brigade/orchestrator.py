@@ -2826,6 +2826,8 @@ def _run_recurrence_step(store: StateStore, config: OrchestrationConfig) -> dict
         store,
         threshold=config.recurrence_detection_threshold,
         lookback_days=config.recurrence_lookback_days,
+        telegram_bot_token=config.telegram_bot_token,
+        operator_telegram_chat_id=config.operator_telegram_chat_id,
     )
 
 

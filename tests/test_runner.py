@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from brigade.providers import ModelResponse
-from brigade.runner import run_agent_once
+from brigade.runner import MAX_AGENT_ITERATIONS, run_agent_once
 from brigade.schemas import Agent, Assignment
 from brigade.state import JsonStateStore
 from brigade.workspace import write_heartbeat_assignment
@@ -195,10 +195,9 @@ def test_non_complete_status_with_missing_file_claims_is_annotated(tmp_path):
 
 
 def test_native_tool_specs_conversion():
-    from brigade.runner import _native_tool_specs
-    from brigade.tools import default_tool_registry
+    from brigade.tools import default_tool_registry, native_tool_specs
 
-    specs = _native_tool_specs(default_tool_registry())
+    specs = native_tool_specs(default_tool_registry())
     by_name = {spec["function"]["name"]: spec for spec in specs}
     assert "write_file" in by_name
     write_file = by_name["write_file"]["function"]
@@ -323,3 +322,79 @@ def test_missing_claimed_files_resolves_shared_workspace(tmp_path):
 
     assert "shared/governance_model.md" not in missing
     assert "shared/missing_thing.md" in missing
+
+
+def _tool_call(tool: str = "list_files") -> str:
+    return json.dumps(
+        {"status": "tool_call", "tool": tool, "arguments": {}, "summary": "looking around"}
+    )
+
+
+def test_exhausted_cycle_ends_with_wrap_up_progress_report(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    _make_agent_with_assignment(tmp_path, store)
+
+    wrap_up = json.dumps(
+        {
+            "status": "working",
+            "summary": "Reviewed the workspace inventory; next step is drafting the outline",
+            "blockers": [],
+        }
+    )
+    provider = _SequencedProvider([_tool_call()] * MAX_AGENT_ITERATIONS + [wrap_up])
+
+    result = run_agent_once("sage", store, provider)
+
+    assert result.status == "working"
+    assert "drafting the outline" in result.summary
+    assert "budget exhausted" not in result.summary
+    assert len(provider.prompts) == MAX_AGENT_ITERATIONS + 1
+    assert "TOOL BUDGET EXHAUSTED" in provider.prompts[-1]
+    # the model's report becomes the durable progress summary for the next cycle
+    assert "drafting the outline" in store.assignments()[0].progress_summary
+
+
+def test_wrap_up_tool_call_falls_back_to_observation_summary(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    _make_agent_with_assignment(tmp_path, store)
+
+    provider = _SequencedProvider([_tool_call()] * (MAX_AGENT_ITERATIONS + 1))
+
+    result = run_agent_once("sage", store, provider)
+
+    assert result.status == "working"
+    assert "tool iteration budget exhausted" in result.summary
+    assert f"list_files x{MAX_AGENT_ITERATIONS}" in result.summary
+
+
+def test_wrap_up_completion_with_missing_files_is_downgraded(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    _make_agent_with_assignment(tmp_path, store)
+
+    fabricated = json.dumps(
+        {"status": "complete", "summary": "Saved everything to final_report.md", "blockers": []}
+    )
+    provider = _SequencedProvider([_tool_call()] * MAX_AGENT_ITERATIONS + [fabricated])
+
+    result = run_agent_once("sage", store, provider)
+
+    assert result.status == "working"
+    assert "completion claimed at wrap-up" in result.summary
+    assert "final_report.md" in result.summary
+    assert store.assignments() != []
+
+
+def test_wrap_up_completion_with_real_files_is_accepted(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    _make_agent_with_assignment(tmp_path, store)
+    (tmp_path / "workspace-sage" / "report.md").write_text("data", encoding="utf-8")
+
+    completion = json.dumps(
+        {"status": "complete", "summary": "Wrote report.md with the findings", "blockers": []}
+    )
+    provider = _SequencedProvider([_tool_call()] * MAX_AGENT_ITERATIONS + [completion])
+
+    result = run_agent_once("sage", store, provider)
+
+    assert result.status == "complete"
+    assert store.assignments() == []

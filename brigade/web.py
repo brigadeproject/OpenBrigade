@@ -11,6 +11,14 @@ from uuid import uuid4
 
 from brigade import __version__
 from brigade.auth import AuthResult, issue_token, verify_token
+from brigade.chief_chat import (
+    CHIEF_CHAT_KIND_PREFIX,
+    UnknownPersonaError,
+    available_personas,
+    resolve_persona,
+    run_chief_chat_turn,
+    run_connector_chief_chat,
+)
 from brigade.config import Settings, load_settings
 from brigade.connectors import (
     ConnectorRateLimiter,
@@ -52,6 +60,8 @@ from brigade.services import (
     AssignmentActionError,
     ProposalAlreadyDecidedError,
     UnknownProposalError,
+    _classify_chat_confirmation,
+    _pending_chat_proposal,
     attach_operator_guidance,
     build_chat_payload,
     build_cockpit_payload,
@@ -90,7 +100,7 @@ def create_app(
     telegram_http_post: HttpPost | None = None,
 ):
     try:
-        from fastapi import Depends, FastAPI, Header, HTTPException
+        from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
         from fastapi.responses import HTMLResponse, StreamingResponse
         from fastapi.staticfiles import StaticFiles
         from starlette.datastructures import MutableHeaders
@@ -98,6 +108,12 @@ def create_app(
         raise RuntimeError(
             "install the web extra to run the gateway: pip install -e '.[web]'"
         ) from exc
+
+    # FastAPI resolves route-handler annotations via get_type_hints against this
+    # module's globals, but the web extra is imported lazily inside this
+    # function. Expose BackgroundTasks at module scope so the annotation on the
+    # Telegram webhook resolves instead of being treated as a query parameter.
+    globals().setdefault("BackgroundTasks", BackgroundTasks)
 
     settings = settings or load_settings()
     store = store or open_state_store(settings)
@@ -160,6 +176,26 @@ def create_app(
             raise HTTPException(status_code=403, detail=f"missing permission: {permission}")
         return current.user
 
+    def _connector_chat_turn(max_iterations: int):
+        """Build a ConnectorChatTurn bound to this app's settings, or None when
+        connector chief chat is disabled (the default single-shot path)."""
+        if not (settings.connector_chief_chat_enabled and settings.chief_chat_enabled):
+            return None
+
+        def _turn(turn_store, incoming, username):
+            return run_connector_chief_chat(
+                turn_store,
+                incoming,
+                username,
+                provider=provider_from_settings(settings),
+                default_persona=settings.chief_chat_default_persona,
+                max_iterations=max_iterations,
+                history_window=settings.chief_chat_history_window,
+                enable_web_fetch=settings.chief_chat_web_fetch_enabled,
+            )
+
+        return _turn
+
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
         return {"ok": True, "service": "brigade_web"}
@@ -167,6 +203,7 @@ def create_app(
     @app.post("/api/connectors/telegram/webhook")
     async def telegram_webhook(
         payload: dict[str, Any],
+        background_tasks: BackgroundTasks,
         x_telegram_secret: str | None = Header(
             default=None,
             alias="X-Telegram-Bot-Api-Secret-Token",
@@ -199,9 +236,7 @@ def create_app(
             raise HTTPException(status_code=413, detail="telegram webhook body too large")
         if not settings.telegram_bot_token:
             raise HTTPException(status_code=503, detail="telegram bot token is not configured")
-        result = process_live_connector_message(
-            store,
-            incoming,
+        connector_kwargs = dict(
             default_agent=settings.telegram_default_agent,
             model_provider=provider_from_settings(settings),
             outbound_sender=telegram_reply_sender(
@@ -213,6 +248,20 @@ def create_app(
             max_inbound_chars=settings.connector_max_inbound_chars,
             max_outbound_chars=settings.connector_max_outbound_chars,
         )
+        chat_turn = _connector_chat_turn(settings.chief_chat_max_iterations)
+        if chat_turn is not None:
+            # The chief-chat loop can run several model calls; do it out of band
+            # so the webhook returns 200 fast and telegram_reply_sender posts the
+            # reply when the turn finishes.
+            background_tasks.add_task(
+                process_live_connector_message,
+                store,
+                incoming,
+                chat_turn=chat_turn,
+                **connector_kwargs,
+            )
+            return {"ok": True, "status": "accepted", "provider": "telegram"}
+        result = process_live_connector_message(store, incoming, **connector_kwargs)
         if result.status == "rate_limited":
             raise HTTPException(status_code=429, detail=result.reason or "rate limit exceeded")
         if result.status == "rejected":
@@ -249,6 +298,8 @@ def create_app(
                 )
             )
             raise HTTPException(status_code=413, detail="google chat webhook body too large")
+        # Google Chat needs a synchronous response body, so the chief-chat loop
+        # runs inline with a tighter iteration cap to stay under webhook timeouts.
         result = process_live_connector_message(
             store,
             incoming,
@@ -259,6 +310,7 @@ def create_app(
             rate_limiter=connector_rate_limiter or _connector_rate_limiter(settings),
             max_inbound_chars=settings.connector_max_inbound_chars,
             max_outbound_chars=settings.connector_max_outbound_chars,
+            chat_turn=_connector_chat_turn(settings.chief_chat_connector_max_iterations),
         )
         if result.status == "rate_limited":
             raise HTTPException(status_code=429, detail=result.reason or "rate limit exceeded")
@@ -1039,6 +1091,127 @@ def create_app(
             "response_markdown": response_markdown,
             "response_html": render_markdown_html(response_markdown),
         }
+
+    def _operator_username(user: User | None) -> str:
+        return user.username if user else "operator"
+
+    def _thread_or_404(thread_id: str):
+        conversation = store.find_conversation(thread_id)
+        if conversation is None:
+            raise HTTPException(status_code=404, detail=f"unknown thread: {thread_id}")
+        return conversation
+
+    @app.get("/api/chat/threads")
+    async def chat_threads(current: AuthResult = auth_dependency) -> dict[str, object]:
+        user = require("chat:read", current)
+        username = _operator_username(user)
+        return {
+            "threads": [item.to_dict() for item in store.conversations(username)],
+            "personas": [item.to_dict() for item in available_personas(store)],
+        }
+
+    @app.post("/api/chat/threads")
+    async def chat_thread_open(
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("chat:write", current)
+        try:
+            persona = resolve_persona(
+                store,
+                payload.get("persona"),
+                default=settings.chief_chat_default_persona,
+            )
+        except UnknownPersonaError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        conversation = store.resolve_active_conversation(
+            _operator_username(user),
+            persona.persona_id,
+            chief_agent_id=persona.chief_agent_id,
+            team_id=persona.team_id,
+            title=payload.get("title") or persona.display_name,
+        )
+        return {**conversation.to_dict(), "channel": conversation.channel}
+
+    @app.get("/api/chat/threads/{thread_id}/messages")
+    async def chat_thread_messages(
+        thread_id: str,
+        limit: int = 100,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        require("chat:read", current)
+        conversation = _thread_or_404(thread_id)
+        return {
+            "thread": conversation.to_dict(),
+            "messages": [
+                message.to_dict()
+                for message in store.recent_messages(conversation.channel, limit=limit)
+            ],
+        }
+
+    @app.post("/api/chat/threads/{thread_id}/messages")
+    async def chat_thread_send(
+        thread_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("chat:write", current)
+        if not settings.chief_chat_enabled:
+            raise HTTPException(status_code=503, detail="chief chat is disabled")
+        conversation = _thread_or_404(thread_id)
+        username = _operator_username(user)
+        if conversation.operator_username != username:
+            raise HTTPException(status_code=403, detail="not your thread")
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="content is required")
+        try:
+            persona = resolve_persona(store, conversation.persona)
+        except UnknownPersonaError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # Confirming staged actions changes task state; gate it like the
+        # task-mutation routes rather than like plain chat.
+        pending = _pending_chat_proposal(
+            store, conversation.channel, kind_prefix=CHIEF_CHAT_KIND_PREFIX
+        )
+        if pending is not None and _classify_chat_confirmation(content) == "confirm":
+            require("task:write", current)
+        provider = _provider_from_payload(payload, settings)
+        return run_chief_chat_turn(
+            store,
+            thread=conversation,
+            persona=persona,
+            operator=username,
+            content=content,
+            provider=provider,
+            max_iterations=settings.chief_chat_max_iterations,
+            history_window=settings.chief_chat_history_window,
+            enable_web_fetch=settings.chief_chat_web_fetch_enabled,
+            idempotency_key=payload.get("idempotency_key") or f"web-chief:{uuid4()}",
+        )
+
+    @app.post("/api/chat/threads/{thread_id}/persona")
+    async def chat_thread_switch_persona(
+        thread_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        # A thread keeps one persona for life: switching resolves (or creates)
+        # the caller's active thread for the requested persona instead.
+        user = require("chat:write", current)
+        _thread_or_404(thread_id)
+        try:
+            persona = resolve_persona(store, str(payload.get("persona") or ""))
+        except UnknownPersonaError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        conversation = store.resolve_active_conversation(
+            _operator_username(user),
+            persona.persona_id,
+            chief_agent_id=persona.chief_agent_id,
+            team_id=persona.team_id,
+            title=persona.display_name,
+        )
+        return {**conversation.to_dict(), "channel": conversation.channel}
 
     @app.get("/api/settings/effective")
     async def settings_effective(current: AuthResult = auth_dependency) -> dict[str, object]:

@@ -80,6 +80,51 @@ def write_orchestrator_notes(store: StateStore, content: str, *, append: bool = 
         combined = combined[-MAX_ORCHESTRATOR_NOTES_CHARS :]
     path.write_text(combined, encoding="utf-8")
 
+CHAT_MEMORY_FILENAME = "CHAT_MEMORY.md"
+MAX_CHAT_MEMORY_CHARS = 8000
+
+
+def _chat_memory_path(store: StateStore, agent_id: str | None) -> Path:
+    """Curated chat memory lives next to the persona's other workspace files;
+    the front desk (agent_id=None) shares the orchestrator workspace."""
+    if agent_id is None:
+        return orchestrator_workspace_path(store) / CHAT_MEMORY_FILENAME
+    agent = next((item for item in store.agents() if item.agent_id == agent_id), None)
+    if agent is None:
+        return orchestrator_workspace_path(store) / CHAT_MEMORY_FILENAME
+    return store.data_dir / agent.workspace_path / CHAT_MEMORY_FILENAME
+
+
+def read_agent_chat_notes(store: StateStore, agent_id: str | None) -> str:
+    path = _chat_memory_path(store, agent_id)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def write_agent_chat_notes(
+    store: StateStore,
+    agent_id: str | None,
+    content: str,
+    *,
+    append: bool = True,
+) -> None:
+    path = _chat_memory_path(store, agent_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if append and path.exists():
+        existing = path.read_text(encoding="utf-8")
+        combined = (
+            (existing.rstrip() + "\n" + content.strip() + "\n")
+            if existing.strip()
+            else (content.strip() + "\n")
+        )
+    else:
+        combined = content.strip() + "\n"
+    if len(combined) > MAX_CHAT_MEMORY_CHARS:
+        combined = combined[-MAX_CHAT_MEMORY_CHARS:]
+    path.write_text(combined, encoding="utf-8")
+
+
 CREW_CHIEF_SYSTEM_PROMPT = "\n".join(
     [
         "You are an OpenBrigade Crew Chief.",
@@ -89,6 +134,29 @@ CREW_CHIEF_SYSTEM_PROMPT = "\n".join(
         "member whose declared or demonstrated specialties match it, then one "
         "whose built tools or recent completions fit; give generalists the "
         "remainder.",
+    ]
+)
+
+CREW_CHIEF_CHAT_PROMPT = "\n".join(
+    [
+        "You are chatting directly with a human operator.",
+        "Answer questions about live or historical work by CALLING TOOLS, never "
+        "from memory: tool results in this prompt are real current state.",
+        "To call a tool, reply with exactly one JSON object and nothing else:",
+        '{"status":"tool_call","tool":"<name>","arguments":{...}}',
+        "Call one tool at a time; its result appears under tool_observations on "
+        "your next turn.",
+        "When you have what you need, reply with your final answer as plain "
+        "Markdown prose (no JSON). Keep answers short and concrete; cite task "
+        "ids when you reference tasks.",
+        "If the operator asks you to change state (create or cancel tasks, set "
+        "priority, attach guidance, retry blocked work), do NOT apply it yet. "
+        "Reply with exactly one JSON object describing your plan:",
+        '{"status":"propose_actions","summary":"one sentence","actions":[...]}',
+        "The operator must reply confirm before anything is applied.",
+        "If a pending proposal is shown in the context and this message is not a "
+        "bare confirm/cancel, treat the message as the operator's real intent and "
+        "propose fresh actions accordingly.",
     ]
 )
 
@@ -375,14 +443,22 @@ def build_chat_status_context(store: StateStore, agent_id: str) -> dict[str, Any
                 {
                     "assignment_id": item.assignment_id,
                     "assigned_to": item.assigned_to,
+                    "assignment": item.assignment[:160],
                     "blockers": item.blockers,
                     "last_error": item.last_error,
                     "consecutive_failures": item.consecutive_failures,
                 }
                 for item in blocked
             ],
+            # Titles ride along so a chief can name blocked work to the
+            # operator instead of citing bare UUIDs.
             "awaiting_human": [
-                item.assignment_id for item in blocked if item.awaiting_human
+                {
+                    "assignment_id": item.assignment_id,
+                    "assignment": item.assignment[:160],
+                }
+                for item in blocked
+                if item.awaiting_human
             ],
             "team_alerts": team_alerts,
         }

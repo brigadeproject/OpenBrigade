@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import timedelta
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -13,6 +14,7 @@ from brigade.config import Settings
 from brigade.health import HealthCheck
 from brigade.orchestrator import (
     _active_policy_summaries,
+    _resolve_agent_id,
     apply_orchestrator_actions,
     build_orchestration_telemetry,
     orchestration_event,
@@ -41,7 +43,7 @@ from brigade.schemas import (
     extract_json_object,
 )
 from brigade.store import StateStore
-from brigade.time import utc_now_iso
+from brigade.time import parse_utc_iso, utc_now_iso
 from brigade.workspace import write_heartbeat_assignment
 
 LOGGER = logging.getLogger("brigade.services")
@@ -225,6 +227,13 @@ SAFE_CONFIG_KEYS = {
     "blocker_resolution_enabled": bool,
     "recurrence_detection_threshold": int,
     "recurrence_lookback_days": int,
+    "chief_chat_enabled": bool,
+    "chief_chat_max_iterations": int,
+    "chief_chat_history_window": int,
+    "chief_chat_default_persona": str,
+    "chief_chat_web_fetch_enabled": bool,
+    "connector_chief_chat_enabled": bool,
+    "chief_chat_connector_max_iterations": int,
 }
 
 # Keys an operator can change live from the Telemetry page. These are layered onto
@@ -582,12 +591,17 @@ def _classify_chat_confirmation(content: str) -> str | None:
     return None
 
 
-def _pending_chat_proposal(store: StateStore, channel: str) -> dict[str, Any] | None:
+def _pending_chat_proposal(
+    store: StateStore,
+    channel: str,
+    *,
+    kind_prefix: str = "orchestrator_chat",
+) -> dict[str, Any] | None:
     for message in reversed(store.messages(channel)):
         kind = message.metadata.get("kind")
-        if kind == "orchestrator_chat_proposal_resolved":
+        if kind == f"{kind_prefix}_proposal_resolved":
             return None
-        if kind == "orchestrator_chat_proposal":
+        if kind == f"{kind_prefix}_proposal":
             return message.metadata
     return None
 
@@ -790,16 +804,19 @@ def _stage_chat_proposal(
     sender: str,
     request: ChatMessage,
     response: Any,
+    agent_id: str = "orchestrator",
+    kind_prefix: str = "orchestrator_chat",
 ) -> dict[str, Any]:
     response_text = _format_action_proposal(summary, actions)
     response_message = ChatMessage(
         channel=channel,
-        sender="orchestrator",
+        sender=agent_id,
         recipient=sender,
         content=response_text,
         metadata={
-            "kind": "orchestrator_chat_proposal",
+            "kind": f"{kind_prefix}_proposal",
             "conversation_id": channel,
+            "agent_id": agent_id,
             "actions": actions,
             "summary": summary,
             "provider": response.provider,
@@ -815,7 +832,7 @@ def _stage_chat_proposal(
         {
             "usage_id": str(uuid4()),
             "assignment_id": None,
-            "agent_id": "orchestrator",
+            "agent_id": agent_id,
             "provider": response.provider,
             "model": response.model,
             "route_type": response.route_type,
@@ -825,7 +842,7 @@ def _stage_chat_proposal(
             "estimated_cost_usd": response.estimated_cost_usd,
             "recorded_at": utc_now_iso(),
             "conversation_id": channel,
-            "source": "orchestrator_chat",
+            "source": kind_prefix,
         }
     )
     return {
@@ -834,7 +851,7 @@ def _stage_chat_proposal(
         "summary": summary,
         "request_message_id": request.message_id,
         "response_message_id": response_message.message_id,
-        "agent_id": "orchestrator",
+        "agent_id": agent_id,
         "actions_proposed": actions,
         "provider": response.provider,
         "model": response.model,
@@ -850,10 +867,16 @@ def _resolve_chat_proposal(
     channel: str,
     sender: str,
     request: ChatMessage,
+    agent_id: str = "orchestrator",
+    kind_prefix: str = "orchestrator_chat",
+    apply: Callable[[list[dict[str, Any]]], dict[str, list[dict[str, Any]]]] | None = None,
 ) -> dict[str, Any]:
     actions = pending.get("actions") or []
     if decision == "confirm":
-        result = apply_orchestrator_chat_actions(store, actions, by=sender)
+        if apply is None:
+            result = apply_orchestrator_chat_actions(store, actions, by=sender)
+        else:
+            result = apply(actions)
         response_text = _format_action_result(result)
         status = "applied"
     else:
@@ -862,12 +885,13 @@ def _resolve_chat_proposal(
         status = "declined"
     response_message = ChatMessage(
         channel=channel,
-        sender="orchestrator",
+        sender=agent_id,
         recipient=sender,
         content=response_text,
         metadata={
-            "kind": "orchestrator_chat_proposal_resolved",
+            "kind": f"{kind_prefix}_proposal_resolved",
             "conversation_id": channel,
+            "agent_id": agent_id,
             "decision": decision,
             "result": result,
         },
@@ -879,7 +903,7 @@ def _resolve_chat_proposal(
         "summary": _summarize(response_text),
         "request_message_id": request.message_id,
         "response_message_id": response_message.message_id,
-        "agent_id": "orchestrator",
+        "agent_id": agent_id,
         "actions_applied": result["applied"],
         "actions_rejected": result["rejected"],
     }
@@ -1203,6 +1227,13 @@ def build_alert_feed(
         if not message:
             continue
         created_at = record.get("created_at")
+        # The Postgres store hands back datetimes where the JSON store has ISO
+        # strings; normalize so the feed stays json.dumps-safe (the ops-room
+        # SSE stream bypasses FastAPI's encoder) and comparisons stay uniform.
+        if isinstance(created_at, datetime):
+            created_at = created_at.astimezone(timezone.utc).isoformat()
+        elif created_at is not None:
+            created_at = str(created_at)
         entry = grouped.get(message)
         if entry is None:
             entry = {
@@ -1498,6 +1529,7 @@ CHAT_EXTENDED_ACTION_TYPES = frozenset(
     {
         "cancel_assignment",
         "cancel_assignments_where",
+        "set_priority",
         "set_routing_policy",
         "retire_policy",
         "write_note",
@@ -1531,6 +1563,8 @@ def apply_orchestrator_chat_actions(
                 applied.append(_apply_chat_cancel_assignment(store, action, by=by))
             elif action_type == "cancel_assignments_where":
                 applied.append(_apply_chat_cancel_assignments_where(store, action, by=by))
+            elif action_type == "set_priority":
+                applied.append(_apply_chat_set_priority(store, action, by=by))
             elif action_type == "set_routing_policy":
                 applied.append(_apply_chat_set_routing_policy(store, action, by=by))
             elif action_type == "retire_policy":
@@ -1553,6 +1587,19 @@ def _apply_chat_cancel_assignment(
     reason = str(action.get("reason") or "cancelled via orchestrator chat")
     result = cancel_assignment(store, assignment_id, reason=reason, by=by, force=True)
     return {"type": "cancel_assignment", **result}
+
+
+def _apply_chat_set_priority(
+    store: StateStore, action: dict[str, Any], *, by: str
+) -> dict[str, Any]:
+    assignment_id = str(action.get("assignment_id") or "").strip()
+    priority = str(action.get("priority") or "").strip()
+    if not assignment_id:
+        raise ValueError("set_priority is missing assignment_id")
+    if not priority:
+        raise ValueError("set_priority is missing priority")
+    result = update_assignment_fields(store, assignment_id, priority=priority, by=by)
+    return {"type": "set_priority", "priority": priority, **result}
 
 
 def _apply_chat_cancel_assignments_where(
@@ -1656,6 +1703,293 @@ def _apply_chat_update_system_prompt(store: StateStore, action: dict[str, Any]) 
         raise ValueError("update_system_prompt is missing content")
     write_orchestrator_system_prompt(store, content)
     return {"type": "update_system_prompt", "content": content}
+
+
+CHIEF_CHAT_ACTION_TYPES = frozenset(
+    {
+        "create_assignment",
+        "cancel_assignment",
+        "attach_guidance",
+        "set_priority",
+        "retry_blocked_assignment",
+        "create_recurrence",
+        "set_recurrence_enabled",
+    }
+)
+
+
+def apply_chief_chat_actions(
+    store: StateStore,
+    actions: list[dict[str, Any]],
+    *,
+    chief_id: str | None,
+    managed_agent_ids: set[str] | None,
+    by: str = "operator",
+    conversation_channel: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Operator-confirmed actions proposed by a crew chief in chat.
+
+    Every action is validated against the chief's managed agents
+    (``managed_agent_ids=None`` is the unrestricted front desk) before it
+    touches state; anything outside the vocabulary or the team is rejected
+    with a reason instead of applied."""
+    applied: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for action in actions:
+        action_type = str(action.get("type") or "").strip()
+        try:
+            if action_type not in CHIEF_CHAT_ACTION_TYPES:
+                raise ValueError(
+                    f"unsupported chief chat action type: {action_type or '<missing>'}"
+                )
+            if action_type == "create_assignment":
+                result = _apply_chief_create_assignment(
+                    store, action, chief_id=chief_id, managed=managed_agent_ids
+                )
+            elif action_type == "create_recurrence":
+                result = _apply_chief_create_recurrence(
+                    store,
+                    action,
+                    chief_id=chief_id,
+                    managed=managed_agent_ids,
+                    by=by,
+                    conversation_channel=conversation_channel,
+                )
+            elif action_type == "set_recurrence_enabled":
+                result = _apply_chief_set_recurrence_enabled(
+                    store, action, managed=managed_agent_ids
+                )
+            elif action_type == "retry_blocked_assignment":
+                _chief_scoped_assignment(store, action, managed=managed_agent_ids)
+                sub = apply_orchestrator_actions(store, [action])
+                if sub["rejected"]:
+                    raise ValueError(str(sub["rejected"][0].get("reason")))
+                if sub["skipped"]:
+                    skipped.extend(sub["skipped"])
+                    continue
+                result = sub["applied"][0]
+            elif action_type == "cancel_assignment":
+                _chief_scoped_assignment(store, action, managed=managed_agent_ids)
+                result = _apply_chat_cancel_assignment(store, action, by=by)
+            elif action_type == "attach_guidance":
+                target = _chief_scoped_assignment(store, action, managed=managed_agent_ids)
+                message = str(action.get("message") or "").strip()
+                if not message:
+                    raise ValueError("attach_guidance is missing message")
+                guidance = attach_operator_guidance(
+                    store,
+                    target.assignment_id,
+                    operator=by,
+                    message=message,
+                    conversation_id=action.get("conversation_id"),
+                )
+                result = {"type": "attach_guidance", **guidance}
+            else:  # set_priority
+                _chief_scoped_assignment(store, action, managed=managed_agent_ids)
+                result = _apply_chat_set_priority(store, action, by=by)
+            applied.append(result)
+            audit_ref = str(
+                result.get("assignment_id") or action.get("assignment_id") or ""
+            )
+            if not audit_ref and result.get("recurrence_id"):
+                audit_ref = f"recurrence:{result['recurrence_id']}"
+            _record_operator_event(
+                store,
+                action=f"chief_chat_{action_type}",
+                summary=(
+                    f"{action_type} applied via chief chat "
+                    f"({chief_id or 'front_desk'}) by {by}"
+                ),
+                assignment_id=audit_ref,
+                agent_id=chief_id,
+                by=by,
+                payload={"chief_id": chief_id, "action": action},
+            )
+        except (AssignmentActionError, ValueError) as exc:
+            rejected.append({"action": action, "reason": str(exc)})
+    return {"applied": applied, "rejected": rejected, "skipped": skipped}
+
+
+def _chief_scoped_assignment(
+    store: StateStore,
+    action: dict[str, Any],
+    *,
+    managed: set[str] | None,
+) -> Assignment:
+    assignment_id = str(action.get("assignment_id") or "").strip()
+    if not assignment_id:
+        raise ValueError(f"{action.get('type')} is missing assignment_id")
+    target = store.find_assignment(assignment_id)
+    if target is None:
+        raise ValueError(f"unknown assignment: {assignment_id}")
+    if managed is not None and target.assigned_to not in managed:
+        raise ValueError(
+            f"assignment {assignment_id} is outside your team "
+            f"(assigned to {target.assigned_to})"
+        )
+    return target
+
+
+def _apply_chief_create_assignment(
+    store: StateStore,
+    action: dict[str, Any],
+    *,
+    chief_id: str | None,
+    managed: set[str] | None,
+) -> dict[str, Any]:
+    agent_id = str(action.get("agent_id") or "").strip()
+    assignment_text = str(action.get("assignment") or "").strip()
+    if not agent_id:
+        raise ValueError("create_assignment is missing agent_id")
+    if not assignment_text:
+        raise ValueError("create_assignment is missing assignment")
+    resolved = _resolve_agent_id(store, agent_id)
+    if resolved is None:
+        raise ValueError(f"create_assignment targets unknown agent {agent_id}")
+    if managed is not None and resolved not in managed:
+        raise ValueError(
+            f"create_assignment targets {resolved}, who is not on your team"
+        )
+    try:
+        priority = Priority(str(action.get("priority") or Priority.NORMAL.value))
+    except ValueError as exc:
+        raise ValueError(f"unsupported priority: {action.get('priority')}") from exc
+    assignment = Assignment(
+        assignment=assignment_text,
+        assigned_to=resolved,
+        created_by=chief_id or "front_desk",
+        source="chief_chat",
+        priority=priority,
+        goal_statement=(
+            str(action.get("goal_statement")).strip()
+            if action.get("goal_statement") is not None
+            else None
+        ),
+        assignment_rationale=str(
+            action.get("rationale") or "Operator-confirmed chief chat action."
+        ),
+        created_by_role="crew_chief" if chief_id else "orchestrator",
+    )
+    persisted = store.add_assignment(assignment)
+    return {
+        "type": "create_assignment",
+        "assignment_id": persisted.assignment_id,
+        "agent_id": resolved,
+        "priority": priority.value,
+        "status": persisted.status.value,
+    }
+
+
+MIN_RECURRENCE_INTERVAL_SECONDS = 300
+
+
+def _apply_chief_create_recurrence(
+    store: StateStore,
+    action: dict[str, Any],
+    *,
+    chief_id: str | None,
+    managed: set[str] | None,
+    by: str,
+    conversation_channel: str | None,
+) -> dict[str, Any]:
+    """Operator-confirmed scheduled job. The recurrence engine (efficiency.py)
+    materializes the template each due slot; when ``deliver_briefing`` is set
+    the finished output is posted back into this conversation's thread."""
+    from brigade.schemas import build_recurrence
+    from brigade.time import add_seconds_iso
+
+    agent_id = str(action.get("agent_id") or chief_id or "").strip()
+    assignment_text = str(action.get("assignment") or "").strip()
+    if not assignment_text:
+        raise ValueError("create_recurrence is missing assignment")
+    resolved = _resolve_agent_id(store, agent_id) if agent_id else None
+    if resolved is None:
+        raise ValueError(f"create_recurrence targets unknown agent {agent_id}")
+    if managed is not None and resolved not in managed:
+        raise ValueError(f"create_recurrence targets {resolved}, who is not on your team")
+    try:
+        interval_seconds = int(action.get("interval_seconds") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("create_recurrence interval_seconds must be an integer") from exc
+    if interval_seconds < MIN_RECURRENCE_INTERVAL_SECONDS:
+        raise ValueError(
+            "create_recurrence interval_seconds must be at least "
+            f"{MIN_RECURRENCE_INTERVAL_SECONDS} (got {interval_seconds})"
+        )
+    next_due_at = str(action.get("next_due_at") or "").strip()
+    if next_due_at:
+        try:
+            parse_utc_iso(next_due_at)
+        except ValueError as exc:
+            raise ValueError(
+                f"create_recurrence next_due_at is not a UTC ISO timestamp: {next_due_at}"
+            ) from exc
+    else:
+        next_due_at = add_seconds_iso(utc_now_iso(), interval_seconds)
+    template: dict[str, Any] = {
+        "assignment": assignment_text,
+        "assigned_to": resolved,
+        "priority": str(action.get("priority") or Priority.NORMAL.value),
+    }
+    if action.get("deliver_briefing") and conversation_channel:
+        template["deliver_to"] = {
+            "channel": conversation_channel,
+            "operator": by,
+            "agent_id": chief_id or "front_desk",
+        }
+    recurrence = build_recurrence(
+        template=template,
+        interval_seconds=interval_seconds,
+        next_due_at=next_due_at,
+    )
+    persisted = store.add_recurrence(recurrence)
+    return {
+        "type": "create_recurrence",
+        "recurrence_id": persisted.get("recurrence_id"),
+        "agent_id": resolved,
+        "interval_seconds": interval_seconds,
+        "next_due_at": next_due_at,
+        "delivers_briefing": "deliver_to" in template,
+    }
+
+
+def _apply_chief_set_recurrence_enabled(
+    store: StateStore,
+    action: dict[str, Any],
+    *,
+    managed: set[str] | None,
+) -> dict[str, Any]:
+    recurrence_id = str(action.get("recurrence_id") or "").strip()
+    if not recurrence_id:
+        raise ValueError("set_recurrence_enabled is missing recurrence_id")
+    enabled = action.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("set_recurrence_enabled needs enabled true/false")
+    recurrence = next(
+        (
+            item
+            for item in store.recurrences()
+            if str(item.get("recurrence_id")) == recurrence_id
+        ),
+        None,
+    )
+    if recurrence is None:
+        raise ValueError(f"unknown recurrence: {recurrence_id}")
+    target = str((recurrence.get("template") or {}).get("assigned_to") or "")
+    if managed is not None and target not in managed:
+        raise ValueError(
+            f"recurrence {recurrence_id} is outside your team (assigned to {target})"
+        )
+    recurrence = dict(recurrence)
+    recurrence["enabled"] = enabled
+    recurrence["updated_at"] = utc_now_iso()
+    store.update_recurrence(recurrence)
+    return {
+        "type": "set_recurrence_enabled",
+        "recurrence_id": recurrence_id,
+        "enabled": enabled,
+    }
 
 
 def _record_operator_event(
@@ -2137,6 +2471,13 @@ def build_settings_payload(
         "connector_max_inbound_chars": settings.connector_max_inbound_chars,
         "connector_max_outbound_chars": settings.connector_max_outbound_chars,
         "connector_max_body_bytes": settings.connector_max_body_bytes,
+        "chief_chat_enabled": settings.chief_chat_enabled,
+        "chief_chat_max_iterations": settings.chief_chat_max_iterations,
+        "chief_chat_history_window": settings.chief_chat_history_window,
+        "chief_chat_default_persona": settings.chief_chat_default_persona,
+        "chief_chat_web_fetch_enabled": settings.chief_chat_web_fetch_enabled,
+        "connector_chief_chat_enabled": settings.connector_chief_chat_enabled,
+        "chief_chat_connector_max_iterations": settings.chief_chat_connector_max_iterations,
         "editable_keys": sorted(SAFE_CONFIG_KEYS),
     }
 
@@ -2662,6 +3003,7 @@ def _orchestrator_chat_prompt(
                 '{"type":"set_routing_policy","assignment_kind":"failure_analysis",'
                 '"target_team_id":"...","statement":"..."}'
             ),
+            '{"type":"set_priority","assignment_id":"...","priority":"high"}',
             '{"type":"retire_policy","policy_id":"..."}',
             '{"type":"write_note","content":"...","append":true}',
             '{"type":"update_system_prompt","content":"..."}',

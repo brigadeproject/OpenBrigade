@@ -10,6 +10,7 @@ from brigade.schemas import (
     Agent,
     Assignment,
     AssignmentKind,
+    Conversation,
     Goal,
     build_proposal,
     build_recurrence,
@@ -79,6 +80,40 @@ def test_postgres_recurrence_crud_round_trips(tmp_path):
         item["recurrence_id"] == recurrence["recurrence_id"]
         for item in store.recurrences(enabled=False)
     )
+
+
+def test_postgres_conversation_crud_round_trips(tmp_path):
+    store = _live_store(tmp_path)
+    operator = f"op-{uuid4().hex[:12]}"
+
+    first = store.resolve_active_conversation(operator, "front_desk")
+    again = store.resolve_active_conversation(operator, "front_desk")
+    assert again.thread_id == first.thread_id  # partial unique index holds
+
+    chief = store.resolve_active_conversation(
+        operator, "chief:sage", chief_agent_id="sage", team_id="alpha"
+    )
+    assert chief.thread_id != first.thread_id
+
+    store.set_conversation_summary(first.thread_id, "- discussed the roadmap")
+    reloaded = store.find_conversation(first.thread_id)
+    assert reloaded is not None
+    assert reloaded.rolling_summary == "- discussed the roadmap"
+
+    active = {item.thread_id for item in store.conversations(operator, status="active")}
+    assert active == {first.thread_id, chief.thread_id}
+
+    # Archiving frees the active slot, so a fresh resolve mints a new thread.
+    archived = Conversation(
+        operator_username=operator,
+        persona="front_desk",
+        status="archived",
+        thread_id=first.thread_id,
+        created_at=first.created_at,
+    )
+    store.upsert_conversation(archived)
+    replacement = store.resolve_active_conversation(operator, "front_desk")
+    assert replacement.thread_id != first.thread_id
 
 
 def test_postgres_persists_new_contract_columns(tmp_path):
