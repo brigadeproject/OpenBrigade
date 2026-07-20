@@ -385,6 +385,7 @@ class QdrantChunkStore(QdrantCollectionStore):
             "chunk_id": point_id,
             "kb_id": chunk.get("kb_id") or f"chunk:{point_id}",
             "document_id": chunk.get("document_id"),
+            "document_type": chunk.get("document_type"),
             "chunk_index": chunk.get("chunk_index"),
             "source": chunk.get("source"),
             "text": text,
@@ -400,6 +401,27 @@ class QdrantChunkStore(QdrantCollectionStore):
 
     def search_chunks(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         return self.search(query, limit)
+
+    def delete_by_document(self, document_id: str) -> ExternalWriteResult:
+        if not self.url:
+            return ExternalWriteResult("qdrant", False, "not configured")
+        try:
+            self._request(
+                "POST",
+                f"/collections/{self.collection}/points/delete?wait=true",
+                {
+                    "filter": {
+                        "must": [
+                            {"key": "document_id", "match": {"value": document_id}}
+                        ]
+                    }
+                },
+            )
+        except RuntimeError as exc:
+            return ExternalWriteResult("qdrant", False, str(exc))
+        return ExternalWriteResult(
+            "qdrant", True, f"deleted chunks for document {document_id}"
+        )
 
     def upsert_chunks(
         self, chunks: list[dict[str, Any]], *, batch_size: int = 32

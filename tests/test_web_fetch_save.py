@@ -123,3 +123,50 @@ def test_web_fetch_autosave_skips_short_pages(tmp_path, monkeypatch):
     assert result.ok
     assert "knowledge_save" not in (result.metadata or {})
     assert context.store.knowledge_documents() == []
+
+
+def test_web_fetch_refetch_supersedes_old_version(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    _patch_network(monkeypatch, b"version one body " * 100)
+    arguments = {"url": "https://example.com/notes", "save_to_knowledge": True}
+
+    first = _web_fetch(context, arguments)
+    _patch_network(monkeypatch, b"version two body " * 100)
+    second = _web_fetch(context, arguments)
+
+    old_id = first.metadata["saved_document_id"]
+    new_id = second.metadata["saved_document_id"]
+    assert second.metadata["knowledge_save"] == "saved"
+    assert second.metadata["superseded_documents"] == [old_id]
+    documents = {
+        doc["document_id"]: doc for doc in context.store.knowledge_documents()
+    }
+    assert documents[old_id]["metadata"]["superseded_by"] == new_id
+    assert documents[old_id]["metadata"]["superseded_at"]
+    assert "superseded_by" not in (documents[new_id]["metadata"] or {})
+    # Old chunks are retired; only the new version is retrievable.
+    assert context.store.knowledge_chunks(old_id) == []
+    assert context.store.knowledge_chunks(new_id)
+    hits = context.store.search_chunks("version body", limit=10)
+    assert hits and all(
+        row["payload"]["document_id"] == new_id for row in hits
+    )
+
+
+def test_web_fetch_third_version_supersedes_second_only(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    arguments = {"url": "https://example.com/notes", "save_to_knowledge": True}
+    for body in (b"one " * 200, b"two " * 200, b"three " * 200):
+        _patch_network(monkeypatch, body)
+        result = _web_fetch(context, arguments)
+    final_id = result.metadata["saved_document_id"]
+
+    live = [
+        doc
+        for doc in context.store.knowledge_documents()
+        if not (doc["metadata"] or {}).get("superseded_by")
+    ]
+    assert [doc["document_id"] for doc in live] == [final_id]
+    for doc in context.store.knowledge_documents():
+        if doc["document_id"] != final_id:
+            assert context.store.knowledge_chunks(doc["document_id"]) == []

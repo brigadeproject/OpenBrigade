@@ -4,8 +4,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
+from datetime import timedelta
+
 from brigade.ingestion import chunk_text
-from brigade.time import utc_now_iso
+from brigade.time import parse_utc_iso, utc_now, utc_now_iso
 
 SUPPORTED_TEXT_EXTENSIONS = {".md", ".txt"}
 
@@ -73,6 +75,7 @@ def ingest_text(
                 "chunk_id": chunk_id,
                 "kb_id": f"chunk:{chunk_id}",
                 "document_id": document.document_id,
+                "document_type": document_type,
                 "chunk_index": chunk.index,
                 "text": chunk.text,
                 "source": source,
@@ -162,6 +165,62 @@ def store_ingest_result(store: object, result: IngestResult) -> dict[str, object
     for record in provenance:
         store.add_provenance_record(record)
     return document.to_dict()
+
+
+def web_knowledge_max_age_days(store: object) -> int:
+    """Operator TTL for web-fetched knowledge, in days. 0 disables expiry."""
+    try:
+        raw = (store.runtime_overrides() or {}).get("web_knowledge_max_age_days")
+        value = int(raw) if raw is not None else 0
+    except (TypeError, ValueError, RuntimeError):
+        value = 0
+    return max(0, value)
+
+
+def web_chunk_expired(chunk: dict[str, object], max_age_days: int) -> bool:
+    """True when a chunk comes from a web document older than the TTL.
+
+    Non-web chunks (including pre-1.2 chunks without a document_type) never
+    expire; a missing/unparseable created_at is treated as fresh so a bad
+    timestamp cannot silently hide knowledge.
+    """
+    if max_age_days <= 0:
+        return False
+    if str(chunk.get("document_type") or "") != "web":
+        return False
+    created_at = str(chunk.get("created_at") or "")
+    if not created_at:
+        return False
+    try:
+        age = utc_now() - parse_utc_iso(created_at)
+    except ValueError:
+        return False
+    return age > timedelta(days=max_age_days)
+
+
+def active_knowledge_chunks(
+    store: object, document_id: str | None = None
+) -> list[dict[str, object]]:
+    """Knowledge chunks minus expired web content — the retrieval-side view."""
+    max_age_days = web_knowledge_max_age_days(store)
+    chunks = store.knowledge_chunks(document_id)
+    if max_age_days <= 0:
+        return chunks
+    return [chunk for chunk in chunks if not web_chunk_expired(chunk, max_age_days)]
+
+
+def filter_expired_web_rows(
+    store: object, rows: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """Drop {score, payload} search rows whose payload is an expired web chunk."""
+    max_age_days = web_knowledge_max_age_days(store)
+    if max_age_days <= 0:
+        return rows
+    return [
+        row
+        for row in rows
+        if not web_chunk_expired(row.get("payload") or {}, max_age_days)
+    ]
 
 
 def _extract_summary(content: str, fallback: str) -> str:

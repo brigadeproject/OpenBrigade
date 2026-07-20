@@ -13,6 +13,7 @@ from typing import Any
 
 from brigade.config import Settings
 from brigade.kb import make_kb_id, parse_kb_id, provenance_edges
+from brigade.knowledge import active_knowledge_chunks, web_chunk_expired, web_knowledge_max_age_days
 from brigade.store import StateStore
 
 DEFAULT_GRAPH_NODE_LIMIT = 300
@@ -67,6 +68,21 @@ def _agent_memory_files(settings: Settings, agent: Any) -> list[dict[str, object
             }
         )
     return files
+
+
+def _document_flags(store: StateStore, document: dict[str, Any]) -> dict[str, bool]:
+    metadata = document.get("metadata") or {}
+    stale = False
+    max_age_days = web_knowledge_max_age_days(store)
+    if max_age_days > 0 and document.get("document_type") == "web":
+        stale = web_chunk_expired(
+            {
+                "document_type": "web",
+                "created_at": metadata.get("fetched_at") or document.get("ingested_at"),
+            },
+            max_age_days,
+        )
+    return {"superseded": bool(metadata.get("superseded_by")), "stale": stale}
 
 
 def _document_related(
@@ -128,6 +144,7 @@ def register_knowledge_routes(
         return {
             "kb_id": make_kb_id("doc", document_id),
             "document": document,
+            **_document_flags(store, document),
             "chunks": chunks,
             "episode": episode,
             "provenance": provenance,
@@ -207,6 +224,7 @@ def register_knowledge_routes(
         page = documents[offset : offset + limit]
         for item in page:
             item["kb_id"] = make_kb_id("doc", str(item.get("document_id")))
+            item.update(_document_flags(store, item))
         return {"total": total, "limit": limit, "offset": offset, "documents": page}
 
     @app.get("/api/knowledge/documents/{document_id}")
@@ -579,7 +597,7 @@ def _keyword_chunk_scan(
     if not terms:
         return []
     matches: list[dict[str, Any]] = []
-    for chunk in store.knowledge_chunks():
+    for chunk in active_knowledge_chunks(store):
         text = str(chunk.get("text") or "").lower()
         if any(term in text for term in terms):
             matches.append({"score": None, "payload": chunk})

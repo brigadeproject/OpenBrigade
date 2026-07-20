@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from brigade.config import Settings
+from brigade.knowledge import active_knowledge_chunks
 from brigade.finance import persist_financial_report
 from brigade.meta import evaluate_assignment_alignment
 from brigade.prompt_floors import (
@@ -1935,7 +1936,7 @@ def _targeted_knowledge_snippets(
             )
             if len(snippets) >= limit:
                 return snippets
-    for chunk in store.knowledge_chunks():
+    for chunk in active_knowledge_chunks(store):
         text = str(chunk.get("text") or "")
         haystack = text.lower()
         if terms and not any(term in haystack for term in terms):

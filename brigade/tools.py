@@ -535,16 +535,18 @@ def _save_fetched_page(
     final_url: str,
 ) -> dict[str, Any]:
     content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    previous_versions: list[str] = []
     for document in store.knowledge_documents():
         doc_metadata = document.get("metadata") or {}
-        if (
-            doc_metadata.get("source_url") == url
-            and doc_metadata.get("content_hash") == content_hash
-        ):
+        if doc_metadata.get("source_url") != url:
+            continue
+        if doc_metadata.get("content_hash") == content_hash:
             return {
                 "knowledge_save": "skipped-duplicate",
                 "saved_document_id": document.get("document_id"),
             }
+        if not doc_metadata.get("superseded_by"):
+            previous_versions.append(str(document.get("document_id")))
     content_dir = store.data_dir / "knowledge" / "web"
     content_dir.mkdir(parents=True, exist_ok=True)
     content_path = content_dir / f"{content_hash}.txt"
@@ -566,7 +568,17 @@ def _save_fetched_page(
         },
     )
     saved = store_ingest_result(store, result)
-    return {"knowledge_save": "saved", "saved_document_id": saved["document_id"]}
+    outcome: dict[str, Any] = {
+        "knowledge_save": "saved",
+        "saved_document_id": saved["document_id"],
+    }
+    # The page changed: retire earlier versions of the same URL so retrieval
+    # only ever surfaces the current content.
+    for old_document_id in previous_versions:
+        store.supersede_knowledge_document(old_document_id, str(saved["document_id"]))
+    if previous_versions:
+        outcome["superseded_documents"] = previous_versions
+    return outcome
 
 
 # Delegated tasks carry no idempotency key, so a planner re-run cheerfully

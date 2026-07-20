@@ -48,6 +48,8 @@ type DocumentRow = {
   source: string;
   document_type: string;
   ingested_at: string;
+  superseded?: boolean;
+  stale?: boolean;
 };
 type DocumentsPayload = { total: number; documents: DocumentRow[] };
 type EpisodeRow = {
@@ -208,6 +210,8 @@ export default function KnowledgeView({
                 <span className="ob-kb-row-title">{document.title}</span>
                 <span className="ob-kb-row-meta">
                   {document.document_type} · {document.source}
+                  {document.superseded ? " · superseded" : ""}
+                  {document.stale ? " · stale" : ""}
                 </span>
               </button>
             ))}
@@ -663,6 +667,14 @@ function DocumentInspector({
   return (
     <>
       <h3 className="ob-kb-inspector-title">{String(document.title || "")}</h3>
+      {Boolean(payload.superseded) && (
+        <span className="ob-badge warn">
+          superseded by {String(metadata.superseded_by || "a newer fetch")}
+        </span>
+      )}
+      {Boolean(payload.stale) && (
+        <span className="ob-badge warn">stale — past the web knowledge TTL</span>
+      )}
       <dl className="ob-kb-fields">
         <dt>type</dt>
         <dd>{String(document.document_type || "")}</dd>
@@ -674,6 +686,12 @@ function DocumentInspector({
           <>
             <dt>url</dt>
             <dd>{String(metadata.source_url)}</dd>
+          </>
+        )}
+        {Boolean(metadata.fetched_at) && (
+          <>
+            <dt>fetched</dt>
+            <dd>{String(metadata.fetched_at)}</dd>
           </>
         )}
       </dl>

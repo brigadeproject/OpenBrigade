@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from brigade.finance import persist_financial_report
+from brigade.knowledge import active_knowledge_chunks
 from brigade.orchestrator import orchestration_event, record_orchestration_events
 from brigade.prompt_floors import build_agent_floor, compact_json
 from brigade.providers import (
@@ -877,7 +878,7 @@ def _agent_state_context(store: StateStore, agent_id: str) -> dict[str, Any] | N
 
 def _knowledge_snippets(store: StateStore) -> list[dict[str, str]]:
     snippets = []
-    for chunk in store.knowledge_chunks()[:MAX_KNOWLEDGE_SNIPPETS]:
+    for chunk in active_knowledge_chunks(store)[:MAX_KNOWLEDGE_SNIPPETS]:
         text = str(chunk.get("text") or "")
         snippets.append(
             {

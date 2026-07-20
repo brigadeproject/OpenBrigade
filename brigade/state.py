@@ -627,10 +627,36 @@ class JsonStateStore:
                 break
         return matches
 
+    def supersede_knowledge_document(
+        self, old_document_id: str, new_document_id: str
+    ) -> None:
+        from brigade.time import utc_now_iso
+
+        state = self.load()
+        documents = state.get("knowledge_documents", [])
+        found = False
+        for document in documents:
+            if document.get("document_id") == old_document_id:
+                metadata = dict(document.get("metadata") or {})
+                metadata["superseded_by"] = new_document_id
+                metadata["superseded_at"] = utc_now_iso()
+                document["metadata"] = metadata
+                found = True
+        if not found:
+            return
+        state["knowledge_chunks"] = [
+            chunk
+            for chunk in state.get("knowledge_chunks", [])
+            if chunk.get("document_id") != old_document_id
+        ]
+        self.save(state)
+
     def search_chunks(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        from brigade.knowledge import active_knowledge_chunks
+
         terms = [term.lower() for term in query.split() if len(term) >= 3]
         matches = []
-        for chunk in self.knowledge_chunks():
+        for chunk in active_knowledge_chunks(self):
             text = str(chunk.get("text") or "").lower()
             if terms and not any(term in text for term in terms):
                 continue

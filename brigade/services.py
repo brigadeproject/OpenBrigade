@@ -249,6 +249,8 @@ RUNTIME_OVERRIDE_KEYS = {
     "stale_work_seconds": int,
     "max_agent_iterations": int,
     "web_fetch_autosave": bool,
+    # TTL (days) for web-fetched knowledge at retrieval time; 0 = never expire.
+    "web_knowledge_max_age_days": int,
 }
 # Floors for integer runtime overrides where zero (or near-zero) would wedge
 # the daemon: a 0s cadence busy-loops, a 0 iteration budget starves every agent.

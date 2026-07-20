@@ -9,6 +9,7 @@ from uuid import uuid4
 from brigade.config import Settings
 from brigade.datastores import Neo4jProvenanceStore, QdrantChunkStore, QdrantEpisodeStore
 from brigade.db import ensure_schema
+from brigade.knowledge import filter_expired_web_rows
 from brigade.schemas import (
     Agent,
     AgentState,
@@ -141,6 +142,10 @@ class StateStore(Protocol):
     def add_knowledge_chunk(self, chunk: dict[str, Any]) -> None: ...
 
     def knowledge_chunks(self, document_id: str | None = None) -> list[dict[str, Any]]: ...
+
+    def supersede_knowledge_document(
+        self, old_document_id: str, new_document_id: str
+    ) -> None: ...
 
     def add_message(self, message: ChatMessage) -> None: ...
 
@@ -1175,6 +1180,42 @@ class PostgresStateStore:
                 f"qdrant chunk write failed for {chunk['chunk_id']}: {result.detail}"
             )
 
+    def supersede_knowledge_document(
+        self, old_document_id: str, new_document_id: str
+    ) -> None:
+        """Mark a document replaced by a newer version and retire its chunks.
+
+        The document row and provenance stay for audit; chunks leave Postgres
+        and Qdrant so retrieval only ever sees the current version. The derived
+        episode is kept deliberately: it summarizes what was learned at the
+        time, which stays true after the source changes.
+        """
+        document = next(
+            (
+                item
+                for item in self.knowledge_documents()
+                if item.get("document_id") == old_document_id
+            ),
+            None,
+        )
+        if document is None:
+            return
+        metadata = dict(document.get("metadata") or {})
+        metadata["superseded_by"] = new_document_id
+        metadata["superseded_at"] = utc_now_iso()
+        document["metadata"] = metadata
+        self.add_knowledge_document(document)
+        self._execute(
+            "delete from brigade_knowledge_chunks where document_id = %s",
+            (old_document_id,),
+        )
+        result = self._qdrant_chunks.delete_by_document(old_document_id)
+        if self._qdrant_chunks.available() and not result.ok:
+            self.add_alert(
+                f"qdrant chunk delete failed for superseded document "
+                f"{old_document_id}: {result.detail}"
+            )
+
     def knowledge_chunks(self, document_id: str | None = None) -> list[dict[str, Any]]:
         sql = "select record from brigade_knowledge_chunks"
         params: tuple[object, ...] = ()
@@ -1862,10 +1903,11 @@ class PostgresStateStore:
 
     def search_chunks(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         try:
-            return self._qdrant_chunks.search_chunks(query, limit=limit)
+            rows = self._qdrant_chunks.search_chunks(query, limit=limit)
         except RuntimeError as exc:
             self._add_alert_postgres(f"qdrant chunk search failed: {exc}")
             return []
+        return filter_expired_web_rows(self, rows)
 
     def chunk_neighbors(self, chunk_id: str, limit: int = 8) -> list[dict[str, Any]]:
         return self._qdrant_chunks.neighbors(chunk_id, limit=limit)

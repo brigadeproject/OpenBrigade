@@ -65,6 +65,17 @@ Operators can enable autosave for every successful fetch over 500 chars via the
 `(source_url, content_hash)`; page bodies land in `<data_dir>/knowledge/web/<hash>.txt`. A failed
 save never fails the fetch.
 
+Freshness is enforced two ways so dated pages cannot linger in retrieval:
+
+- **Supersede on refetch** — saving a URL whose content changed marks earlier versions
+  `superseded_by`/`superseded_at` and deletes their chunks from Postgres and Qdrant. The document
+  row, provenance, and derived episode are kept for audit (an episode summarizes what was learned
+  at the time and stays true after the page changes). Only the newest version is ever retrievable.
+- **TTL** — the `web_knowledge_max_age_days` runtime override (0 = disabled) excludes web chunks
+  older than the window from every retrieval path: runner knowledge snippets, orchestrator
+  targeting, vector search, and the KB API keyword scan. Expired documents remain visible in the
+  Knowledge Base tab with a `stale` badge; local/non-web documents never expire.
+
 ## Unified Read API and GUI
 
 `/api/knowledge/*` (RBAC `knowledge:read`, read-only) serves every store through one namespace:

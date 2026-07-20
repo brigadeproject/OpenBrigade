@@ -103,3 +103,56 @@ def test_ingest_text_propagates_document_id_everywhere() -> None:
     for record in chunk_records:
         assert record["metadata"]["document_id"] == doc_id
     assert document.metadata["content_type"] == "md"
+
+
+def test_web_chunk_expiry_rules() -> None:
+    from brigade.knowledge import web_chunk_expired
+
+    old = {"document_type": "web", "created_at": "2026-01-01T00:00:00+00:00"}
+    fresh = {"document_type": "web", "created_at": "2026-07-19T00:00:00+00:00"}
+    local_doc = {"document_type": "note", "created_at": "2020-01-01T00:00:00+00:00"}
+    untyped = {"created_at": "2020-01-01T00:00:00+00:00"}
+
+    assert web_chunk_expired(old, 30) is True
+    assert web_chunk_expired(fresh, 30) is False
+    assert web_chunk_expired(old, 0) is False  # TTL disabled
+    assert web_chunk_expired(local_doc, 30) is False  # non-web never expires
+    assert web_chunk_expired(untyped, 30) is False  # pre-1.2 chunks stay
+    assert web_chunk_expired({"document_type": "web", "created_at": "bogus"}, 30) is False
+
+
+def test_active_knowledge_chunks_filters_expired_web(tmp_path) -> None:
+    from brigade.knowledge import active_knowledge_chunks
+    from brigade.state import JsonStateStore
+
+    store = JsonStateStore(tmp_path / "state.json")
+    store.add_knowledge_chunk(
+        {
+            "chunk_id": "old-web",
+            "document_id": "doc-web",
+            "document_type": "web",
+            "chunk_index": 0,
+            "text": "outdated web text",
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
+    store.add_knowledge_chunk(
+        {
+            "chunk_id": "local",
+            "document_id": "doc-local",
+            "document_type": "note",
+            "chunk_index": 0,
+            "text": "durable local text",
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
+
+    # TTL off: everything visible.
+    assert {c["chunk_id"] for c in active_knowledge_chunks(store)} == {"old-web", "local"}
+
+    store.set_runtime_overrides({"web_knowledge_max_age_days": 30})
+    assert {c["chunk_id"] for c in active_knowledge_chunks(store)} == {"local"}
+    assert all(
+        row["payload"]["chunk_id"] != "old-web"
+        for row in store.search_chunks("text", limit=10)
+    )
