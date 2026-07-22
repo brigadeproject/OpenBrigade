@@ -478,6 +478,56 @@ def test_escalation_create_assignment_routes_to_chief(tmp_path):
     assert "suggested agent was ada" in created.assignment_rationale
 
 
+def test_rebalance_archived_target_is_skipped_not_rejected(tmp_path):
+    # An assignment archived since the LLM's snapshot is a benign race: the
+    # action is silently skipped, never surfaced as a rejected cycle_decision.
+    store = JsonStateStore(tmp_path / "state.json")
+    store.add_agent(Agent("ada", "Ada", "workspace-ada"))
+    archived = _assignment(
+        text="Do the thing",
+        agent="ada",
+        status=AssignmentStatus.COMPLETE,
+    )
+    store.archive_assignment(archived, "done")
+
+    outcome = apply_orchestrator_actions(
+        store,
+        [
+            {
+                "type": "rebalance_queued_assignment",
+                "assignment_id": archived.assignment_id,
+                "to_agent_id": "ada",
+            }
+        ],
+    )
+
+    assert outcome["rejected"] == []
+    assert len(outcome["skipped"]) == 1
+    assert archived.assignment_id in outcome["skipped"][0]["reason"]
+
+
+def test_rebalance_unknown_target_is_rejected(tmp_path):
+    # A genuinely unknown id (never in live assignments or history) keeps its
+    # audit trail: it is rejected, not silenced.
+    store = JsonStateStore(tmp_path / "state.json")
+    store.add_agent(Agent("ada", "Ada", "workspace-ada"))
+
+    outcome = apply_orchestrator_actions(
+        store,
+        [
+            {
+                "type": "rebalance_queued_assignment",
+                "assignment_id": "ghost-id-that-never-existed",
+                "to_agent_id": "ada",
+            }
+        ],
+    )
+
+    assert outcome["skipped"] == []
+    assert len(outcome["rejected"]) == 1
+    assert "ghost-id-that-never-existed" in outcome["rejected"][0]["reason"]
+
+
 def test_idle_synthesis_targets_chief_for_worker_goal(tmp_path):
     store = _store_with_team(tmp_path)
     store.add_goal(

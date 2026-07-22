@@ -266,16 +266,38 @@ def test_runtime_settings_route(tmp_path):
 
 
 def test_apply_actions_skips_stale_target(tmp_path):
+    # A target archived since the LLM's snapshot is a benign race → silent skip.
     store = _store(tmp_path)
+    archived = _archive(store)
     result = apply_orchestrator_actions(
         store,
-        [{"type": "rebalance_queued_assignment", "assignment_id": "ghost", "to_agent_id": "ada"}],
+        [
+            {
+                "type": "rebalance_queued_assignment",
+                "assignment_id": archived.assignment_id,
+                "to_agent_id": "ada",
+            }
+        ],
     )
     assert result["rejected"] == []
     assert len(result["skipped"]) == 1
     assert "unknown assignment" in result["skipped"][0]["reason"]
     # a benign race must not raise an operator alert
     assert store.alerts() == []
+
+
+def test_apply_actions_rejects_never_existed_target(tmp_path):
+    # A genuinely unknown id (never in live assignments or history) keeps its
+    # audit trail — rejected, not silenced.
+    store = _store(tmp_path)
+    result = apply_orchestrator_actions(
+        store,
+        [{"type": "rebalance_queued_assignment", "assignment_id": "ghost", "to_agent_id": "ada"}],
+    )
+    assert result["skipped"] == []
+    assert len(result["rejected"]) == 1
+    assert "unknown assignment ghost" in result["rejected"][0]["reason"]
+    assert store.alerts()  # genuine rejection alerts the operator
 
 
 def test_apply_actions_rejects_genuinely_invalid_action(tmp_path):

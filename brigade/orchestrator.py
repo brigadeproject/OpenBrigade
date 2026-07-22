@@ -9,7 +9,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from brigade.config import Settings
-from brigade.knowledge import active_knowledge_chunks
+from brigade.knowledge import active_knowledge_chunks, filter_expired_web_rows
 from brigade.finance import persist_financial_report
 from brigade.meta import evaluate_assignment_alignment
 from brigade.prompt_floors import (
@@ -1629,6 +1629,20 @@ def apply_orchestrator_actions(
     return {"applied": applied, "rejected": rejected, "skipped": skipped}
 
 
+def _missing_assignment_error(store: StateStore, assignment_id: str) -> ValueError:
+    """Classify an escalation target that ``find_assignment`` could not resolve.
+
+    ``find_assignment`` returns ``None`` both for an assignment archived since
+    the LLM built its snapshot (a benign race) and for a genuinely
+    unknown/hallucinated id. Only the former should be silently skipped — a
+    never-existed id is a real rejection worth an audit ``cycle_decision``.
+    """
+    for item in store.assignment_history():
+        if item.get("assignment_id") == assignment_id:
+            return StaleAssignmentTarget(f"unknown assignment {assignment_id}")
+    return ValueError(f"unknown assignment {assignment_id}")
+
+
 def _completed_assignment_ids(
     assignments: list[Assignment],
     assignment_history: list[dict[str, object]],
@@ -1749,7 +1763,7 @@ def _apply_rebalance_queued_assignment(
     to_agent_id = resolved
     assignment = store.find_assignment(assignment_id)
     if assignment is None:
-        raise StaleAssignmentTarget(f"unknown assignment {assignment_id}")
+        raise _missing_assignment_error(store, assignment_id)
     if assignment.status != AssignmentStatus.QUEUED:
         raise ValueError(f"assignment {assignment_id} is not queued")
     previous = assignment.assigned_to
@@ -1799,7 +1813,7 @@ def _apply_ladder_action(
         raise ValueError(f"{action_type} is missing assignment_id")
     assignment = store.find_assignment(assignment_id)
     if assignment is None:
-        raise StaleAssignmentTarget(f"unknown assignment {assignment_id}")
+        raise _missing_assignment_error(store, assignment_id)
     if assignment.status != AssignmentStatus.BLOCKED:
         raise ValueError(f"assignment {assignment_id} is not blocked")
     if assignment.awaiting_human:
@@ -1839,7 +1853,7 @@ def _validate_request_human(store: StateStore, action: dict[str, Any]) -> None:
     if assignment_id:
         assignment = store.find_assignment(assignment_id)
         if assignment is None:
-            raise StaleAssignmentTarget(f"unknown assignment {assignment_id}")
+            raise _missing_assignment_error(store, assignment_id)
         if assignment.status == AssignmentStatus.BLOCKED and not (
             assignment.awaiting_human
             or assignment.consecutive_failures >= HUMAN_ESCALATION_FAILURES
@@ -1936,6 +1950,29 @@ def _targeted_knowledge_snippets(
             )
             if len(snippets) >= limit:
                 return snippets
+    # Prefer vector-ranked chunks (Qdrant); fall back to a keyword scan when the
+    # vector store is unconfigured/empty, mirroring /api/knowledge/search.
+    chunk_rows = (
+        store.search_chunks(" ".join(sorted(terms)), limit=limit) if terms else []
+    )
+    if chunk_rows:
+        for row in filter_expired_web_rows(store, chunk_rows):
+            payload = row.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            text = str(payload.get("text") or "")
+            if not text.strip():
+                continue
+            snippets.append(
+                {
+                    "chunk_id": str(payload.get("chunk_id") or ""),
+                    "source": str(payload.get("source") or ""),
+                    "text": text[:1200],
+                }
+            )
+            if len(snippets) >= limit:
+                return snippets
+        return snippets
     for chunk in active_knowledge_chunks(store):
         text = str(chunk.get("text") or "")
         haystack = text.lower()

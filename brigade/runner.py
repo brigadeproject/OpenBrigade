@@ -14,7 +14,6 @@ from typing import Any
 from uuid import uuid4
 
 from brigade.finance import persist_financial_report
-from brigade.knowledge import active_knowledge_chunks
 from brigade.orchestrator import orchestration_event, record_orchestration_events
 from brigade.prompt_floors import build_agent_floor, compact_json
 from brigade.providers import (
@@ -77,7 +76,6 @@ DECOMPOSITION_TOOLS = {"create_subtasks", "delegate"}
 # (full web pages, large files) bloat the prompt enough to destabilize local
 # models, so cap each one like workspace context files.
 MAX_OBSERVATION_CHARS = 4000
-MAX_KNOWLEDGE_SNIPPETS = 3
 TRANSIENT_ERROR_HINTS = (
     "timeout",
     "timed out",
@@ -874,20 +872,6 @@ def _dependency_state(store: StateStore, assignment: Assignment) -> list[dict[st
 def _agent_state_context(store: StateStore, agent_id: str) -> dict[str, Any] | None:
     state = store.agent_states().get(agent_id)
     return state.to_dict() if state else None
-
-
-def _knowledge_snippets(store: StateStore) -> list[dict[str, str]]:
-    snippets = []
-    for chunk in active_knowledge_chunks(store)[:MAX_KNOWLEDGE_SNIPPETS]:
-        text = str(chunk.get("text") or "")
-        snippets.append(
-            {
-                "chunk_id": str(chunk.get("chunk_id") or ""),
-                "source": str(chunk.get("source") or chunk.get("content_path") or ""),
-                "text": _truncate(text, 1200),
-            }
-        )
-    return snippets
 
 
 def _truncate(text: str, limit: int) -> str:

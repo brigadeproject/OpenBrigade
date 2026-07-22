@@ -329,6 +329,49 @@ def test_orchestrator_floor_contains_minimum_snapshot_only(tmp_path):
     assert "knowledge_snippets" not in floor
 
 
+def test_targeted_knowledge_snippets_prefers_vector_ranking(tmp_path):
+    from brigade.orchestrator import _targeted_knowledge_snippets
+
+    class VectorStore(JsonStateStore):
+        def search_chunks(self, query, limit=5):
+            return [
+                {
+                    "score": 0.9,
+                    "payload": {
+                        "chunk_id": "v1",
+                        "source": "qdrant",
+                        "text": "vector ranked chunk about deploy",
+                    },
+                }
+            ]
+
+    store = VectorStore(tmp_path / "state.json")
+    store.add_knowledge_chunk({"chunk_id": "k1", "text": "keyword deploy content"})
+    triggers = [{"assignment": {"assignment": "deploy the release"}}]
+
+    snippets = _targeted_knowledge_snippets(store, triggers, limit=3)
+
+    assert any(item["chunk_id"] == "v1" for item in snippets)
+    # The vector path short-circuits the keyword scan entirely.
+    assert all(item["chunk_id"] != "k1" for item in snippets)
+
+
+def test_targeted_knowledge_snippets_keyword_fallback(tmp_path):
+    from brigade.orchestrator import _targeted_knowledge_snippets
+
+    class EmptyVectorStore(JsonStateStore):
+        def search_chunks(self, query, limit=5):
+            return []
+
+    store = EmptyVectorStore(tmp_path / "state.json")
+    store.add_knowledge_chunk({"chunk_id": "k1", "text": "keyword deploy content here"})
+    triggers = [{"assignment": {"assignment": "deploy the release"}}]
+
+    snippets = _targeted_knowledge_snippets(store, triggers, limit=3)
+
+    assert any(item["chunk_id"] == "k1" for item in snippets)
+
+
 def test_crew_chief_floor_mirrors_owned_goal_freshness_and_agent_load(tmp_path):
     store = JsonStateStore(tmp_path / "state.json")
     chief = Agent("sage", "SAGE", "workspace-sage", role="crew_chief")
