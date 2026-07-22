@@ -1,7 +1,30 @@
 from brigade.kb import make_kb_id, parse_kb_id, provenance_edges
-from brigade.knowledge import ingest_text
+from brigade.knowledge import extract_document_text, html_to_text, ingest_text
 
 import pytest
+
+
+def test_html_to_text_strips_markup() -> None:
+    html = (
+        "<html><head><style>.x{color:red}</style>"
+        "<script>var a=1;</script></head><body>"
+        "<h1>Deploy Runbook</h1><p>Step one: build the image.</p></body></html>"
+    )
+    text = html_to_text(html)
+    assert "Deploy Runbook" in text
+    assert "Step one: build the image." in text
+    assert "<h1>" not in text
+    assert "var a=1" not in text  # script contents dropped
+
+
+def test_extract_document_text_by_extension() -> None:
+    assert extract_document_text("note.txt", b"plain text body") == "plain text body"
+    md = extract_document_text("readme.md", b"# Title\nbody")
+    assert md.startswith("# Title")
+    html = extract_document_text("page.html", b"<p>hello world</p>")
+    assert "hello world" in html
+    with pytest.raises(ValueError):
+        extract_document_text("archive.zip", b"PK\x03\x04")
 
 
 def test_kb_id_round_trip() -> None:

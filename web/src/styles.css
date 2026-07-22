@@ -4202,9 +4202,76 @@ button.danger:disabled {
   gap: 6px;
 }
 
+.ob-kb-graph-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 420px;
+  display: flex;
+}
+
 .ob-kb-graph {
   flex: 1;
   min-height: 420px;
+}
+
+.ob-kb-graph-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.ob-kb-linked {
+  margin-top: 10px;
+  border-top: 1px solid var(--c-border, #2a3140);
+  padding-top: 8px;
+}
+
+.ob-kb-head-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.ob-kb-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+
+.ob-kb-dialog {
+  background: var(--c-panel, #171c24);
+  border: 1px solid var(--c-border, #2a3140);
+  border-radius: 8px;
+  padding: 16px;
+  width: min(460px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ob-kb-dialog input,
+.ob-kb-dialog textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.ob-kb-dialog-row {
+  display: flex;
+  gap: 8px;
+}
+
+.ob-kb-dialog-row input {
+  flex: 1;
+}
+
+.ob-kb-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
 }
 
 .ob-kb-empty {

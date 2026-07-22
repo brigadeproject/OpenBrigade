@@ -10,6 +10,83 @@ from brigade.ingestion import chunk_text
 from brigade.time import parse_utc_iso, utc_now, utc_now_iso
 
 SUPPORTED_TEXT_EXTENSIONS = {".md", ".txt"}
+# Formats the ingest pipeline can turn into plain text. Text formats need no
+# extra dependency; .pdf/.html use the optional ``ingest`` extra (pypdf +
+# trafilatura), with a stdlib fallback for HTML so a bare stack still works.
+SUPPORTED_INGEST_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | {".pdf", ".html", ".htm"}
+
+
+def _pdf_to_text(data: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:  # pragma: no cover - depends on the ingest extra
+        raise ValueError(
+            "PDF ingestion requires the 'ingest' extra (pip install '.[ingest]')"
+        ) from exc
+    import io
+
+    reader = PdfReader(io.BytesIO(data))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n\n".join(part.strip() for part in pages if part.strip())
+
+
+def _strip_html_tags(html: str) -> str:
+    """Zero-dependency HTML→text fallback used when trafilatura is absent."""
+    from html.parser import HTMLParser
+
+    class _Extractor(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self._skip = 0
+            self.parts: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs: object) -> None:
+            if tag in {"script", "style"}:
+                self._skip += 1
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in {"script", "style"} and self._skip:
+                self._skip -= 1
+
+        def handle_data(self, data: str) -> None:
+            if not self._skip and data.strip():
+                self.parts.append(data.strip())
+
+    parser = _Extractor()
+    parser.feed(html)
+    return "\n".join(parser.parts)
+
+
+def html_to_text(html: str) -> str:
+    """Extract readable text from HTML.
+
+    Prefers trafilatura (the ``ingest`` extra) for clean article text; falls
+    back to a stdlib tag-stripper so web content is never stored as raw markup.
+    """
+    try:
+        import trafilatura
+
+        extracted = trafilatura.extract(html)
+        if extracted and extracted.strip():
+            return extracted.strip()
+    except Exception:  # pragma: no cover - trafilatura optional / parse issues
+        pass
+    return _strip_html_tags(html)
+
+
+def extract_document_text(filename: str, data: bytes) -> str:
+    """Turn a supported file's bytes into plain text for ingestion.
+
+    Raises ValueError for unsupported extensions or a missing extractor dep.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix in SUPPORTED_TEXT_EXTENSIONS:
+        return data.decode("utf-8", errors="replace")
+    if suffix == ".pdf":
+        return _pdf_to_text(data)
+    if suffix in {".html", ".htm"}:
+        return html_to_text(data.decode("utf-8", errors="replace"))
+    raise ValueError(f"unsupported content type for ingestion: {suffix or '<none>'}")
 
 
 @dataclass(frozen=True)
@@ -139,9 +216,9 @@ def ingest_local_document(
 ) -> IngestResult:
     path = Path(content_path)
     suffix = path.suffix.lower()
-    if suffix not in SUPPORTED_TEXT_EXTENSIONS:
-        raise ValueError(f"unsupported content type for MVP ingestion: {suffix or '<none>'}")
-    content = path.read_text(encoding="utf-8")
+    if suffix not in SUPPORTED_INGEST_EXTENSIONS:
+        raise ValueError(f"unsupported content type for ingestion: {suffix or '<none>'}")
+    content = extract_document_text(path.name, path.read_bytes())
     return ingest_text(
         title=title,
         source=source,

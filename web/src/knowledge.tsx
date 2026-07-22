@@ -38,7 +38,14 @@ type OverviewPayload = {
     chunk_backfill_pending?: number | null;
   };
   neo4j: { ok?: boolean; detail?: string };
-  memory: { agents: { agent_id: string; kb_id: string; files: MemoryFile[] }[] };
+  memory: {
+    agents: {
+      agent_id: string;
+      display_name?: string;
+      kb_id: string;
+      files: MemoryFile[];
+    }[];
+  };
 };
 
 type DocumentRow = {
@@ -65,6 +72,7 @@ type SearchRow = { score: number | null; payload: Record<string, unknown> };
 type SearchPayload = { mode: string; episodes: SearchRow[]; chunks: SearchRow[] };
 type NeighborsPayload = { edges: GraphEdge[]; nodes: GraphNode[]; reason?: string | null };
 type NodePayload = Record<string, unknown> & { kind: string; kb_id?: string };
+type LinkRow = { kbId: string; rel: string; label: string };
 
 const KIND_COLORS: Record<string, string> = {
   document: "var(--c-accent)",
@@ -83,18 +91,47 @@ function kindColor(kind: string): string {
   return KIND_COLORS[kind] || "#5a6472";
 }
 
+const KIND_FROM_PREFIX: Record<string, string> = {
+  doc: "document",
+  chunk: "chunk",
+  episode: "episode",
+  prov: "provenance",
+  agent: "agent",
+  memory: "memory",
+  task: "task",
+  goal: "goal",
+  team: "team",
+  decision: "decision",
+};
+
+function kindOf(kbId: string): string {
+  return KIND_FROM_PREFIX[kbId.split(":")[0]] || "provenance";
+}
+
+function shortLabel(kbId: string): string {
+  const rest = kbId.slice(kbId.indexOf(":") + 1);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(rest) ? rest.split("-")[0] : rest;
+}
+
+function nodeDef(node: GraphNode): ElementDefinition {
+  return { data: { id: node.id, label: node.label, kind: node.kind } };
+}
+
 export default function KnowledgeView({
   api,
   setStatus,
+  canWrite = false,
 }: {
   api: Api;
   setStatus: (message: string) => void;
+  canWrite?: boolean;
 }) {
+  const [showAdd, setShowAdd] = useState(false);
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [graph, setGraph] = useState<GraphPayload | null>(null);
   const [documents, setDocuments] = useState<DocumentRow[]>([]);
   const [episodes, setEpisodes] = useState<EpisodeRow[]>([]);
-  const [browse, setBrowse] = useState<"documents" | "episodes" | "memory">("documents");
+  const [browse, setBrowse] = useState<"memory" | "documents" | "episodes">("memory");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [similarEdges, setSimilarEdges] = useState<GraphEdge[]>([]);
   const [similarNodes, setSimilarNodes] = useState<GraphNode[]>([]);
@@ -156,6 +193,47 @@ export default function KnowledgeView({
   );
 
   const memoryAgents = overview?.memory.agents || [];
+  const agentNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const agent of memoryAgents) {
+      map.set(agent.agent_id, agent.display_name || agent.agent_id);
+    }
+    return map;
+  }, [memoryAgents]);
+
+  // Links for the selected node — provenance/memory edges from the loaded graph
+  // plus any view-time similarity edges — used by the inspector's traversal list.
+  const selectedLinks = useMemo<LinkRow[]>(() => {
+    if (!selectedId || !graph) {
+      return [];
+    }
+    const labelOf = new Map<string, string>();
+    for (const node of graph.nodes) {
+      labelOf.set(node.id, node.label);
+    }
+    for (const node of similarNodes) {
+      if (!labelOf.has(node.id)) {
+        labelOf.set(node.id, node.label);
+      }
+    }
+    const seen = new Set<string>();
+    const rows: LinkRow[] = [];
+    for (const edge of [...graph.edges, ...similarEdges]) {
+      let other: string | null = null;
+      if (edge.source === selectedId) {
+        other = edge.target;
+      } else if (edge.target === selectedId) {
+        other = edge.source;
+      }
+      if (!other || seen.has(other)) {
+        continue;
+      }
+      seen.add(other);
+      rows.push({ kbId: other, rel: edge.rel, label: labelOf.get(other) || other });
+    }
+    return rows;
+  }, [selectedId, graph, similarEdges, similarNodes]);
+
   const qdrantOk = Boolean(overview?.qdrant.ok ?? overview?.qdrant.configured);
   const neo4jOk = Boolean(overview?.neo4j.ok);
   const backfillPending = overview?.qdrant.chunk_backfill_pending;
@@ -165,10 +243,32 @@ export default function KnowledgeView({
       <div className="ob-kb-rail ob-panel">
         <div className="ob-panel-head">
           <span className="ob-panel-title">Knowledge Base</span>
-          <button type="button" className="ob-kb-refresh" onClick={() => void refresh()}>
-            Refresh
-          </button>
+          <div className="ob-kb-head-actions">
+            {canWrite && (
+              <button
+                type="button"
+                className="ob-kb-refresh"
+                onClick={() => setShowAdd(true)}
+              >
+                + Add
+              </button>
+            )}
+            <button type="button" className="ob-kb-refresh" onClick={() => void refresh()}>
+              Refresh
+            </button>
+          </div>
         </div>
+        {showAdd && (
+          <AddDocumentDialog
+            api={api}
+            setStatus={setStatus}
+            onClose={() => setShowAdd(false)}
+            onAdded={() => {
+              setShowAdd(false);
+              void refresh();
+            }}
+          />
+        )}
         {overview && (
           <div className="ob-kb-stats">
             <span className="ob-badge">{overview.postgres.documents} docs</span>
@@ -187,7 +287,7 @@ export default function KnowledgeView({
         )}
         <KnowledgeSearch api={api} onSelect={select} setStatus={setStatus} />
         <div className="segmented ob-kb-browse-switch">
-          {(["documents", "episodes", "memory"] as const).map((section) => (
+          {(["memory", "documents", "episodes"] as const).map((section) => (
             <button
               key={section}
               type="button"
@@ -229,7 +329,11 @@ export default function KnowledgeView({
                 onClick={() => select(`episode:${episode.episode_id}`)}
               >
                 <span className="ob-kb-row-title">{episode.summary || episode.episode_id}</span>
-                <span className="ob-kb-row-meta">{episode.agent_id || "unknown agent"}</span>
+                <span className="ob-kb-row-meta">
+                  {episode.agent_id
+                    ? agentNames.get(episode.agent_id) || episode.agent_id
+                    : "unknown agent"}
+                </span>
               </button>
             ))}
           {browse === "episodes" && !episodes.length && (
@@ -243,7 +347,9 @@ export default function KnowledgeView({
                   className={`ob-kb-row ${selectedId === agent.kb_id ? "selected" : ""}`}
                   onClick={() => select(agent.kb_id)}
                 >
-                  <span className="ob-kb-row-title">{agent.agent_id}</span>
+                  <span className="ob-kb-row-title">
+                    {agent.display_name || agent.agent_id}
+                  </span>
                   <span className="ob-kb-row-meta">{agent.files.length} memory files</span>
                 </button>
                 {agent.files.map((file) => (
@@ -301,6 +407,7 @@ export default function KnowledgeView({
         <KnowledgeInspector
           kbId={selectedId}
           api={api}
+          links={selectedLinks}
           onSelect={select}
           onShowSimilar={showSimilar}
           onShowDocumentGraph={(documentId) => setEgoDocument(documentId)}
@@ -310,6 +417,148 @@ export default function KnowledgeView({
   );
 }
 
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  for (let index = 0; index < bytes.byteLength; index += 1) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+  return btoa(binary);
+}
+
+function AddDocumentDialog({
+  api,
+  setStatus,
+  onClose,
+  onAdded,
+}: {
+  api: Api;
+  setStatus: (message: string) => void;
+  onClose: () => void;
+  onAdded: () => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [source, setSource] = useState("manual");
+  const [type, setType] = useState("note");
+  const [mode, setMode] = useState<"text" | "file">("text");
+  const [content, setContent] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (!title.trim()) {
+      setStatus("Title is required");
+      return;
+    }
+    setBusy(true);
+    try {
+      const body: Record<string, unknown> = {
+        title: title.trim(),
+        source: source.trim() || "manual",
+        type: type.trim() || "note",
+      };
+      if (mode === "file") {
+        if (!file) {
+          setStatus("Choose a file to upload");
+          setBusy(false);
+          return;
+        }
+        body.filename = file.name;
+        body.file_b64 = arrayBufferToBase64(await file.arrayBuffer());
+      } else {
+        if (!content.trim()) {
+          setStatus("Paste some content to add");
+          setBusy(false);
+          return;
+        }
+        body.content = content;
+      }
+      const result = await api<{ document_id: string; kb_id: string }>(
+        "/api/knowledge/documents",
+        { method: "POST", json: body },
+      );
+      setStatus(`Added document ${result.document_id}`);
+      onAdded();
+    } catch (error) {
+      setStatus(`Add failed: ${error instanceof Error ? error.message : error}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="ob-kb-dialog-backdrop" onClick={onClose}>
+      <div className="ob-kb-dialog" onClick={(event) => event.stopPropagation()}>
+        <div className="ob-kb-subhead">Add to Knowledge Base</div>
+        <input
+          aria-label="Title"
+          placeholder="Title"
+          value={title}
+          onChange={(event) => setTitle(event.target.value)}
+        />
+        <div className="ob-kb-dialog-row">
+          <input
+            aria-label="Source"
+            placeholder="Source"
+            value={source}
+            onChange={(event) => setSource(event.target.value)}
+          />
+          <input
+            aria-label="Type"
+            placeholder="Type"
+            value={type}
+            onChange={(event) => setType(event.target.value)}
+          />
+        </div>
+        <div className="segmented ob-kb-browse-switch">
+          <button
+            type="button"
+            className={mode === "text" ? "active" : ""}
+            onClick={() => setMode("text")}
+          >
+            paste text
+          </button>
+          <button
+            type="button"
+            className={mode === "file" ? "active" : ""}
+            onClick={() => setMode("file")}
+          >
+            upload file
+          </button>
+        </div>
+        {mode === "text" ? (
+          <textarea
+            aria-label="Content"
+            placeholder="Paste content…"
+            value={content}
+            rows={8}
+            onChange={(event) => setContent(event.target.value)}
+          />
+        ) : (
+          <input
+            type="file"
+            accept=".md,.txt,.pdf,.html,.htm"
+            onChange={(event) => setFile(event.target.files?.[0] || null)}
+          />
+        )}
+        <div className="ob-kb-dialog-actions">
+          <button type="button" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button type="button" onClick={() => void submit()} disabled={busy}>
+            {busy ? "Adding…" : "Add"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// The graph is explored incrementally: the cytoscape instance is created once
+// and then mutated in place (cy.add / positioning) rather than destroyed and
+// re-laid-out on every change. Initial view seeds with agent nodes only;
+// selecting a node reveals its neighbours from the full in-memory graph and
+// centres on it without disturbing the existing layout or zoom.
 function KnowledgeGraph({
   graph,
   similarEdges,
@@ -325,49 +574,34 @@ function KnowledgeGraph({
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
+  const onSelectRef = useRef(onSelect);
+  onSelectRef.current = onSelect;
 
-  const elements = useMemo<ElementDefinition[]>(() => {
-    if (!graph) {
-      return [];
+  const nodeByIdRef = useRef(new Map<string, GraphNode>());
+  const nodeById = useMemo(() => {
+    const map = new Map<string, GraphNode>();
+    if (graph) {
+      for (const node of graph.nodes) {
+        map.set(node.id, node);
+      }
     }
-    const nodeIds = new Set(graph.nodes.map((node) => node.id));
-    const defs: ElementDefinition[] = graph.nodes.map((node) => ({
-      data: { id: node.id, label: node.label, kind: node.kind },
-    }));
     for (const node of similarNodes) {
-      if (!nodeIds.has(node.id)) {
-        nodeIds.add(node.id);
-        defs.push({ data: { id: node.id, label: node.label, kind: node.kind } });
+      if (!map.has(node.id)) {
+        map.set(node.id, node);
       }
     }
-    const edgeDefs: ElementDefinition[] = [];
-    const pushEdge = (edge: GraphEdge, index: number, prefix: string) => {
-      if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) {
-        return;
-      }
-      edgeDefs.push({
-        data: {
-          id: `${prefix}-${index}`,
-          source: edge.source,
-          target: edge.target,
-          rel: edge.rel,
-          origin: edge.origin,
-        },
-        classes: edge.origin === "similarity" ? "similarity" : undefined,
-      });
-    };
-    graph.edges.forEach((edge, index) => pushEdge(edge, index, "e"));
-    similarEdges.forEach((edge, index) => pushEdge(edge, index, "sim"));
-    return defs.concat(edgeDefs);
-  }, [graph, similarEdges, similarNodes]);
+    return map;
+  }, [graph, similarNodes]);
+  nodeByIdRef.current = nodeById;
 
+  // Create the cytoscape instance once.
   useEffect(() => {
     if (!containerRef.current) {
       return undefined;
     }
     const cy = cytoscape({
       container: containerRef.current,
-      elements,
+      elements: [],
       style: [
         {
           selector: "node",
@@ -421,46 +655,205 @@ function KnowledgeGraph({
           },
         },
       ],
-      layout: { name: "cose", animate: false, padding: 20 },
-      wheelSensitivity: 0.2,
+      wheelSensitivity: 0.45,
     });
     cy.on("tap", "node", (event) => {
-      onSelect(String(event.target.id()));
+      onSelectRef.current(String(event.target.id()));
     });
     cyRef.current = cy;
     return () => {
       cyRef.current = null;
       cy.destroy();
     };
-    // The graph is rebuilt (not patched) per data change: sizes here are small
-    // enough (<=300 nodes server-capped) that relayout beats diffing.
-  }, [elements, onSelect]);
+  }, []);
 
+  // Seed / reset the canvas whenever the underlying graph payload changes.
+  // Shows agent nodes only (or the first slice when no agents exist, e.g. an
+  // ego graph) so the initial layout is cheap and the operator expands from
+  // there.
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy || !graph) {
+      return;
+    }
+    const agents = graph.nodes.filter((node) => node.kind === "agent");
+    const seed = agents.length ? agents : graph.nodes.slice(0, 24);
+    const present = new Set(seed.map((node) => node.id));
+    cy.startBatch();
+    cy.elements().remove();
+    cy.add(seed.map(nodeDef));
+    graph.edges.forEach((edge, index) => {
+      if (present.has(edge.source) && present.has(edge.target)) {
+        cy.add({
+          data: {
+            id: `e-${index}`,
+            source: edge.source,
+            target: edge.target,
+            rel: edge.rel,
+            origin: edge.origin,
+          },
+          classes: edge.origin === "similarity" ? "similarity" : undefined,
+        });
+      }
+    });
+    cy.endBatch();
+    if (cy.nodes().nonempty()) {
+      cy.layout({ name: "cose", animate: false, padding: 30 }).run();
+      cy.fit(undefined, 40);
+    }
+  }, [graph]);
+
+  // Select + expand: reveal the selected node's neighbours from the full graph,
+  // placing new nodes around the focus so nothing already on screen jumps.
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) {
       return;
     }
     cy.nodes().unselect();
-    if (selectedId) {
-      const node = cy.getElementById(selectedId);
-      if (node.nonempty()) {
-        node.select();
+    if (!selectedId || !graph) {
+      return;
+    }
+    let focus = cy.getElementById(selectedId);
+    if (focus.empty()) {
+      const known = nodeByIdRef.current.get(selectedId);
+      const added = cy.add(
+        known
+          ? nodeDef(known)
+          : {
+              data: {
+                id: selectedId,
+                label: shortLabel(selectedId),
+                kind: kindOf(selectedId),
+              },
+            },
+      );
+      const extent = cy.extent();
+      added.position({
+        x: (extent.x1 + extent.x2) / 2,
+        y: (extent.y1 + extent.y2) / 2,
+      });
+      focus = added;
+    }
+    const focusPos = { ...focus.position() };
+
+    const newNodeDefs: ElementDefinition[] = [];
+    const newEdgeDefs: ElementDefinition[] = [];
+    graph.edges.forEach((edge, index) => {
+      let other: string | null = null;
+      if (edge.source === selectedId) {
+        other = edge.target;
+      } else if (edge.target === selectedId) {
+        other = edge.source;
+      }
+      if (!other) {
+        return;
+      }
+      const known = nodeByIdRef.current.get(other);
+      if (cy.getElementById(other).empty() && known) {
+        newNodeDefs.push(nodeDef(known));
+      }
+      const edgeId = `x-${index}`;
+      if (cy.getElementById(edgeId).empty()) {
+        newEdgeDefs.push({
+          data: {
+            id: edgeId,
+            source: edge.source,
+            target: edge.target,
+            rel: edge.rel,
+            origin: edge.origin,
+          },
+          classes: edge.origin === "similarity" ? "similarity" : undefined,
+        });
+      }
+    });
+
+    if (newNodeDefs.length) {
+      cy.startBatch();
+      const addedNodes = cy.add(newNodeDefs);
+      const count = addedNodes.length;
+      addedNodes.forEach((element, index) => {
+        const angle = (2 * Math.PI * index) / Math.max(1, count);
+        element.position({
+          x: focusPos.x + 140 * Math.cos(angle),
+          y: focusPos.y + 140 * Math.sin(angle),
+        });
+      });
+      cy.endBatch();
+    }
+    for (const def of newEdgeDefs) {
+      const data = def.data as { source?: string; target?: string };
+      if (
+        cy.getElementById(String(data.source)).nonempty() &&
+        cy.getElementById(String(data.target)).nonempty()
+      ) {
+        cy.add(def);
       }
     }
-  }, [selectedId, elements]);
 
-  if (!graph) {
-    return <div className="ob-kb-empty">Loading graph…</div>;
-  }
-  if (!graph.nodes.length) {
-    return (
-      <div className="ob-kb-empty">
-        Nothing to show yet — ingest a document with `brigade knowledge ingest`.
-      </div>
+    focus.select();
+    cy.animate({ center: { eles: focus } }, { duration: 220 });
+  }, [selectedId, graph]);
+
+  // Similarity edges arrive on demand ("Show similar"); add them dashed around
+  // the current focus without re-laying-out the graph.
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy || !selectedId) {
+      return;
+    }
+    const focus = cy.getElementById(selectedId);
+    if (focus.empty()) {
+      return;
+    }
+    const focusPos = { ...focus.position() };
+    const missing = similarNodes.filter((node) =>
+      cy.getElementById(node.id).empty(),
     );
-  }
-  return <div ref={containerRef} className="ob-kb-graph" />;
+    if (missing.length) {
+      cy.startBatch();
+      const added = cy.add(missing.map(nodeDef));
+      added.forEach((element, index) => {
+        const angle = (2 * Math.PI * index) / missing.length + 0.6;
+        element.position({
+          x: focusPos.x + 200 * Math.cos(angle),
+          y: focusPos.y + 200 * Math.sin(angle),
+        });
+      });
+      cy.endBatch();
+    }
+    similarEdges.forEach((edge, index) => {
+      const id = `sim-${index}`;
+      if (
+        cy.getElementById(id).empty() &&
+        cy.getElementById(edge.source).nonempty() &&
+        cy.getElementById(edge.target).nonempty()
+      ) {
+        cy.add({
+          data: {
+            id,
+            source: edge.source,
+            target: edge.target,
+            rel: edge.rel,
+            origin: edge.origin,
+          },
+          classes: "similarity",
+        });
+      }
+    });
+  }, [similarEdges, similarNodes, selectedId]);
+
+  return (
+    <div className="ob-kb-graph-wrap">
+      <div ref={containerRef} className="ob-kb-graph" />
+      {!graph && <div className="ob-kb-empty ob-kb-graph-overlay">Loading graph…</div>}
+      {graph && !graph.nodes.length && (
+        <div className="ob-kb-empty ob-kb-graph-overlay">
+          Nothing to show yet — add a document from the rail.
+        </div>
+      )}
+    </div>
+  );
 }
 
 function KnowledgeSearch({
@@ -564,12 +957,14 @@ function KnowledgeSearch({
 function KnowledgeInspector({
   kbId,
   api,
+  links,
   onSelect,
   onShowSimilar,
   onShowDocumentGraph,
 }: {
   kbId: string | null;
   api: Api;
+  links: LinkRow[];
   onSelect: (kbId: string) => void;
   onShowSimilar: (kbId: string) => void;
   onShowDocumentGraph: (documentId: string) => void;
@@ -646,6 +1041,22 @@ function KnowledgeInspector({
       )}
       {["task", "goal", "team", "decision"].includes(payload.kind) && (
         <pre className="ob-kb-pre">{pretty(payload.records)}</pre>
+      )}
+      {links.length > 0 && (
+        <div className="ob-kb-linked">
+          <div className="ob-kb-subhead">linked ({links.length})</div>
+          {links.map((link) => (
+            <button
+              key={link.kbId}
+              type="button"
+              className="ob-kb-row"
+              onClick={() => onSelect(link.kbId)}
+            >
+              <span className="ob-kb-row-title">{link.label}</span>
+              <span className="ob-kb-row-meta">{link.rel}</span>
+            </button>
+          ))}
+        </div>
       )}
     </div>
   );

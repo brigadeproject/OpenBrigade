@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from brigade.knowledge import ingest_text, store_ingest_result
+from brigade.knowledge import html_to_text, ingest_text, store_ingest_result
 from brigade.schemas import Agent, Assignment, AssignmentKind, AssignmentStatus, Priority
 from brigade.store import StateStore
 from brigade.time import utc_now_iso
@@ -551,13 +551,17 @@ def _save_fetched_page(
     content_dir.mkdir(parents=True, exist_ok=True)
     content_path = content_dir / f"{content_hash}.txt"
     content_path.write_text(body, encoding="utf-8")
+    # Ingest clean text, not raw markup: chunks/embeddings hold prose. The raw
+    # body stays on disk for audit and the hash (dedup) is still over the raw
+    # bytes, so change-detection is unaffected.
+    extracted = html_to_text(body).strip() or body
     parsed = urllib.parse.urlparse(url)
     title = f"{parsed.netloc}{parsed.path}".rstrip("/") or url
     result = ingest_text(
         title=title,
         source=url,
         document_type="web",
-        content=body,
+        content=extracted,
         content_path=str(content_path),
         extra_metadata={
             "content_type": "web",

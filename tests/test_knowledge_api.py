@@ -194,3 +194,70 @@ def test_requires_auth_when_enabled(tmp_path):
     app, _ = _app(tmp_path, require_auth=True)
 
     assert TestClient(app).get("/api/knowledge/overview").status_code == 401
+
+
+def test_add_document_from_pasted_text(tmp_path):
+    from fastapi.testclient import TestClient
+
+    app, store = _app(tmp_path)
+
+    response = TestClient(app).post(
+        "/api/knowledge/documents",
+        json={
+            "title": "Manual Note",
+            "source": "operator",
+            "type": "note",
+            "content": "# Manual Note\n\n" + ("added by hand " * 60),
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["kb_id"].startswith("doc:")
+    documents = store.knowledge_documents()
+    assert any(doc["title"] == "Manual Note" for doc in documents)
+    # Chunks embed at write time (no backfill needed).
+    assert store.knowledge_chunks()
+
+
+def test_add_document_from_html_file(tmp_path):
+    import base64
+
+    from fastapi.testclient import TestClient
+
+    app, store = _app(tmp_path)
+    html = b"<html><body><h1>Uploaded</h1><p>clean body text here</p></body></html>"
+
+    response = TestClient(app).post(
+        "/api/knowledge/documents",
+        json={
+            "title": "Uploaded Page",
+            "type": "web",
+            "filename": "page.html",
+            "file_b64": base64.b64encode(html).decode("ascii"),
+        },
+    )
+
+    assert response.status_code == 201
+    chunk_text = " ".join(str(c.get("text") or "") for c in store.knowledge_chunks())
+    assert "clean body text here" in chunk_text
+    assert "<h1>" not in chunk_text  # markup stripped
+
+
+def test_add_document_requires_title(tmp_path):
+    from fastapi.testclient import TestClient
+
+    app, _ = _app(tmp_path)
+
+    response = TestClient(app).post(
+        "/api/knowledge/documents", json={"content": "no title provided"}
+    )
+    assert response.status_code == 400
+
+
+def test_observer_cannot_write_knowledge():
+    from brigade.rbac import can
+    from brigade.schemas import Role, User
+
+    assert not can(User("obs", Role.OBSERVER), "knowledge:write")
+    assert can(User("op", Role.OPERATOR), "knowledge:write")

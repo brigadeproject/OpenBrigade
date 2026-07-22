@@ -814,7 +814,7 @@ function App() {
           />
         ) : view === "knowledge" ? (
           <Suspense fallback={<div className="ob-kb-loading">Loading knowledge base…</div>}>
-            <KnowledgeView api={api} setStatus={setStatus} />
+            <KnowledgeView api={api} setStatus={setStatus} canWrite={can("knowledge:write")} />
           </Suspense>
         ) : view === "proposals" ? (
           <ProposalsView

@@ -13,7 +13,14 @@ from typing import Any
 
 from brigade.config import Settings
 from brigade.kb import make_kb_id, parse_kb_id, provenance_edges
-from brigade.knowledge import active_knowledge_chunks, web_chunk_expired, web_knowledge_max_age_days
+from brigade.knowledge import (
+    active_knowledge_chunks,
+    extract_document_text,
+    ingest_text,
+    store_ingest_result,
+    web_chunk_expired,
+    web_knowledge_max_age_days,
+)
 from brigade.store import StateStore
 
 DEFAULT_GRAPH_NODE_LIMIT = 300
@@ -39,6 +46,20 @@ _KIND_LABELS = {
 def _clip(text: object, limit: int = 80) -> str:
     value = str(text or "").strip()
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+_UUID_PREFIX = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-")
+
+
+def _short_label(text: object) -> str:
+    """Collapse a raw UUID down to its first segment for node labels.
+
+    Non-UUID identifiers (agent slugs, goal statements) pass through unchanged.
+    """
+    value = str(text or "").strip()
+    if _UUID_PREFIX.match(value):
+        return value.split("-", 1)[0]
+    return value
 
 
 def _memory_filename_ok(filename: str) -> bool:
@@ -115,7 +136,7 @@ def register_knowledge_routes(
     require: Any,
     auth_dependency: Any,
 ) -> None:
-    from fastapi import HTTPException
+    from fastapi import Body, HTTPException
     from brigade.auth import AuthResult
 
     def _find_document(document_id: str) -> dict[str, Any]:
@@ -173,6 +194,7 @@ def register_knowledge_routes(
             memory_agents.append(
                 {
                     "agent_id": agent.agent_id,
+                    "display_name": agent.display_name,
                     "kb_id": make_kb_id("agent", agent.agent_id),
                     "files": files,
                 }
@@ -234,6 +256,67 @@ def register_knowledge_routes(
     ) -> dict[str, object]:
         require("knowledge:read", current)
         return _document_payload(document_id)
+
+    @app.post("/api/knowledge/documents", status_code=201)
+    async def knowledge_add_document(
+        payload: dict = Body(...),
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        """Manually add a document to the KB — pasted text or an uploaded file.
+
+        Accepts JSON ``{title, source, type, content}`` for pasted text, or
+        ``{title, source, type, filename, file_b64}`` for a base64 file
+        (.md/.txt/.pdf/.html). Chunks embed at write time, so no backfill.
+        """
+        require("knowledge:write", current)
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="title is required")
+        source = str(payload.get("source") or "manual").strip() or "manual"
+        document_type = str(payload.get("type") or "note").strip() or "note"
+        file_b64 = payload.get("file_b64")
+        content = payload.get("content")
+        if file_b64:
+            import base64
+
+            filename = str(payload.get("filename") or "").strip()
+            if not filename:
+                raise HTTPException(
+                    status_code=400, detail="filename is required with file_b64"
+                )
+            try:
+                raw = base64.b64decode(str(file_b64), validate=True)
+            except Exception as exc:  # noqa: BLE001 - surfaced as a 400
+                raise HTTPException(
+                    status_code=400, detail=f"invalid file_b64: {exc}"
+                ) from exc
+            try:
+                text = extract_document_text(filename, raw)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            content_path = filename
+        elif isinstance(content, str) and content.strip():
+            text = content
+            content_path = f"manual/{title}"
+        else:
+            raise HTTPException(
+                status_code=400, detail="provide 'content' or 'file_b64'"
+            )
+        if not text.strip():
+            raise HTTPException(
+                status_code=400, detail="no extractable text in the document"
+            )
+        result = ingest_text(
+            title=title,
+            source=source,
+            document_type=document_type,
+            content=text,
+            content_path=content_path,
+            extra_metadata={"content_type": document_type, "added_via": "manual"},
+        )
+        saved = store_ingest_result(store, result)
+        document_id = str(saved["document_id"])
+        return {"document_id": document_id, "kb_id": make_kb_id("doc", document_id)}
 
     @app.get("/api/knowledge/episodes")
     async def knowledge_episodes(
@@ -301,6 +384,11 @@ def register_knowledge_routes(
             labels[make_kb_id("chunk", str(chunk.get("chunk_id")))] = _clip(
                 f"{title} · chunk {chunk.get('chunk_index')}", 60
             )
+        # Pre-label agent nodes with the display name up front: they may be
+        # created by a provenance/episode edge before the memory loop runs, and
+        # add_node never relabels a node that already exists.
+        for agent in store.agents():
+            labels[make_kb_id("agent", agent.agent_id)] = _clip(agent.display_name, 60)
 
         def add_node(kb_id: str) -> bool:
             if kb_id in nodes:
@@ -313,7 +401,7 @@ def register_knowledge_routes(
             nodes[kb_id] = {
                 "id": kb_id,
                 "kind": _KIND_LABELS.get(kind, kind),
-                "label": labels.get(kb_id) or _clip(rest, 60),
+                "label": labels.get(kb_id) or _clip(_short_label(rest), 60),
             }
             return True
 
@@ -380,7 +468,9 @@ def register_knowledge_routes(
         for agent in store.agents():
             agent_kb = make_kb_id("agent", agent.agent_id)
             for entry in _agent_memory_files(settings, agent):
-                add_edge(agent_kb, "HAS_MEMORY", str(entry["kb_id"]), "memory")
+                entry_kb = str(entry["kb_id"])
+                labels[entry_kb] = _clip(str(entry["filename"]), 40)
+                add_edge(agent_kb, "HAS_MEMORY", entry_kb, "memory")
 
         return {"nodes": list(nodes.values()), "edges": edges, "truncated": truncated}
 
