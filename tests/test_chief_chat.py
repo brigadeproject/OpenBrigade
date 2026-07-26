@@ -552,3 +552,76 @@ def test_usage_summary_and_episode_tools_answer(tmp_path):
     final_prompt = provider.calls[2]["prompt"]
     assert "ollama:qwen" in final_prompt
     assert "Shipped the report pipeline" in final_prompt
+
+
+def test_search_knowledge_tool_returns_document_excerpts(tmp_path):
+    # 1.2.1: chiefs could reach past episodes but not the knowledge base, so
+    # questions about an uploaded file could never be answered.
+    from brigade.knowledge import ingest_text, store_ingest_result
+
+    store = _fleet(tmp_path)
+    store_ingest_result(
+        store,
+        ingest_text(
+            title="Brigade Compact",
+            source="operator-upload",
+            document_type="note",
+            content="# Brigade Compact\n\n" + ("chiefs escalate blocked work " * 60),
+            content_path="virtual://compact",
+        ),
+    )
+    provider = SequencedTestProvider(
+        [
+            _tool_call("search_knowledge", query="escalate blocked work"),
+            "The Compact says chiefs escalate blocked work.",
+        ]
+    )
+
+    result = _turn(store, provider, content="what does the Brigade Compact say?")
+
+    assert result["tools_used"] == ["search_knowledge"]
+    final_prompt = provider.calls[1]["prompt"]
+    assert "Brigade Compact" in final_prompt  # document title joined onto chunks
+    assert "chiefs escalate blocked work" in final_prompt
+
+
+def test_search_knowledge_falls_back_to_keyword_scan(tmp_path):
+    # Qdrant down/unconfigured must degrade, not fail the turn.
+    from brigade.chief_chat import search_knowledge_excerpts
+
+    store = _fleet(tmp_path)
+    store.add_knowledge_chunk(
+        {
+            "chunk_id": "c1",
+            "document_id": "d1",
+            "document_type": "note",
+            "chunk_index": 0,
+            "text": "the runbook covers postgres failover",
+            "created_at": "2026-07-01T00:00:00+00:00",
+        }
+    )
+
+    def broken_search(query, limit=5):
+        raise RuntimeError("qdrant offline")
+
+    store.search_chunks = broken_search  # type: ignore[method-assign]
+
+    matches = search_knowledge_excerpts(store, "postgres failover", limit=3)
+
+    assert len(matches) == 1
+    assert "postgres failover" in matches[0]["text"]
+
+
+def test_search_knowledge_tool_reports_no_match(tmp_path):
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(
+        [
+            _tool_call("search_knowledge", query="nothing here at all"),
+            "Nothing in the knowledge base on that.",
+        ]
+    )
+
+    result = _turn(store, provider, content="anything about widgets?")
+
+    assert result["tools_used"] == ["search_knowledge"]
+    assert "no knowledge-base documents matched" in provider.calls[1]["prompt"]

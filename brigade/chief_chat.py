@@ -336,6 +336,29 @@ def _tool_search_episodes(
     return ToolResult(True, compact_json({"count": len(matches), "episodes": matches}))
 
 
+def _tool_search_knowledge(
+    context: ChatToolContext, arguments: dict[str, Any]
+) -> ToolResult:
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        return ToolResult(False, "search_knowledge needs a query")
+    matches = search_knowledge_excerpts(
+        context.store, query, limit=min(_int_arg(arguments, "limit", 3), 10)
+    )
+    if not matches:
+        return ToolResult(
+            True,
+            compact_json(
+                {
+                    "count": 0,
+                    "excerpts": [],
+                    "note": "no knowledge-base documents matched; try other wording",
+                }
+            ),
+        )
+    return ToolResult(True, compact_json({"count": len(matches), "excerpts": matches}))
+
+
 def _tool_usage_summary(context: ChatToolContext, arguments: dict[str, Any]) -> ToolResult:
     days = min(_int_arg(arguments, "days", 7), 90)
     cutoff = utc_now() - timedelta(days=days)
@@ -413,6 +436,49 @@ def search_episode_summaries(
             }
         )
     return matches
+
+
+def search_knowledge_excerpts(
+    store: StateStore, query: str, limit: int = 3
+) -> list[dict[str, Any]]:
+    """Knowledge-base chunk search for chat turns: vector-ranked when Qdrant is
+    live, keyword scan otherwise (same graceful degradation as
+    ``/api/knowledge/search``). Chunk rows carry no title, so the owning
+    document is joined in — a chief answering about "the file I uploaded"
+    needs the title, not a chunk id."""
+    from brigade.knowledge import active_knowledge_chunks
+
+    try:
+        rows = store.search_chunks(query, limit=limit)
+    except RuntimeError:
+        rows = []
+    if not rows:
+        terms = [term.lower() for term in query.split() if len(term) >= 3]
+        if not terms:
+            return []
+        rows = [
+            {"score": None, "payload": chunk}
+            for chunk in active_knowledge_chunks(store)
+            if any(term in str(chunk.get("text") or "").lower() for term in terms)
+        ][:limit]
+    titles = {
+        str(doc.get("document_id")): str(doc.get("title") or "")
+        for doc in store.knowledge_documents()
+    }
+    excerpts = []
+    for row in rows[:limit]:
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else row
+        document_id = str(payload.get("document_id") or "")
+        excerpts.append(
+            {
+                "title": titles.get(document_id) or "(untitled)",
+                "source": payload.get("source"),
+                "document_type": payload.get("document_type"),
+                "created_at": payload.get("created_at"),
+                "text": str(payload.get("text") or "")[:1200],
+            }
+        )
+    return excerpts
 
 
 def chief_query_registry(*, include_web_fetch: bool = True) -> ToolRegistry:
@@ -500,6 +566,22 @@ def chief_query_registry(*, include_web_fetch: bool = True) -> ToolRegistry:
             },
         ),
         _tool_search_episodes,
+    )
+    registry.register(
+        ToolSpec(
+            name="search_knowledge",
+            description=(
+                "Search the knowledge base — uploaded and fetched documents "
+                "(PDFs, pages, notes) — and get matching excerpts with their "
+                "document title and source. Use this for questions about "
+                "files or reference material, not past conversations."
+            ),
+            argument_schema={
+                "query": "what to look for",
+                "limit": "optional max excerpts (default 3)",
+            },
+        ),
+        _tool_search_knowledge,
     )
     registry.register(
         ToolSpec(
