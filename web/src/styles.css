@@ -2773,6 +2773,171 @@ button.danger:disabled {
   white-space: nowrap;
 }
 
+/* ===== Executive chat surface ===== */
+.executive-chat-view {
+  min-height: 0;
+  height: 100%;
+  padding: 14px;
+}
+
+.executive-chat-shell {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+
+.executive-sidebar,
+.executive-chat-panel {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.executive-sidebar {
+  display: flex;
+  flex-direction: column;
+}
+
+.executive-persona-list,
+.executive-thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.executive-thread-list {
+  border-top: 1px solid var(--line);
+}
+
+.executive-persona-row,
+.executive-thread-list button {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  text-align: left;
+  padding: 8px;
+  border-radius: 8px;
+}
+
+.executive-thread-list button {
+  justify-content: space-between;
+}
+
+.executive-persona-row.is-selected,
+.executive-thread-list button.is-selected {
+  border-color: var(--accent);
+  background: var(--surface-strong);
+}
+
+.executive-persona-row span:not(.ob-agent-avatar),
+.executive-thread-list button span {
+  min-width: 0;
+}
+
+.executive-persona-row strong,
+.executive-thread-list button span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.executive-persona-row small,
+.executive-thread-list button small,
+.mini-label {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.executive-chat-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.executive-chat-head {
+  flex: none;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 320px);
+  gap: 12px;
+  align-items: start;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.executive-chat-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.executive-chat-head p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.executive-feed {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.executive-feed > :first-child {
+  margin-top: auto;
+}
+
+.executive-feed .message-row {
+  width: 100%;
+}
+
+.executive-feed .message-row.from-selected {
+  align-self: flex-end;
+}
+
+.executive-compose {
+  flex: none;
+  position: static;
+  align-items: stretch;
+}
+
+.executive-compose .chat-actions {
+  flex-direction: column;
+  gap: 7px;
+}
+
+.executive-compose .chat-actions button {
+  width: 100%;
+  flex: 1;
+  white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+  .executive-chat-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .executive-sidebar {
+    max-height: 230px;
+  }
+
+  .executive-chat-head {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ===== Right — System + Activity ===== */
 .ob-system {
   flex: none;

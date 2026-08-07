@@ -377,12 +377,39 @@ def test_remember_round_trips_into_next_turn(tmp_path):
     _turn(store, provider, content="remember that I prefer Friday demos")
 
     assert "Friday demos" in read_agent_chat_notes(store, "chief0")
+    records = store.provenance_records()
+    assert records[-1]["node_type"] == "memory_entry"
+    assert records[-1]["metadata"]["source"] == "user_stated"
+    assert records[-1]["metadata"]["author"] == "owner"
 
     provider = SequencedTestProvider(["You prefer Friday demos."])
     _turn(store, provider, content="what do I prefer?")
     prompt = provider.calls[0]["prompt"]
     assert "curated_notes" in prompt
     assert "Operator prefers Friday demos." in prompt
+
+
+def test_remember_rejects_inferred_memory_without_explicit_operator_request(tmp_path):
+    from brigade.prompt_floors import read_agent_chat_notes
+
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(
+        [
+            json.dumps(
+                {
+                    "status": "tool_call",
+                    "tool": "remember",
+                    "arguments": {"note": "Operator prefers Friday demos."},
+                }
+            ),
+            "I did not save that as durable memory.",
+        ]
+    )
+
+    _turn(store, provider, content="Friday demos might work")
+
+    assert read_agent_chat_notes(store, "chief0") == ""
+    assert store.provenance_records() == []
 
 
 def test_episode_recall_block_present_only_on_match(tmp_path):

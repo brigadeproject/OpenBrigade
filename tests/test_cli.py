@@ -8,7 +8,7 @@ import pytest
 from brigade.cli import _chat_tui_provider_from_args, _live_chat_tui_command, _run_cycle, main
 from brigade.config import Settings
 from brigade.orchestrator import CycleResult
-from brigade.schemas import Agent, Assignment, AssignmentStatus, Goal, Mission
+from brigade.schemas import Agent, Assignment, AssignmentStatus, ChatMessage, Goal, Mission
 from brigade.state import JsonStateStore
 from brigade.workspace import write_heartbeat_assignment
 from tests.helpers import TestProvider
@@ -370,6 +370,48 @@ def test_cli_chat_tui_plain_defaults_to_first_agent(tmp_path, monkeypatch, capsy
     rendered = capsys.readouterr().out
 
     assert "Channel: user:operator:sage" in rendered
+
+
+def test_cli_executive_tui_plain_uses_owner_executive_thread(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["init", "mvp", "--mission", "Prototype mission"]) == 0
+    capsys.readouterr()
+
+    assert main(["--as-user", "owner", "executive", "tui", "--plain"]) == 0
+    rendered = capsys.readouterr().out
+
+    assert "Channel: thread:" in rendered
+    assert "No messages" in rendered
+
+
+def test_cli_executive_tui_plain_shows_existing_history(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["init", "mvp", "--mission", "Prototype mission"]) == 0
+    capsys.readouterr()
+
+    store = JsonStateStore(tmp_path / ".brigade" / "state.json")
+    thread = store.resolve_active_conversation(
+        "owner",
+        "executive:executive",
+        title="Executive",
+    )
+    store.add_message(
+        ChatMessage(
+            channel=thread.channel,
+            sender="owner",
+            recipient="executive",
+            content="remember that Thursday is server day",
+        )
+    )
+
+    assert main(["--as-user", "owner", "executive", "tui", "--plain"]) == 0
+    rendered = capsys.readouterr().out
+
+    assert "Thursday is server day" in rendered
 
 
 def test_cli_chat_tui_uses_available_recommended_model_when_not_overridden(tmp_path, monkeypatch):
@@ -1419,7 +1461,7 @@ def test_cli_init_mvp_and_dashboard(tmp_path, monkeypatch, capsys):
 
     assert main(["init", "mvp", "--mission", "Offset operating cost"]) == 0
     initialized = json.loads(capsys.readouterr().out)
-    assert initialized == {"agents": 3, "status": "initialized"}
+    assert initialized == {"agents": 4, "status": "initialized"}
 
     assert main(["dashboard"]) == 0
     dashboard = capsys.readouterr().out
@@ -1427,6 +1469,7 @@ def test_cli_init_mvp_and_dashboard(tmp_path, monkeypatch, capsys):
     assert "- sage (crew_chief): idle" in dashboard
     assert "- garde (infrastructure): idle" in dashboard
     assert "- abacus (financial): idle" in dashboard
+    assert "- executive (executive): idle" in dashboard
 
 
 def test_cli_init_mvp_rejects_second_run_without_force(tmp_path, monkeypatch, capsys):
@@ -1713,6 +1756,28 @@ def test_cli_chat_tui_delegates_to_live_wrapper_inside_repo(tmp_path, monkeypatc
     )
 
     assert command == [str(wrapper), "chat", "tui", "--agent", "sage"]
+
+
+def test_cli_executive_tui_delegates_to_live_wrapper_inside_repo(tmp_path):
+    ops = tmp_path / "ops"
+    ops.mkdir()
+    wrapper = ops / "brigade-live.sh"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    (tmp_path / "docker-compose.yml").write_text("name: brigade\n", encoding="utf-8")
+    args = argparse.Namespace(
+        allow_host_state=False,
+        command="executive",
+        executive_command="tui",
+    )
+
+    command = _live_chat_tui_command(
+        args,
+        ["executive", "tui"],
+        cwd=tmp_path,
+        in_container=False,
+    )
+
+    assert command == [str(wrapper), "executive", "tui"]
 
 
 def test_cli_chat_tui_delegation_respects_allow_host_state(tmp_path):

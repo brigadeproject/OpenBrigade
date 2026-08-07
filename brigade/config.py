@@ -95,6 +95,10 @@ class Settings:
     chief_chat_web_fetch_enabled: bool = True
     connector_chief_chat_enabled: bool = False
     chief_chat_connector_max_iterations: int = 3
+    executive_enabled: bool = True
+    executive_max_iterations: int = 6
+    executive_web_fetch_enabled: bool = True
+    connector_executive_chat_enabled: bool = False
     allow_json_store: bool = False
 
 
@@ -595,6 +599,26 @@ def load_settings(
             "BRIGADE_CHIEF_CHAT_CONNECTOR_MAX_ITERATIONS",
             dotenv,
             config.get("chief_chat_connector_max_iterations", 3),
+        ),
+        executive_enabled=_env_bool(
+            "BRIGADE_EXECUTIVE_ENABLED",
+            dotenv,
+            config.get("executive_enabled", True),
+        ),
+        executive_max_iterations=_env_int(
+            "BRIGADE_EXECUTIVE_MAX_ITERATIONS",
+            dotenv,
+            config.get("executive_max_iterations", 6),
+        ),
+        executive_web_fetch_enabled=_env_bool(
+            "BRIGADE_EXECUTIVE_WEB_FETCH_ENABLED",
+            dotenv,
+            config.get("executive_web_fetch_enabled", True),
+        ),
+        connector_executive_chat_enabled=_env_bool(
+            "BRIGADE_CONNECTOR_EXECUTIVE_CHAT_ENABLED",
+            dotenv,
+            config.get("connector_executive_chat_enabled", False),
         ),
         allow_json_store=_env_bool(
             "BRIGADE_ALLOW_JSON_STORE",

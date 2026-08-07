@@ -434,6 +434,124 @@ def _chat_loop(
             draft += chr(key)
 
 
+def run_executive_chat_tui(
+    store: StateStore,
+    send_message: Callable[[str], dict[str, Any]],
+    *,
+    channel: str,
+    persona_label: str,
+    operator: str,
+    model_label: str,
+    refresh_seconds: float = 1.0,
+) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError("executive chat TUI requires a real TTY")
+    return curses.wrapper(
+        lambda screen: _executive_chat_loop(
+            screen,
+            store,
+            send_message,
+            channel,
+            persona_label,
+            operator,
+            model_label,
+            refresh_seconds,
+        )
+    )
+
+
+def _executive_chat_loop(
+    screen: Any,
+    store: StateStore,
+    send_message: Callable[[str], dict[str, Any]],
+    channel: str,
+    persona_label: str,
+    operator: str,
+    model_label: str,
+    refresh_seconds: float,
+) -> int:
+    curses.curs_set(1)
+    screen.nodelay(False)
+    screen.keypad(True)
+    draft = ""
+    status = (
+        "enter sends, /status shows thread state, /model shows route, "
+        "/clear clears view, /quit exits"
+    )
+    hide_history = False
+    next_refresh = 0.0
+    payload = build_chat_payload(store, channel=channel)
+    while True:
+        now = time.time()
+        if now >= next_refresh:
+            payload = build_chat_payload(store, channel=channel)
+            next_refresh = now + refresh_seconds
+        screen.erase()
+        height, width = screen.getmaxyx()
+        if height <= 0 or width <= 0:
+            continue
+        header = (
+            "OpenBrigade Executive "
+            f"[persona: {persona_label}] [operator: {operator}] "
+            f"[channel: {channel}]"
+        )
+        _safe_addnstr(screen, 0, 0, header, width)
+        input_row = max(3, height - 2)
+        if not hide_history:
+            body = render_chat_view(payload, channel).splitlines()
+            for row, line in enumerate(body[-(input_row - 2) :], start=1):
+                if row >= input_row:
+                    break
+                _safe_addnstr(screen, row, 0, line, width)
+        else:
+            _safe_addnstr(screen, 1, 0, "View cleared. History is still stored.", width)
+        _safe_addnstr(screen, input_row, 0, f"> {draft}", width)
+        _safe_addnstr(screen, input_row + 1, 0, status, width)
+        screen.refresh()
+        key = screen.getch()
+        if key in (10, 13):
+            message = draft.strip()
+            draft = ""
+            command = parse_chat_tui_command(message)
+            if command is not None:
+                if command.action == "quit":
+                    return 0
+                if command.action == "clear":
+                    hide_history = True
+                    status = "cleared local view; durable history retained"
+                    continue
+                if command.action == "status":
+                    payload = build_chat_payload(store, channel=channel)
+                    count = len(payload.get("messages", []))
+                    status = f"thread {channel}: {count} loaded messages"
+                    hide_history = False
+                    continue
+                if command.action == "model":
+                    status = f"model: {model_label}"
+                    continue
+                if command.action == "help":
+                    status = "/status, /model, /clear, /quit"
+                    continue
+                status = f"unknown command: /{command.action}"
+                continue
+            if message:
+                try:
+                    hide_history = False
+                    result = send_message(message)
+                    status = f"sent: {result.get('status')} ({result.get('summary') or ''})"
+                    payload = build_chat_payload(store, channel=channel)
+                except Exception as exc:  # pragma: no cover - interactive safety
+                    status = f"send failed: {exc}"
+            continue
+        if key in (27,):
+            return 0
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            draft = draft[:-1]
+            continue
+        if 32 <= key <= 126:
+            draft += chr(key)
+
+
 def render_settings_view(payload: dict[str, Any]) -> str:
     lines = ["Settings", ""]
     for key in sorted(payload):

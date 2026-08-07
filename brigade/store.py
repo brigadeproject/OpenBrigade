@@ -193,6 +193,16 @@ class StateStore(Protocol):
 
     def update_proposal(self, proposal: dict[str, Any]) -> None: ...
 
+    def upsert_policy_projection(self, projection: dict[str, Any]) -> None: ...
+
+    def policy_projection(
+        self,
+        agent_id: str,
+        path: str,
+    ) -> dict[str, Any] | None: ...
+
+    def policy_projections(self, agent_id: str | None = None) -> list[dict[str, Any]]: ...
+
     def add_recurrence(self, recurrence: dict[str, Any]) -> dict[str, Any]: ...
 
     def recurrences(self, enabled: bool | None = None) -> list[dict[str, Any]]: ...
@@ -1232,13 +1242,7 @@ class PostgresStateStore:
               id, channel, sender, recipient, content, created_at, metadata
             )
             values (%s, %s, %s, %s, %s, %s, %s::jsonb)
-            on conflict (id) do update set
-              channel = excluded.channel,
-              sender = excluded.sender,
-              recipient = excluded.recipient,
-              content = excluded.content,
-              created_at = excluded.created_at,
-              metadata = excluded.metadata
+            on conflict (id) do nothing
             """,
             (
                 message.message_id,
@@ -1477,6 +1481,55 @@ class PostgresStateStore:
     def update_proposal(self, proposal: dict[str, Any]) -> None:
         self._upsert_proposal(proposal)
 
+    def upsert_policy_projection(self, projection: dict[str, Any]) -> None:
+        self._execute(
+            """
+            insert into brigade_policy_projections (
+              id, agent_id, path, file_kind, content_hash, parsed_version,
+              status, updated_at, record
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            on conflict (agent_id, path) do update set
+              id = excluded.id,
+              file_kind = excluded.file_kind,
+              content_hash = excluded.content_hash,
+              parsed_version = excluded.parsed_version,
+              status = excluded.status,
+              updated_at = excluded.updated_at,
+              record = excluded.record
+            """,
+            (
+                projection["projection_id"],
+                projection["agent_id"],
+                projection["path"],
+                projection.get("file_kind"),
+                projection["content_hash"],
+                int(projection.get("parsed_version") or 1),
+                projection.get("status", "active"),
+                projection.get("updated_at") or utc_now_iso(),
+                json.dumps(projection, sort_keys=True),
+            ),
+        )
+
+    def policy_projection(self, agent_id: str, path: str) -> dict[str, Any] | None:
+        return self._record_or_none(
+            """
+            select record
+            from brigade_policy_projections
+            where agent_id = %s and path = %s
+            """,
+            (agent_id, path),
+        )
+
+    def policy_projections(self, agent_id: str | None = None) -> list[dict[str, Any]]:
+        sql = "select record from brigade_policy_projections"
+        params: tuple[object, ...] = ()
+        if agent_id is not None:
+            sql += " where agent_id = %s"
+            params = (agent_id,)
+        sql += " order by agent_id, path"
+        return list(self._records(sql, params))
+
     def _upsert_proposal(self, proposal: dict[str, Any]) -> None:
         self._execute(
             """
@@ -1615,11 +1668,7 @@ class PostgresStateStore:
             """
             insert into brigade_usage_records (id, assignment_id, agent_id, recorded_at, record)
             values (%s, %s, %s, %s, %s::jsonb)
-            on conflict (id) do update set
-              assignment_id = excluded.assignment_id,
-              agent_id = excluded.agent_id,
-              recorded_at = excluded.recorded_at,
-              record = excluded.record
+            on conflict (id) do nothing
             """,
             (
                 record["usage_id"],
@@ -1846,11 +1895,7 @@ class PostgresStateStore:
               id, assignment_id, agent_id, created_at, record
             )
             values (%s, %s, %s, %s, %s::jsonb)
-            on conflict (id) do update set
-              assignment_id = excluded.assignment_id,
-              agent_id = excluded.agent_id,
-              created_at = excluded.created_at,
-              record = excluded.record
+            on conflict (id) do nothing
             """,
             (
                 transcript["transcript_id"],
@@ -1869,14 +1914,12 @@ class PostgresStateStore:
         )
 
     def add_episode(self, episode: dict[str, Any]) -> None:
-        self._execute(
+        inserted = self._query_one(
             """
             insert into brigade_episodes (id, agent_id, created_at, record)
             values (%s, %s, %s, %s::jsonb)
-            on conflict (id) do update set
-              agent_id = excluded.agent_id,
-              created_at = excluded.created_at,
-              record = excluded.record
+            on conflict (id) do nothing
+            returning id
             """,
             (
                 episode["episode_id"],
@@ -1885,6 +1928,8 @@ class PostgresStateStore:
                 json.dumps(episode, sort_keys=True),
             ),
         )
+        if inserted is None:
+            return
         result = self._qdrant.upsert_episode(episode)
         if self._qdrant.available() and not result.ok:
             self.add_alert(
@@ -1926,15 +1971,12 @@ class PostgresStateStore:
         }
 
     def add_provenance_record(self, record: dict[str, Any]) -> None:
-        self._execute(
+        inserted = self._query_one(
             """
             insert into brigade_provenance_records (id, node_id, node_type, created_at, record)
             values (%s, %s, %s, %s, %s::jsonb)
-            on conflict (id) do update set
-              node_id = excluded.node_id,
-              node_type = excluded.node_type,
-              created_at = excluded.created_at,
-              record = excluded.record
+            on conflict (id) do nothing
+            returning id
             """,
             (
                 record["record_id"],
@@ -1944,6 +1986,8 @@ class PostgresStateStore:
                 json.dumps(record, sort_keys=True),
             ),
         )
+        if inserted is None:
+            return
         result = self._neo4j.upsert_provenance(record)
         if self._neo4j.available() and not result.ok:
             self.add_alert(
@@ -1971,18 +2015,7 @@ class PostgresStateStore:
               external_message_id, agent_id, reason, redacted_metadata, created_at, record
             )
             values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb)
-            on conflict (id) do update set
-              provider = excluded.provider,
-              direction = excluded.direction,
-              status = excluded.status,
-              external_user_id = excluded.external_user_id,
-              conversation_id = excluded.conversation_id,
-              external_message_id = excluded.external_message_id,
-              agent_id = excluded.agent_id,
-              reason = excluded.reason,
-              redacted_metadata = excluded.redacted_metadata,
-              created_at = excluded.created_at,
-              record = excluded.record
+            on conflict (id) do nothing
             """,
             (
                 record["event_id"],
@@ -2166,6 +2199,33 @@ class PostgresStateStore:
         if not assignment_ids:
             return
         node_id = str(reasoning.get("reasoning_id") or reasoning.get("cycle_id") or uuid4())
+        events = [
+            item for item in reasoning.get("events", []) if isinstance(item, dict)
+        ]
+        evidence_refs: list[str] = []
+        constraints: list[str] = []
+        assumptions: list[str] = []
+        supersedes: list[str] = []
+        triggers: list[str] = []
+        for event in events:
+            provenance = event.get("provenance") or {}
+            payload = event.get("payload") or {}
+            if isinstance(provenance, dict) and provenance.get("trigger"):
+                triggers.append(str(provenance["trigger"]))
+            for source in (provenance, payload):
+                if not isinstance(source, dict):
+                    continue
+                for key, target in (
+                    ("evidence_refs", evidence_refs),
+                    ("constraints", constraints),
+                    ("assumptions", assumptions),
+                    ("supersedes", supersedes),
+                ):
+                    value = source.get(key)
+                    if isinstance(value, list):
+                        target.extend(str(item) for item in value if str(item).strip())
+                    elif value:
+                        target.append(str(value))
         self.add_provenance_record(
             {
                 "record_id": f"decision:{node_id}",
@@ -2176,6 +2236,12 @@ class PostgresStateStore:
                     "assignment_ids": assignment_ids,
                     "cycle_id": reasoning.get("cycle_id"),
                     "decision_summary": reasoning.get("decision_summary"),
+                    "rationale": reasoning.get("decision_summary"),
+                    "trigger": triggers[0] if triggers else None,
+                    "evidence_refs": sorted(set(evidence_refs)),
+                    "constraints": sorted(set(constraints)),
+                    "assumptions": sorted(set(assumptions)),
+                    "supersedes": sorted(set(supersedes)),
                 },
                 "created_at": (
                     reasoning.get("ended_at") or reasoning.get("started_at") or utc_now_iso()
@@ -2423,6 +2489,8 @@ def _import_legacy_state(path: Path, store: StateStore) -> None:
         store.add_message(message)
     for reasoning in legacy.orchestrator_reasoning():
         store.add_orchestrator_reasoning(reasoning)
+    for projection in legacy.policy_projections():
+        store.upsert_policy_projection(projection)
     for usage in legacy.usage_records():
         store.add_usage_record(usage)
     inventory = legacy.model_inventory()

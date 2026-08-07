@@ -3,14 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from uuid import uuid4
 
 from brigade.config import Settings
-from brigade.knowledge import active_knowledge_chunks, filter_expired_web_rows
 from brigade.finance import persist_financial_report
+from brigade.knowledge import active_knowledge_chunks, filter_expired_web_rows
 from brigade.meta import evaluate_assignment_alignment
 from brigade.prompt_floors import (
     DEFAULT_STALE_WORK_SECONDS,
@@ -21,6 +22,8 @@ from brigade.prompt_floors import (
 )
 from brigade.providers import ModelProvider
 from brigade.schemas import (
+    AGENT_ROLE_EXECUTIVE,
+    TERMINAL_STATUSES,
     Agent,
     AgentState,
     Assignment,
@@ -30,7 +33,6 @@ from brigade.schemas import (
     Goal,
     GoalEngagementMode,
     Priority,
-    TERMINAL_STATUSES,
     WorkMode,
     extract_json_object,
 )
@@ -811,7 +813,11 @@ def _active_or_queued_assignments(assignments: list[Assignment]) -> list[Assignm
 
 
 def _crew_chief_agents(store: StateStore) -> list[Agent]:
-    agents = {agent.agent_id: agent for agent in store.agents()}
+    agents = {
+        agent.agent_id: agent
+        for agent in store.agents()
+        if agent.role != AGENT_ROLE_EXECUTIVE
+    }
     chief_ids = {
         team.crew_chief_id
         for team in store.teams()
@@ -1219,7 +1225,7 @@ def deterministic_cycle(
 
 
 def build_idle_agent_assignments(store: StateStore) -> list[Assignment]:
-    agents = store.agents()
+    agents = [agent for agent in store.agents() if agent.role != AGENT_ROLE_EXECUTIVE]
     assignments = store.assignments()
     goals_by_agent = store.goals()
     mission = store.mission()
@@ -1666,7 +1672,7 @@ def _resolve_agent_id(store: StateStore, requested: str) -> str | None:
     Prompts render agents as display names ('SAGE', 'ABACUS'), so models echo
     that casing back; ids are lowercase in the store. Match exact id first,
     then case-insensitive id, then case-insensitive display name."""
-    agents = store.agents()
+    agents = [agent for agent in store.agents() if agent.role != AGENT_ROLE_EXECUTIVE]
     if requested in {agent.agent_id for agent in agents}:
         return requested
     lowered = requested.lower()

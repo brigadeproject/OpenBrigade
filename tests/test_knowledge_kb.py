@@ -1,7 +1,7 @@
+import pytest
+
 from brigade.kb import make_kb_id, parse_kb_id, provenance_edges
 from brigade.knowledge import extract_document_text, html_to_text, ingest_text
-
-import pytest
 
 
 def test_html_to_text_strips_markup() -> None:
@@ -76,12 +76,22 @@ def test_provenance_edges_decision_and_team() -> None:
             "record_id": "rec-3",
             "node_type": "decision",
             "node_id": "decision-1",
-            "metadata": {"assignment_ids": ["a-1", "a-2"]},
+            "metadata": {
+                "assignment_ids": ["a-1", "a-2"],
+                "evidence_refs": ["doc-1"],
+                "constraints": ["no network writes"],
+                "assumptions": ["operator wants dry-run"],
+                "supersedes": ["decision-0"],
+            },
         }
     )
     rels = {(edge["rel"], edge["target"]) for edge in decision}
     assert ("CREATED_ASSIGNMENT", "task:a-1") in rels
     assert ("CREATED_ASSIGNMENT", "task:a-2") in rels
+    assert ("INFORMED_BY", "evidence:doc-1") in rels
+    assert ("SATISFIES", "constraint:no network writes") in rels
+    assert ("CHOSEN_BECAUSE", "assumption:operator wants dry-run") in rels
+    assert ("SUPERSEDES", "decision:decision-0") in rels
 
     team = provenance_edges(
         {

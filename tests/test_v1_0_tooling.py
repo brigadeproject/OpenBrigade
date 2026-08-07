@@ -15,6 +15,7 @@ from brigade.efficiency import (
 from brigade.orchestrator import OrchestrationConfig, run_full_cycle
 from brigade.prompt_floors import build_agent_floor
 from brigade.schemas import (
+    PROPOSAL_KINDS,
     Agent,
     Assignment,
     AssignmentKind,
@@ -118,6 +119,85 @@ def test_request_tool_is_idempotent_per_agent_and_name(tmp_path):
     assert second.ok
     assert second.metadata["status"] == "existing"
     assert len(store.proposals(kind="tool_request")) == 1
+
+
+def test_policy_change_is_registered_proposal_kind() -> None:
+    assert "policy_change" in PROPOSAL_KINDS
+
+
+def test_write_file_to_governing_file_creates_policy_change_proposal(tmp_path):
+    store = _store(tmp_path)
+    registry = default_tool_registry()
+    context = _context(store, "ada")
+    workspace = ensure_agent_workspace(context.agent, store.data_dir)
+    original = (workspace / "IDENTITY.md").read_text(encoding="utf-8")
+
+    result = registry.execute(
+        "write_file",
+        context,
+        {"path": "IDENTITY.md", "content": "# Identity\n\nRole: all-powerful\n"},
+    )
+
+    assert not result.ok
+    assert (workspace / "IDENTITY.md").read_text(encoding="utf-8") == original
+    proposals = store.proposals(kind="policy_change")
+    assert len(proposals) == 1
+    assert proposals[0]["details"]["path"] == "IDENTITY.md"
+    assert proposals[0]["details"]["source_tool"] == "write_file"
+
+
+def test_daily_memory_remains_directly_writable(tmp_path):
+    store = _store(tmp_path)
+    registry = default_tool_registry()
+    context = _context(store, "ada")
+    ensure_agent_workspace(context.agent, store.data_dir)
+
+    result = registry.execute(
+        "write_file",
+        context,
+        {"path": "memory/20260728-MEMORY.md", "content": "- observed\n"},
+    )
+
+    assert result.ok
+    assert (context.workspace / "memory" / "20260728-MEMORY.md").read_text(
+        encoding="utf-8"
+    ) == "- observed\n"
+
+
+def test_approved_policy_change_updates_file_projection_and_audit(tmp_path):
+    store = _store(tmp_path)
+    registry = default_tool_registry()
+    context = _context(store, "ada")
+    workspace = ensure_agent_workspace(context.agent, store.data_dir)
+
+    result = registry.execute(
+        "propose_policy_change",
+        context,
+        {
+            "path": "TOOLS.md",
+            "content": "# Tools\n\nUse approved connectors only.\n",
+            "purpose": "Clarify connector policy.",
+        },
+    )
+    assert result.ok
+    proposal = store.proposals(kind="policy_change")[0]
+
+    decided = decide_proposal(
+        store,
+        proposal_id=proposal["proposal_id"],
+        decision="approved",
+        decided_by="owner",
+    )
+
+    assert (workspace / "TOOLS.md").read_text(encoding="utf-8").startswith("# Tools")
+    effects = decided["details"]["approval_effects"]
+    assert effects["path"] == "TOOLS.md"
+    projection = store.policy_projection("ada", "TOOLS.md")
+    assert projection["content_hash"] == effects["content_hash"]
+    assert any(
+        item.get("metadata", {}).get("event") == "policy_file_updated"
+        for item in store.provenance_records()
+    )
 
 
 # --- Approval paths -----------------------------------------------------------------

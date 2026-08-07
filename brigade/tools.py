@@ -14,6 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from brigade.governance import (
+    build_policy_change_proposal,
+    is_governing_workspace_path,
+    normalize_workspace_relative_path,
+)
 from brigade.knowledge import html_to_text, ingest_text, store_ingest_result
 from brigade.schemas import Agent, Assignment, AssignmentKind, AssignmentStatus, Priority
 from brigade.store import StateStore
@@ -238,6 +243,24 @@ def default_tool_registry() -> ToolRegistry:
     )
     registry.register(
         ToolSpec(
+            name="propose_policy_change",
+            description=(
+                "Propose a governed change to AGENTS.md, USER.md, IDENTITY.md, "
+                "SOUL.md, SKILLS.md, TOOLS.md, MEMORY.md, or a canonical "
+                "skills/.../SKILL.md file. Records a policy_change proposal; "
+                "does not edit the file directly."
+            ),
+            argument_schema={
+                "path": "governed relative file path in your private workspace",
+                "content": "proposed full content, or appended text when append is true",
+                "append": "optional boolean, defaults false",
+                "purpose": "why this governing file should change",
+            },
+        ),
+        _propose_policy_change,
+    )
+    registry.register(
+        ToolSpec(
             name="approve_proposal",
             description=(
                 "Crew chiefs only: approve a pending proposal raised by your "
@@ -401,6 +424,30 @@ def _write_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         context, _required_text(arguments, "path")
     )
     content = _required_text(arguments, "content")
+    relative_path = path.relative_to(workspace_root).as_posix()
+    if not prefix and is_governing_workspace_path(relative_path):
+        proposal = build_policy_change_proposal(
+            context.store,
+            context.agent,
+            relative_path=relative_path,
+            content=content,
+            append=bool(arguments.get("append")),
+            purpose=str(arguments.get("purpose") or "requested through write_file"),
+            source_tool="write_file",
+        )
+        return ToolResult(
+            False,
+            (
+                f"{relative_path} is a governed workspace policy file. Created "
+                f"policy_change proposal {proposal['proposal_id']} instead of "
+                "writing it directly."
+            ),
+            {
+                "proposal_id": proposal["proposal_id"],
+                "proposal_kind": "policy_change",
+                "path": relative_path,
+            },
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     if bool(arguments.get("append")):
         with path.open("a", encoding="utf-8") as handle:
@@ -411,6 +458,37 @@ def _write_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         True,
         f"wrote {len(content)} characters to "
         f"{prefix + str(path.relative_to(workspace_root))}",
+    )
+
+
+def _propose_policy_change(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    raw_path = _required_text(arguments, "path")
+    content = _required_text(arguments, "content")
+    purpose = _required_text(arguments, "purpose")
+    try:
+        relative_path = normalize_workspace_relative_path(raw_path)
+    except ValueError as exc:
+        return ToolResult(False, str(exc))
+    if not is_governing_workspace_path(relative_path):
+        return ToolResult(False, f"{relative_path} is not a governed policy file")
+    proposal = build_policy_change_proposal(
+        context.store,
+        context.agent,
+        relative_path=relative_path,
+        content=content,
+        append=bool(arguments.get("append")),
+        purpose=purpose,
+        source_tool="propose_policy_change",
+    )
+    return ToolResult(
+        True,
+        f"created policy_change proposal {proposal['proposal_id']} for {relative_path}",
+        {
+            "proposal_id": proposal["proposal_id"],
+            "proposal_kind": "policy_change",
+            "path": relative_path,
+            "status": proposal.get("status"),
+        },
     )
 
 

@@ -16,10 +16,16 @@ from typing import Any
 from uuid import uuid4
 
 from brigade.connectors import ConnectorChatReply, IncomingConnectorMessage
+from brigade.memory import (
+    build_memory_entry,
+    explicit_memory_request,
+    record_memory_mutation,
+)
 from brigade.prompt_floors import (
     CREW_CHIEF_CHAT_PROMPT,
     CREW_CHIEF_SYSTEM_PROMPT,
     MAX_CHAT_MEMORY_CHARS,
+    _chat_memory_path,
     _managed_agent_ids,
     build_chat_status_context,
     build_crew_chief_load,
@@ -189,6 +195,9 @@ class ChatToolContext:
     store: StateStore
     persona: Persona
     operator: str
+    user_message: str = ""
+    request_message_id: str | None = None
+    conversation_id: str | None = None
 
     def scope_ids(self) -> set[str] | None:
         if self.persona.is_front_desk:
@@ -411,8 +420,35 @@ def _tool_remember(context: ChatToolContext, arguments: dict[str, Any]) -> ToolR
     note = str(arguments.get("note") or "").strip()
     if not note:
         return ToolResult(False, "remember needs a note")
-    write_agent_chat_notes(context.store, context.persona.chief_agent_id, note)
-    return ToolResult(True, "noted — this will be in your memory on every future turn")
+    if not explicit_memory_request(context.user_message):
+        return ToolResult(
+            False,
+            (
+                "durable memory requires explicit operator wording such as "
+                "'remember that ...' or a governed memory update"
+            ),
+        )
+    entry_id, line, metadata = build_memory_entry(
+        note,
+        source="user_stated",
+        author=context.operator,
+        conversation_id=context.conversation_id,
+        message_id=context.request_message_id,
+    )
+    write_agent_chat_notes(context.store, context.persona.chief_agent_id, line)
+    memory_path = _chat_memory_path(context.store, context.persona.chief_agent_id)
+    record_memory_mutation(
+        context.store,
+        agent_id=context.persona.chief_agent_id,
+        memory_path=memory_path,
+        note=note,
+        metadata=metadata,
+    )
+    return ToolResult(
+        True,
+        "noted — this explicit operator memory will be in future turns",
+        {"entry_id": entry_id, "source": "user_stated", "status": "active"},
+    )
 
 
 def search_episode_summaries(
@@ -620,7 +656,8 @@ def chief_query_registry(*, include_web_fetch: bool = True) -> ToolRegistry:
             description=(
                 "Save a durable note to your curated memory (operator "
                 "preferences, standing decisions); it is injected into every "
-                "future chat turn. Memory-only — needs no confirmation."
+                "future chat turn. Use only when the operator explicitly asks "
+                "you to remember/save/note it."
             ),
             argument_schema={"note": "the note to remember"},
         ),
@@ -944,7 +981,14 @@ def run_chief_chat_turn(
         return result
 
     registry = chief_query_registry(include_web_fetch=enable_web_fetch)
-    context = ChatToolContext(store=store, persona=persona, operator=operator)
+    context = ChatToolContext(
+        store=store,
+        persona=persona,
+        operator=operator,
+        user_message=content,
+        request_message_id=request.message_id,
+        conversation_id=channel,
+    )
     tools = native_tool_specs(registry)
     memory = build_chat_memory(
         store,

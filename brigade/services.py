@@ -235,6 +235,10 @@ SAFE_CONFIG_KEYS = {
     "chief_chat_web_fetch_enabled": bool,
     "connector_chief_chat_enabled": bool,
     "chief_chat_connector_max_iterations": int,
+    "executive_enabled": bool,
+    "executive_max_iterations": int,
+    "executive_web_fetch_enabled": bool,
+    "connector_executive_chat_enabled": bool,
 }
 
 # Keys an operator can change live from the Telemetry page. These are layered onto
@@ -993,13 +997,18 @@ def _apply_proposal_approval(
 
     A ``tool_request`` becomes a ``kind=tool_build`` assignment for the
     requesting team's chief; an ``efficiency`` proposal becomes a recurrence
-    record. ``rest_insight`` carries no side effect.
+    record. ``policy_change`` applies a governed workspace constitution update.
+    ``rest_insight`` carries no side effect.
     """
     kind = proposal.get("kind")
     if kind == "tool_request":
         return _create_tool_build_assignment(store, proposal)
     if kind == "efficiency":
         return _create_recurrence_from_proposal(store, proposal)
+    if kind == "policy_change":
+        from brigade.governance import apply_policy_change_proposal
+
+        return apply_policy_change_proposal(store, proposal)
     return {}
 
 
@@ -2507,6 +2516,10 @@ def build_settings_payload(
         "chief_chat_web_fetch_enabled": settings.chief_chat_web_fetch_enabled,
         "connector_chief_chat_enabled": settings.connector_chief_chat_enabled,
         "chief_chat_connector_max_iterations": settings.chief_chat_connector_max_iterations,
+        "executive_enabled": settings.executive_enabled,
+        "executive_max_iterations": settings.executive_max_iterations,
+        "executive_web_fetch_enabled": settings.executive_web_fetch_enabled,
+        "connector_executive_chat_enabled": settings.connector_executive_chat_enabled,
         "editable_keys": sorted(SAFE_CONFIG_KEYS),
     }
 

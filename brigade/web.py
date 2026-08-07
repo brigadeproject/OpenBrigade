@@ -35,16 +35,27 @@ from brigade.connectors import (
     process_live_connector_message,
     telegram_reply_sender,
 )
+from brigade.executive import (
+    EXECUTIVE_CHAT_KIND_PREFIX,
+    UnknownExecutiveError,
+    available_executive_personas,
+    resolve_executive_persona,
+    run_connector_executive_chat,
+    run_executive_chat_turn,
+)
+from brigade.governance import ensure_policy_projections_current
 from brigade.health import check_configured_datastores, check_embedding_surface
+from brigade.knowledge_web import register_knowledge_routes
 from brigade.markdown import render_markdown_html
 from brigade.providers import (
     available_model_options,
     probe_model_inventory,
     provider_from_settings,
 )
-from brigade.knowledge_web import register_knowledge_routes
 from brigade.rbac import ROLE_PERMISSIONS, can
 from brigade.schemas import (
+    AGENT_ROLE_EXECUTIVE,
+    AGENT_ROLES,
     Agent,
     Assignment,
     ChatMessage,
@@ -87,7 +98,7 @@ from brigade.store import RedisRuntimeClient, StateStore, open_state_store
 from brigade.time import utc_now_iso
 from brigade.tui import build_dashboard_payload
 from brigade.workspace import (
-    REQUIRED_AGENT_FILES,
+    agent_workspace_files,
     ensure_agent_workspace,
     validate_agent_workspace,
 )
@@ -197,6 +208,22 @@ def create_app(
 
         return _turn
 
+    def _connector_executive_turn(max_iterations: int):
+        if not (settings.connector_executive_chat_enabled and settings.executive_enabled):
+            return None
+
+        def _turn(turn_store, incoming, username):
+            return run_connector_executive_chat(
+                turn_store,
+                incoming,
+                username,
+                provider=provider_from_settings(settings),
+                max_iterations=max_iterations,
+                enable_web_fetch=settings.executive_web_fetch_enabled,
+            )
+
+        return _turn
+
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
         return {"ok": True, "service": "brigade_web"}
@@ -249,7 +276,9 @@ def create_app(
             max_inbound_chars=settings.connector_max_inbound_chars,
             max_outbound_chars=settings.connector_max_outbound_chars,
         )
-        chat_turn = _connector_chat_turn(settings.chief_chat_max_iterations)
+        chat_turn = _connector_executive_turn(
+            settings.executive_max_iterations
+        ) or _connector_chat_turn(settings.chief_chat_max_iterations)
         if chat_turn is not None:
             # The chief-chat loop can run several model calls; do it out of band
             # so the webhook returns 200 fast and telegram_reply_sender posts the
@@ -311,7 +340,10 @@ def create_app(
             rate_limiter=connector_rate_limiter or _connector_rate_limiter(settings),
             max_inbound_chars=settings.connector_max_inbound_chars,
             max_outbound_chars=settings.connector_max_outbound_chars,
-            chat_turn=_connector_chat_turn(settings.chief_chat_connector_max_iterations),
+            chat_turn=(
+                _connector_executive_turn(settings.executive_max_iterations)
+                or _connector_chat_turn(settings.chief_chat_connector_max_iterations)
+            ),
         )
         if result.status == "rate_limited":
             raise HTTPException(status_code=429, detail=result.reason or "rate limit exceeded")
@@ -591,6 +623,31 @@ def create_app(
             raise HTTPException(status_code=400, detail="crew_chief requires team_id")
         workspace = str(payload.get("workspace_path") or "").strip() or f"workspace-{agent_id}"
         role = str(payload.get("role") or ("crew_chief" if make_chief else "line_worker")).strip()
+        if role not in AGENT_ROLES:
+            raise HTTPException(
+                status_code=400,
+                detail="role must be one of: " + ", ".join(sorted(AGENT_ROLES)),
+            )
+        owner_username = str(payload.get("owner_username") or "").strip() or None
+        if role == AGENT_ROLE_EXECUTIVE:
+            if team_id or make_chief:
+                raise HTTPException(
+                    status_code=400,
+                    detail="executive agents are user-owned and cannot join teams",
+                )
+            owner = next(
+                (
+                    item
+                    for item in store.users()
+                    if item.username == owner_username and item.role == Role.OWNER
+                ),
+                None,
+            )
+            if owner is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="executive agents require owner_username for an existing owner user",
+                )
         team: Team | None = None
         if team_id:
             team = next((item for item in store.teams() if item.team_id == team_id), None)
@@ -611,9 +668,11 @@ def create_app(
             model_provider=str(payload.get("model_provider") or settings.default_provider),
             model_name=str(payload.get("model_name") or settings.default_model),
             specialties=_string_list(payload.get("specialties")),
+            owner_username=owner_username,
         )
         store.add_agent(agent)
         ensure_agent_workspace(agent, settings.data_dir)
+        ensure_policy_projections_current(store, agent, actor="web_agent_onboard")
         if team is not None:
             members = list(dict.fromkeys([*team.members, agent_id]))
             team = Team(
@@ -684,17 +743,36 @@ def create_app(
             updates["model_name"] = str(payload["model_name"])
         if payload.get("role") is not None:
             role = str(payload["role"]).strip()
-            if role not in {"line_worker", "crew_chief"}:
+            if role not in AGENT_ROLES:
                 raise HTTPException(
-                    status_code=400, detail="role must be line_worker or crew_chief"
+                    status_code=400,
+                    detail="role must be one of: " + ", ".join(sorted(AGENT_ROLES)),
                 )
             updates["role"] = role
+        if payload.get("owner_username") is not None:
+            owner_username = str(payload["owner_username"]).strip() or None
+            if owner_username is not None and next(
+                (
+                    item
+                    for item in store.users()
+                    if item.username == owner_username and item.role == Role.OWNER
+                ),
+                None,
+            ) is None:
+                raise HTTPException(status_code=400, detail="unknown owner_username")
+            updates["owner_username"] = owner_username
         if payload.get("specialties") is not None:
             updates["specialties"] = _string_list(payload["specialties"])
         if not updates:
             raise HTTPException(status_code=400, detail="no updatable fields provided")
         updated = replace(agent, **updates)
+        if updated.role == AGENT_ROLE_EXECUTIVE and not updated.owner_username:
+            raise HTTPException(
+                status_code=400, detail="executive agents require owner_username"
+            )
         store.add_agent(updated)
+        ensure_agent_workspace(updated, settings.data_dir)
+        ensure_policy_projections_current(store, updated, actor="web_agent_update")
         return updated.to_dict()
 
     MAX_WORKSPACE_FILE_BYTES = 64 * 1024
@@ -707,11 +785,12 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown agent")
         # Whitelist membership is the traversal guard: only bare manifest
         # filenames are ever joined to the workspace path.
-        if filename not in REQUIRED_AGENT_FILES:
+        allowed = agent_workspace_files(agent)
+        if filename not in allowed:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "filename must be one of: " + ", ".join(REQUIRED_AGENT_FILES)
+                    "filename must be one of: " + ", ".join(allowed)
                 ),
             )
         return settings.data_dir / agent.workspace_path / filename
@@ -1109,7 +1188,10 @@ def create_app(
         username = _operator_username(user)
         return {
             "threads": [item.to_dict() for item in store.conversations(username)],
-            "personas": [item.to_dict() for item in available_personas(store)],
+            "personas": [
+                *[item.to_dict() for item in available_executive_personas(store, username)],
+                *[item.to_dict() for item in available_personas(store)],
+            ],
         }
 
     @app.post("/api/chat/threads")
@@ -1118,16 +1200,26 @@ def create_app(
         current: AuthResult = auth_dependency,
     ) -> dict[str, object]:
         user = require("chat:write", current)
+        username = _operator_username(user)
+        requested_persona = str(payload.get("persona") or "")
         try:
+            if requested_persona.startswith("executive"):
+                persona = resolve_executive_persona(store, username, requested_persona)
+                conversation = store.resolve_active_conversation(
+                    username,
+                    persona.persona_id,
+                    title=payload.get("title") or persona.display_name,
+                )
+                return {**conversation.to_dict(), "channel": conversation.channel}
             persona = resolve_persona(
                 store,
                 payload.get("persona"),
                 default=settings.chief_chat_default_persona,
             )
-        except UnknownPersonaError as exc:
+        except (UnknownPersonaError, UnknownExecutiveError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         conversation = store.resolve_active_conversation(
-            _operator_username(user),
+            username,
             persona.persona_id,
             chief_agent_id=persona.chief_agent_id,
             team_id=persona.team_id,
@@ -1141,8 +1233,10 @@ def create_app(
         limit: int = 100,
         current: AuthResult = auth_dependency,
     ) -> dict[str, object]:
-        require("chat:read", current)
+        user = require("chat:read", current)
         conversation = _thread_or_404(thread_id)
+        if conversation.operator_username != _operator_username(user):
+            raise HTTPException(status_code=403, detail="not your thread")
         return {
             "thread": conversation.to_dict(),
             "messages": [
@@ -1158,8 +1252,6 @@ def create_app(
         current: AuthResult = auth_dependency,
     ) -> dict[str, object]:
         user = require("chat:write", current)
-        if not settings.chief_chat_enabled:
-            raise HTTPException(status_code=503, detail="chief chat is disabled")
         conversation = _thread_or_404(thread_id)
         username = _operator_username(user)
         if conversation.operator_username != username:
@@ -1167,12 +1259,40 @@ def create_app(
         content = str(payload.get("content") or "").strip()
         if not content:
             raise HTTPException(status_code=400, detail="content is required")
+        if conversation.persona.startswith("executive:"):
+            if not settings.executive_enabled:
+                raise HTTPException(status_code=503, detail="executive chat is disabled")
+            try:
+                executive_persona = resolve_executive_persona(
+                    store, username, conversation.persona
+                )
+            except UnknownExecutiveError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            pending = _pending_chat_proposal(
+                store,
+                conversation.channel,
+                kind_prefix=EXECUTIVE_CHAT_KIND_PREFIX,
+            )
+            if pending is not None and _classify_chat_confirmation(content) == "confirm":
+                require("task:write", current)
+            provider = _provider_from_payload(payload, settings)
+            return run_executive_chat_turn(
+                store,
+                thread=conversation,
+                persona=executive_persona,
+                operator=username,
+                content=content,
+                provider=provider,
+                max_iterations=settings.executive_max_iterations,
+                enable_web_fetch=settings.executive_web_fetch_enabled,
+                idempotency_key=payload.get("idempotency_key") or f"web-executive:{uuid4()}",
+            )
+        if not settings.chief_chat_enabled:
+            raise HTTPException(status_code=503, detail="chief chat is disabled")
         try:
             persona = resolve_persona(store, conversation.persona)
         except UnknownPersonaError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        # Confirming staged actions changes task state; gate it like the
-        # task-mutation routes rather than like plain chat.
         pending = _pending_chat_proposal(
             store, conversation.channel, kind_prefix=CHIEF_CHAT_KIND_PREFIX
         )
@@ -1202,9 +1322,20 @@ def create_app(
         # the caller's active thread for the requested persona instead.
         user = require("chat:write", current)
         _thread_or_404(thread_id)
+        requested_persona = str(payload.get("persona") or "")
         try:
-            persona = resolve_persona(store, str(payload.get("persona") or ""))
-        except UnknownPersonaError as exc:
+            if requested_persona.startswith("executive"):
+                executive_persona = resolve_executive_persona(
+                    store, _operator_username(user), requested_persona
+                )
+                conversation = store.resolve_active_conversation(
+                    _operator_username(user),
+                    executive_persona.persona_id,
+                    title=executive_persona.display_name,
+                )
+                return {**conversation.to_dict(), "channel": conversation.channel}
+            persona = resolve_persona(store, requested_persona)
+        except (UnknownPersonaError, UnknownExecutiveError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         conversation = store.resolve_active_conversation(
             _operator_username(user),
@@ -1279,6 +1410,7 @@ def create_app(
         app.mount("/assets", StaticFiles(directory=static_root / "assets"), name="assets")
 
     @app.get("/", response_class=HTMLResponse)
+    @app.get("/chat", response_class=HTMLResponse)
     async def index() -> str:
         index_path = static_root / "index.html"
         if index_path.exists():

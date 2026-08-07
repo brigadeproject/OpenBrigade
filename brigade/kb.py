@@ -11,7 +11,8 @@ file paths). The kinds in use:
 - ``agent:<agent_id>``
 - ``memory:<agent_id>/<filename>``
 - ``task:<assignment_id>``, ``goal:<statement>``, ``team:<team_id>``,
-  ``decision:<decision_id>`` for provenance-referenced entities.
+  ``decision:<decision_id>``, ``evidence:<ref>``, ``constraint:<statement>``,
+  and ``assumption:<statement>`` for provenance-referenced entities.
 
 ``provenance_edges`` is the single definition of how a provenance record maps
 to graph relationships; the Neo4j mirror and the /api/knowledge/graph endpoint
@@ -34,6 +35,9 @@ KB_KINDS = frozenset(
         "goal",
         "team",
         "decision",
+        "evidence",
+        "constraint",
+        "assumption",
     }
 )
 
@@ -46,6 +50,9 @@ _NODE_TYPE_KINDS = {
     "team": "team",
     "agent": "agent",
     "goal": "goal",
+    "evidence": "evidence",
+    "constraint": "constraint",
+    "assumption": "assumption",
 }
 
 
@@ -127,6 +134,38 @@ def provenance_edges(record: dict[str, Any]) -> list[dict[str, str]]:
                     "source": node_kb_id,
                     "rel": "CREATED_ASSIGNMENT",
                     "target": make_kb_id("task", str(assignment_id)),
+                }
+            )
+        for evidence_ref in metadata.get("evidence_refs") or []:
+            edges.append(
+                {
+                    "source": node_kb_id,
+                    "rel": "INFORMED_BY",
+                    "target": make_kb_id("evidence", str(evidence_ref)),
+                }
+            )
+        for constraint in metadata.get("constraints") or []:
+            edges.append(
+                {
+                    "source": node_kb_id,
+                    "rel": "SATISFIES",
+                    "target": make_kb_id("constraint", str(constraint)),
+                }
+            )
+        for assumption in metadata.get("assumptions") or []:
+            edges.append(
+                {
+                    "source": node_kb_id,
+                    "rel": "CHOSEN_BECAUSE",
+                    "target": make_kb_id("assumption", str(assumption)),
+                }
+            )
+        for superseded in metadata.get("supersedes") or []:
+            edges.append(
+                {
+                    "source": node_kb_id,
+                    "rel": "SUPERSEDES",
+                    "target": make_kb_id("decision", str(superseded)),
                 }
             )
     elif node_type == "team":

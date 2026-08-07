@@ -141,6 +141,9 @@ def test_chat_tui_slash_commands_parse_agent_switches():
     assert parse_chat_tui_command("/agent sage").action == "agent"
     assert parse_chat_tui_command("/switch builder").argument == "builder"
     assert parse_chat_tui_command("/q").action == "quit"
+    assert parse_chat_tui_command("/clear").action == "clear"
+    assert parse_chat_tui_command("/status").action == "status"
+    assert parse_chat_tui_command("/model").action == "model"
     assert parse_chat_tui_command("hello") is None
 
 

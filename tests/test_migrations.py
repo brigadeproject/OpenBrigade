@@ -79,3 +79,11 @@ def test_orchestrator_policies_migration_exists():
     assert "rule_kind text not null default 'freeform'" in sql
     assert "assignment_kind text" in sql
     assert "active boolean not null default true" in sql
+
+
+def test_policy_projections_migration_exists():
+    sql = Path("migrations/0015_policy_projections.sql").read_text(encoding="utf-8")
+
+    assert "create table if not exists brigade_policy_projections" in sql
+    assert "content_hash text not null" in sql
+    assert "unique (agent_id, path)" in sql

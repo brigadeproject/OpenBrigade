@@ -14,6 +14,10 @@ from typing import Any
 from uuid import uuid4
 
 from brigade.finance import persist_financial_report
+from brigade.governance import (
+    PolicyProjectionStaleError,
+    ensure_policy_projections_current,
+)
 from brigade.orchestrator import orchestration_event, record_orchestration_events
 from brigade.prompt_floors import build_agent_floor, compact_json
 from brigade.providers import (
@@ -24,6 +28,7 @@ from brigade.providers import (
     is_model_not_found_error,
 )
 from brigade.schemas import (
+    AGENT_ROLE_EXECUTIVE,
     MALFORMED_PROVIDER_OUTPUT_MARKER,
     AgentState,
     Assignment,
@@ -135,7 +140,11 @@ def run_managed_agents(
     else:
         # Serve least-recently-served agents first; ties keep creation order.
         target_ids = sorted(
-            (item.agent_id for item in store.agents()),
+            (
+                item.agent_id
+                for item in store.agents()
+                if item.role != AGENT_ROLE_EXECUTIVE
+            ),
             key=lambda item: _LAST_SERVED_AT.get(item, 0.0),
         )
     results: list[RunResult] = []
@@ -271,6 +280,18 @@ def run_agent_once(
             store,
             route_type,
             str(exc),
+        )
+
+    try:
+        ensure_policy_projections_current(store, agent)
+    except PolicyProjectionStaleError as exc:
+        return _handle_heartbeat_validation_failure(
+            agent_id,
+            assignment,
+            agent,
+            store,
+            route_type,
+            f"workspace policy projection is stale: {exc}",
         )
 
     run_owner = str(uuid4())

@@ -237,9 +237,16 @@ def test_qdrant_chunk_store_upserts_kb_payload() -> None:
             "chunk_id": "chunk-1",
             "kb_id": "chunk:chunk-1",
             "document_id": "doc-1",
+            "document_type": "text",
             "chunk_index": 0,
             "text": "chunk body text",
             "source": "unit-test",
+            "content_path": "/tmp/doc.txt",
+            "title": "Doc",
+            "ingested_at": "2026-07-18T00:00:00Z",
+            "ingestion_version": 1,
+            "chunking_version": 1,
+            "content_hash": "abc123",
             "created_at": "2026-07-19T00:00:00Z",
         }
     )
@@ -248,6 +255,13 @@ def test_qdrant_chunk_store_upserts_kb_payload() -> None:
     assert store.collection == "brigade_chunks"
     point = calls[-1][2]["points"][0]
     assert point["id"] == "chunk-1"
+    payload = point["payload"]
+    assert payload["content_path"] == "/tmp/doc.txt"
+    assert payload["title"] == "Doc"
+    assert payload["ingestion_version"] == 1
+    assert payload["chunking_version"] == 1
+    assert payload["embedding_model"] == store.embedding_model
+    assert payload["content_hash"] == "abc123"
     assert point["payload"]["kb_id"] == "chunk:chunk-1"
     assert point["payload"]["document_id"] == "doc-1"
     assert len(point["vector"]) == HASH_FALLBACK_VECTOR_SIZE
@@ -287,7 +301,11 @@ def test_qdrant_chunk_store_batch_upsert_uses_hash_fallback() -> None:
 
     def fake_request(method: str, path: str, payload: dict[str, object] | None = None):
         if method == "GET":
-            return {"result": {"config": {"params": {"vectors": {"size": HASH_FALLBACK_VECTOR_SIZE}}}}}
+            return {
+                "result": {
+                    "config": {"params": {"vectors": {"size": HASH_FALLBACK_VECTOR_SIZE}}}
+                }
+            }
         if method == "PUT" and path.endswith("points?wait=true"):
             puts.append(payload)
         return {}

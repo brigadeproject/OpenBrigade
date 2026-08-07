@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
-
-from datetime import timedelta
 
 from brigade.ingestion import chunk_text
 from brigade.time import parse_utc_iso, utc_now, utc_now_iso
@@ -110,6 +110,9 @@ def metadata_for_text(title: str, source: str, content: str) -> dict[str, object
         "source": source,
         "chunk_count": len(chunks),
         "character_count": len(content),
+        "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "ingestion_version": 1,
+        "chunking_version": 1,
     }
 
 
@@ -144,6 +147,9 @@ def ingest_text(
         metadata=metadata,
     )
     kb_doc_id = f"doc:{document.document_id}"
+    content_hash = str(metadata.get("content_hash") or "")
+    ingestion_version = metadata.get("ingestion_version")
+    chunking_version = metadata.get("chunking_version")
     chunks = []
     for chunk in chunk_text(content):
         chunk_id = str(uuid4())
@@ -157,6 +163,11 @@ def ingest_text(
                 "text": chunk.text,
                 "source": source,
                 "content_path": content_path,
+                "title": title,
+                "ingested_at": document.ingested_at,
+                "ingestion_version": ingestion_version,
+                "chunking_version": chunking_version,
+                "content_hash": content_hash,
                 "created_at": utc_now_iso(),
             }
         )

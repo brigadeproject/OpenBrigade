@@ -6,9 +6,78 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from brigade.schemas import Agent, Assignment, assignment_from_dict
+from brigade.schemas import (
+    AGENT_ROLE_EXECUTIVE,
+    Agent,
+    Assignment,
+    assignment_from_dict,
+)
 
 REQUIRED_AGENT_FILES = ("AGENTS.md", "USER.md", "IDENTITY.md", "MEMORY.md", "TOOLS.md", "SOUL.md")
+EXECUTIVE_AGENT_FILES = ("SKILLS.md",)
+EXECUTIVE_SKILL_TEMPLATES: tuple[tuple[str, str], ...] = (
+    (
+        "skills/executive/concierge-chat/SKILL.md",
+        """---
+id: executive-concierge-chat
+version: 1.0.0
+status: approved
+risk: low
+allowed_tools:
+  - brigade_status
+  - list_tasks
+  - get_task
+  - search_knowledge
+  - remember
+fallback_policy: fail_closed
+---
+
+# Executive Concierge Chat
+
+## Purpose
+
+Help the owner inspect OpenBrigade state, clarify priorities, and stage governed
+changes without joining mission execution.
+
+## Procedure
+
+1. Answer from current tool results when discussing live Brigade state.
+2. Stage task, goal, guidance, or knowledge mutations for owner confirmation.
+3. Use durable memory only when the owner explicitly asks to remember/save/note
+   a standing fact.
+4. Stop and ask for confirmation before changing Brigade state.
+""",
+    ),
+    (
+        "skills/executive/check-memory/SKILL.md",
+        """---
+id: executive-check-memory
+version: 1.0.0
+status: approved
+risk: low
+allowed_tools:
+  - search_knowledge
+  - remember
+fallback_policy: fail_closed
+---
+
+# Executive Check Memory
+
+## Purpose
+
+Review the Executive's curated owner context and preserve only explicit,
+standing owner facts.
+
+## Procedure
+
+1. Treat `USER.md`, `MEMORY.md`, and approved skill files as canonical context.
+2. Distinguish owner-stated facts from model inferences.
+3. Do not persist inferred preferences as durable memory.
+4. Propose governance changes for canonical files instead of editing them
+   directly.
+""",
+    ),
+)
 ASSIGNMENT_MARKER = "```json brigade-assignment"
 ASSIGNMENT_BLOCK_RE = re.compile(
     r"```json brigade-assignment\s*\n(.*?)\n```",
@@ -92,10 +161,16 @@ class WorkspaceDiagnostic:
 def ensure_agent_workspace(agent: Agent, root: Path) -> Path:
     workspace = root / agent.workspace_path
     workspace.mkdir(parents=True, exist_ok=True)
-    for filename in REQUIRED_AGENT_FILES:
+    for filename in agent_workspace_files(agent):
         path = workspace / filename
         if not path.exists():
             path.write_text(_default_file(agent, filename), encoding="utf-8")
+    if agent.role == AGENT_ROLE_EXECUTIVE:
+        for relative_path, content in EXECUTIVE_SKILL_TEMPLATES:
+            path = workspace / relative_path
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
     # Seeded for rest/dream cycles but deliberately not required files, so
     # heartbeat validation of existing workspaces is untouched.
     for filename, content in (
@@ -138,7 +213,7 @@ def validate_agent_workspace(agent: Agent, root: Path) -> list[WorkspaceDiagnost
             )
         ]
 
-    for filename in REQUIRED_AGENT_FILES:
+    for filename in agent_workspace_files(agent):
         path = workspace / filename
         if not path.exists():
             diagnostics.append(
@@ -207,6 +282,12 @@ def validate_agent_workspace(agent: Agent, root: Path) -> list[WorkspaceDiagnost
                 )
             )
     return diagnostics
+
+
+def agent_workspace_files(agent: Agent) -> tuple[str, ...]:
+    if agent.role == AGENT_ROLE_EXECUTIVE:
+        return (*REQUIRED_AGENT_FILES, *EXECUTIVE_AGENT_FILES)
+    return REQUIRED_AGENT_FILES
 
 
 def read_heartbeat_assignment(path: Path) -> Assignment:
@@ -319,9 +400,62 @@ def render_assignment_block(assignment: Assignment) -> str:
 def _default_file(agent: Agent, filename: str) -> str:
     title = filename.removesuffix(".md")
     if filename == "IDENTITY.md":
-        return f"# Identity\n\nName: {agent.display_name}\nRole: {agent.role}\n"
+        return (
+            "# Identity\n\n"
+            f"Name: {agent.display_name}\n"
+            f"Agent ID: {agent.agent_id}\n"
+            f"Runtime role: {agent.role}\n"
+            "\nThis file is canonical for identity and purpose. Ordinary "
+            "workspace tools must not edit it directly; propose a policy change "
+            "instead.\n"
+        )
+    if filename == "AGENTS.md":
+        return (
+            "# Agent Constitution\n\n"
+            f"{agent.display_name} operates as `{agent.agent_id}`.\n\n"
+            "## Responsibilities\n\n"
+            "- Work only within assigned scope and current owner/operator direction.\n"
+            "- Preserve auditability for state, memory, and policy changes.\n"
+            "- Escalate uncertainty instead of inventing authority.\n\n"
+            "## Authority\n\n"
+            "Runtime task state and authentication live in PostgreSQL. This file "
+            "defines the human-readable responsibility boundary that runtime "
+            "projections must mirror.\n"
+        )
+    if filename == "USER.md":
+        return (
+            "# User Context\n\n"
+            "Record stable user relationship context here only through governed "
+            "updates. Distinguish user-stated facts from model inferences.\n"
+        )
+    if filename == "TOOLS.md":
+        return (
+            "# Tool Policy\n\n"
+            "Use only tools exposed by the harness for the selected task or skill. "
+            "If a required tool is unavailable, fail closed and report the missing "
+            "dependency instead of improvising an alternate access path.\n"
+        )
+    if filename == "SOUL.md":
+        return (
+            "# Soul\n\n"
+            f"{agent.display_name} should be direct, bounded, auditable, and "
+            "truthful about current authority and tool availability.\n"
+        )
+    if filename == "SKILLS.md":
+        return (
+            "# Approved Skills\n\n"
+            "- [Executive Concierge Chat](./skills/executive/concierge-chat/SKILL.md)  \n"
+            "  Help the owner inspect Brigade state and stage confirmed changes.\n\n"
+            "- [Executive Check Memory](./skills/executive/check-memory/SKILL.md)  \n"
+            "  Review and preserve explicit, standing owner context.\n"
+        )
     if filename == "MEMORY.md":
-        return "# Memory\n\n"
+        return (
+            "# Memory\n\n"
+            "Curated durable knowledge belongs here after consolidation or explicit "
+            "owner memory requests. Daily `memory/*-MEMORY.md` files remain "
+            "provisional.\n"
+        )
     return f"# {title.title()}\n\n"
 
 

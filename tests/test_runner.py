@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from brigade.governance import ensure_policy_projections_current
 from brigade.providers import ModelResponse
 from brigade.runner import MAX_AGENT_ITERATIONS, run_agent_once
 from brigade.schemas import Agent, Assignment
@@ -82,6 +83,33 @@ def test_run_agent_once_completes_and_archives_assignment(tmp_path):
     assert store.assignment_history()[0]["assignment_id"] == assignment.assignment_id
     heartbeat = tmp_path / "workspace-sage" / "HEARTBEAT.md"
     assert '"status": "complete"' in heartbeat.read_text(encoding="utf-8")
+
+
+def test_run_agent_once_blocks_when_policy_projection_is_stale(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    agent = Agent(agent_id="sage", display_name="SAGE", workspace_path="workspace-sage")
+    assignment = Assignment(
+        assignment="Draft a plan",
+        assigned_to="sage",
+        created_by="human",
+        source="direct_command",
+    )
+    assignment.transition_to(status=assignment.status.ASSIGNED)
+    store.add_agent(agent)
+    store.add_assignment(assignment)
+    write_heartbeat_assignment(agent, assignment, tmp_path)
+    ensure_policy_projections_current(store, agent)
+    identity = tmp_path / "workspace-sage" / "IDENTITY.md"
+    identity.write_text(identity.read_text(encoding="utf-8") + "\nUnauthorized edit\n")
+
+    provider = _SequencedProvider(
+        [json.dumps({"status": "complete", "summary": "done", "blockers": []})]
+    )
+    result = run_agent_once("sage", store, provider)
+
+    assert result.status == "blocked"
+    assert "policy projection is stale" in result.summary
+    assert provider.prompts == []
 
 
 def _make_agent_with_assignment(tmp_path, store):

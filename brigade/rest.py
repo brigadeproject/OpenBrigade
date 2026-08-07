@@ -25,6 +25,7 @@ from brigade.orchestrator import (
     record_orchestration_events,
 )
 from brigade.schemas import (
+    AGENT_ROLE_EXECUTIVE,
     Agent,
     Assignment,
     AssignmentKind,
@@ -124,7 +125,10 @@ def evaluate_rest_schedule(
     }
     states = store.agent_states()
 
-    for agent in sorted(store.agents(), key=lambda item: item.agent_id):
+    for agent in sorted(
+        (item for item in store.agents() if item.role != AGENT_ROLE_EXECUTIVE),
+        key=lambda item: item.agent_id,
+    ):
         if agent.agent_id in occupied:
             continue
         idle_cycles = (

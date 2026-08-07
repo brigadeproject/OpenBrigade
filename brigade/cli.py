@@ -39,8 +39,13 @@ from brigade.db import (
     load_migrations,
     migration_status,
 )
+from brigade.executive import (
+    resolve_executive_persona,
+    run_executive_chat_turn,
+)
 from brigade.export import export_training_data
 from brigade.finance import build_model_routing_decision
+from brigade.governance import ensure_policy_projections_current
 from brigade.health import HealthCheck, check_configured_datastores
 from brigade.knowledge import ingest_local_document, store_ingest_result
 from brigade.logging import configure_json_logging
@@ -74,6 +79,8 @@ from brigade.runner import (
     run_managed_agents,
 )
 from brigade.schemas import (
+    AGENT_ROLE_EXECUTIVE,
+    AGENT_ROLES,
     PROPOSAL_KINDS,
     PROPOSAL_STATUSES,
     TERMINAL_STATUSES,
@@ -119,6 +126,7 @@ from brigade.tui import (
     render_settings_view,
     run_chat_tui,
     run_dashboard_tui,
+    run_executive_chat_tui,
     run_settings_tui,
 )
 from brigade.workspace import ensure_agent_workspace, validate_agent_workspace
@@ -163,6 +171,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Refresh cadence for the interactive settings view. Default: 2.0 seconds.",
     )
+
+    executive = subcommands.add_parser(
+        "executive",
+        help="Interact with the user-owned Executive concierge.",
+    )
+    executive_sub = executive.add_subparsers(dest="executive_command", required=True)
+    executive_tui = executive_sub.add_parser(
+        "tui",
+        help="Open an interactive terminal chat with the Executive.",
+    )
+    executive_tui.add_argument(
+        "--persona",
+        default="executive",
+        help="Executive persona id, for example executive or executive:<id>.",
+    )
+    executive_tui.add_argument(
+        "--plain",
+        action="store_true",
+        help="Render the current Executive thread once without curses.",
+    )
+    executive_tui.add_argument(
+        "--refresh-seconds",
+        type=float,
+        default=1.0,
+        help="Refresh cadence for the interactive chat view. Default: 1.0 seconds.",
+    )
+    _add_provider_args(executive_tui)
 
     auth = subcommands.add_parser("auth")
     auth_sub = auth.add_subparsers(dest="auth_command", required=True)
@@ -253,7 +288,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_add.add_argument(
         "--role",
         default="line_worker",
+        choices=sorted(AGENT_ROLES),
         help="Agent role label. Default: line_worker.",
+    )
+    agent_add.add_argument(
+        "--owner-username",
+        default=None,
+        help="Required when --role executive; must name an existing owner user.",
     )
     agent_onboard = agent_sub.add_parser(
         "onboard",
@@ -273,7 +314,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_onboard.add_argument(
         "--role",
         default="line_worker",
+        choices=sorted(AGENT_ROLES),
         help="Agent role label. Default: line_worker.",
+    )
+    agent_onboard.add_argument(
+        "--owner-username",
+        default=None,
+        help="Required when --role executive; must name an existing owner user.",
     )
     agent_onboard.add_argument("--team", default=None, help="Optional team id to join.")
     agent_onboard.add_argument(
@@ -337,8 +384,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_update.add_argument(
         "--role",
         default=None,
-        choices=["line_worker", "crew_chief"],
+        choices=sorted(AGENT_ROLES),
         help="New role label.",
+    )
+    agent_update.add_argument(
+        "--owner-username",
+        default=None,
+        help="Set or replace the owner username for an executive agent.",
     )
     agent_update.add_argument(
         "--specialty",
@@ -1413,7 +1465,13 @@ def _main(argv: Sequence[str] | None = None) -> int:
     if args.command == "init" and args.init_command == "mvp":
         _require_permission(store, settings, actor, "admin", allow_bootstrap=True)
         _bootstrap_mvp(store, settings.data_dir, args.mission, force=args.force)
-        print(json.dumps({"status": "initialized", "agents": 3}, indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                {"status": "initialized", "agents": len(store.agents())},
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "user" and args.user_command == "add":
@@ -1447,14 +1505,19 @@ def _main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "agent" and args.agent_command == "add":
         _require_permission(store, settings, actor, "agent:write")
+        owner_username = _validate_agent_owner_username(
+            store, role=args.role, owner_username=args.owner_username
+        )
         agent = Agent(
             agent_id=args.id,
             display_name=args.name,
             workspace_path=args.workspace,
             role=args.role,
+            owner_username=owner_username,
         )
         store.add_agent(agent)
         ensure_agent_workspace(agent, settings.data_dir)
+        ensure_policy_projections_current(store, agent, actor="agent_add")
         print(json.dumps(agent.to_dict(), indent=2, sort_keys=True))
         return 0
 
@@ -1463,6 +1526,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
         workspace = args.workspace or f"workspace-{args.id}"
         if args.crew_chief and not args.team:
             raise ValueError("--crew-chief requires --team")
+        if args.role == AGENT_ROLE_EXECUTIVE and (args.team or args.crew_chief):
+            raise ValueError("executive agents are user-owned and cannot join teams")
+        owner_username = _validate_agent_owner_username(
+            store, role=args.role, owner_username=args.owner_username
+        )
         team = _find_team(store, args.team) if args.team else None
         if args.team and team is None:
             if not args.create_team:
@@ -1478,9 +1546,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
             model_provider=args.provider or settings.default_provider,
             model_name=args.model or settings.default_model,
             specialties=[item.strip() for item in args.specialties if item.strip()],
+            owner_username=owner_username,
         )
         store.add_agent(agent)
         ensure_agent_workspace(agent, settings.data_dir)
+        ensure_policy_projections_current(store, agent, actor="agent_onboard")
         if team is not None:
             team = _team_with_member(team, args.id, crew_chief=args.crew_chief)
             store.upsert_team(team)
@@ -1529,13 +1599,23 @@ def _main(argv: Sequence[str] | None = None) -> int:
         updates: dict[str, Any] = {}
         if args.role is not None:
             updates["role"] = args.role
+        if args.owner_username is not None:
+            updates["owner_username"] = _validate_agent_owner_username(
+                store,
+                role=args.role or agent.role,
+                owner_username=args.owner_username,
+            )
         if args.specialties is not None:
             updates["specialties"] = [
                 item.strip() for item in args.specialties if item.strip()
             ]
         if not updates:
-            raise ValueError("nothing to update: pass --role and/or --specialty")
+            raise ValueError(
+                "nothing to update: pass --role, --owner-username, and/or --specialty"
+            )
         updated = replace(agent, **updates)
+        if updated.role == AGENT_ROLE_EXECUTIVE and not updated.owner_username:
+            raise ValueError("executive agents require --owner-username")
         store.add_agent(updated)
         print(json.dumps(updated.to_dict(), indent=2, sort_keys=True))
         return 0
@@ -2106,6 +2186,53 @@ def _main(argv: Sequence[str] | None = None) -> int:
             print(render_chat_view(payload, channel))
             return 0
 
+    if args.command == "executive" and args.executive_command == "tui":
+        current_user = _require_permission(store, settings, actor, "chat:write")
+        username = current_user.username if current_user else "operator"
+        persona = resolve_executive_persona(store, username, args.persona)
+        conversation = store.resolve_active_conversation(
+            username,
+            persona.persona_id,
+            title=persona.display_name,
+        )
+        if args.plain:
+            payload = build_chat_payload(store, channel=conversation.channel)
+            print(render_chat_view(payload, conversation.channel))
+            return 0
+        provider = _chat_tui_provider_from_args(args, settings)
+        model_label = (
+            f"{getattr(provider, 'provider_name', getattr(provider, 'provider', 'provider'))}/"
+            f"{getattr(provider, 'model', 'unknown')}"
+        )
+
+        def send_executive_message(message: str) -> dict[str, Any]:
+            return run_executive_chat_turn(
+                store,
+                thread=conversation,
+                persona=persona,
+                operator=username,
+                content=message,
+                provider=provider,
+                max_iterations=settings.executive_max_iterations,
+                enable_web_fetch=settings.executive_web_fetch_enabled,
+                idempotency_key=f"tui-executive:{persona.agent_id}:{uuid4()}",
+            )
+
+        try:
+            return run_executive_chat_tui(
+                store,
+                send_executive_message,
+                channel=conversation.channel,
+                persona_label=persona.persona_id,
+                operator=username,
+                model_label=model_label,
+                refresh_seconds=args.refresh_seconds,
+            )
+        except RuntimeError:
+            payload = build_chat_payload(store, channel=conversation.channel)
+            print(render_chat_view(payload, conversation.channel))
+            return 0
+
     if args.command == "knowledge" and args.knowledge_command == "ingest":
         _require_permission(store, settings, actor, "knowledge:write")
         document = _ingest_document(
@@ -2377,7 +2504,15 @@ def _live_chat_tui_command(
     running_in_container = Path("/.dockerenv").exists() if in_container is None else in_container
     if running_in_container:
         return None
-    if getattr(args, "command", None) != "chat" or getattr(args, "chat_command", None) != "tui":
+    is_chat_tui = (
+        getattr(args, "command", None) == "chat"
+        and getattr(args, "chat_command", None) == "tui"
+    )
+    is_executive_tui = (
+        getattr(args, "command", None) == "executive"
+        and getattr(args, "executive_command", None) == "tui"
+    )
+    if not (is_chat_tui or is_executive_tui):
         return None
     repo_root = _find_repo_root(cwd)
     if repo_root is None:
@@ -2735,6 +2870,32 @@ def _require_known_agent(store: StateStore, agent_id: str) -> None:
         raise ValueError(f"unknown agent: {agent_id}")
 
 
+def _validate_agent_owner_username(
+    store: StateStore,
+    *,
+    role: str,
+    owner_username: str | None,
+) -> str | None:
+    owner_username = (owner_username or "").strip() or None
+    if role != AGENT_ROLE_EXECUTIVE:
+        return owner_username
+    if not owner_username:
+        raise ValueError("executive agents require --owner-username")
+    owner = next(
+        (
+            item
+            for item in store.users()
+            if item.username == owner_username and item.role == Role.OWNER
+        ),
+        None,
+    )
+    if owner is None:
+        raise ValueError(
+            "executive agents require --owner-username to name an existing owner user"
+        )
+    return owner_username
+
+
 def _find_team(store: StateStore, team_id: str | None) -> Team | None:
     if team_id is None:
         return None
@@ -2750,7 +2911,9 @@ def _agent_with_team(agent: Agent, team_id: str) -> Agent:
         team_id=team_id,
         model_provider=agent.model_provider,
         model_name=agent.model_name,
+        specialties=agent.specialties,
         created_at=agent.created_at,
+        owner_username=agent.owner_username,
     )
 
 
@@ -3918,18 +4081,45 @@ def _bootstrap_mvp(
             explicitly_not=["spam users", "make unsupported financial claims"],
         )
     )
+    if _find_user(store, "owner") is None:
+        store.add_user(User("owner", Role.OWNER))
     defaults = [
-        Agent("sage", "SAGE", "workspace-sage", "crew_chief"),
-        Agent("garde", "GARDE", "workspace-garde", "infrastructure"),
-        Agent("abacus", "ABACUS", "workspace-abacus", "financial"),
+        Agent(
+            "sage",
+            "SAGE",
+            "workspace-sage",
+            "crew_chief",
+            specialties=["planning", "writing", "coordination"],
+        ),
+        Agent(
+            "garde",
+            "GARDE",
+            "workspace-garde",
+            "infrastructure",
+            specialties=["infrastructure", "deployment", "runtime-hardening"],
+        ),
+        Agent(
+            "abacus",
+            "ABACUS",
+            "workspace-abacus",
+            "financial",
+            specialties=["finance", "cost-tracking", "revenue-experiments"],
+        ),
+        Agent(
+            "executive",
+            "Executive",
+            "workspace-executive",
+            role=AGENT_ROLE_EXECUTIVE,
+            owner_username="owner",
+            specialties=["owner-concierge", "state-review", "governed-memory"],
+        ),
     ]
     known_agents = {item.agent_id for item in store.agents()}
     for agent in defaults:
         if agent.agent_id not in known_agents:
             store.add_agent(agent)
         ensure_agent_workspace(agent, data_dir)
-    if _find_user(store, "owner") is None:
-        store.add_user(User("owner", Role.OWNER))
+        ensure_policy_projections_current(store, agent, actor="bootstrap")
     store.ensure_goal(
         "sage",
         Goal(

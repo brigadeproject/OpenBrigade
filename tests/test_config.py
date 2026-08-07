@@ -61,6 +61,29 @@ def test_load_settings_reads_proactive_controls(tmp_path):
     assert settings.max_proactive_creations_per_cycle == 1
 
 
+def test_load_settings_reads_executive_controls(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "\n".join(
+            [
+                "BRIGADE_EXECUTIVE_ENABLED=false",
+                "BRIGADE_EXECUTIVE_MAX_ITERATIONS=4",
+                "BRIGADE_EXECUTIVE_WEB_FETCH_ENABLED=false",
+                "BRIGADE_CONNECTOR_EXECUTIVE_CHAT_ENABLED=true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=tmp_path / "missing.json", env_path=env)
+
+    assert settings.executive_enabled is False
+    assert settings.executive_max_iterations == 4
+    assert settings.executive_web_fetch_enabled is False
+    assert settings.connector_executive_chat_enabled is True
+
+
 def test_load_settings_uses_configured_ollama_as_live_default(tmp_path):
     env = tmp_path / ".env"
     env.write_text(

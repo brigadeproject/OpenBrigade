@@ -24,6 +24,7 @@ const OPS_ROOM_FALLBACK_ROOMS: OpsRoomRoom[] = [
 
 const TAB_VIEWS = [
   { id: "cockpit", label: "Cockpit" },
+  { id: "chat", label: "Chat" },
   { id: "brigade", label: "Brigade" },
   { id: "agents", label: "Agents & Teams" },
   { id: "proposals", label: "Proposals" },
@@ -320,6 +321,50 @@ type ChatPayload = {
   agents: unknown[];
 };
 
+type PersonaInfo = {
+  persona_id: string;
+  kind: string;
+  display_name: string;
+  agent_id?: string | null;
+  chief_agent_id?: string | null;
+  team_id?: string | null;
+  owner_username?: string | null;
+};
+
+type ChatThread = {
+  thread_id: string;
+  persona: string;
+  status: string;
+  title?: string | null;
+  channel?: string;
+  chief_agent_id?: string | null;
+  team_id?: string | null;
+};
+
+type ThreadsPayload = {
+  threads: ChatThread[];
+  personas: PersonaInfo[];
+};
+
+type ThreadMessagesPayload = {
+  thread: ChatThread;
+  messages: Message[];
+};
+
+type ThreadTurnResult = {
+  status: string;
+  conversation_id?: string;
+  request_message_id?: string;
+  response_message_id?: string;
+  summary?: string;
+  agent_id?: string;
+  provider?: string;
+  model?: string;
+  route_type?: string;
+  iterations?: number;
+  tools_used?: string[];
+};
+
 type ProposalRecord = {
   proposal_id: string;
   kind: "efficiency" | "tool_request" | "rest_insight" | string;
@@ -394,6 +439,9 @@ class ApiError extends Error {
 }
 
 function initialView(): AppView {
+  if (window.location.pathname === "/chat") {
+    return "chat";
+  }
   const requested = new URLSearchParams(window.location.search).get("view");
   return coerceView(requested) ?? coerceView(localStorage.getItem("brigade_view")) ?? "cockpit";
 }
@@ -784,6 +832,15 @@ function App() {
             onRefresh={refreshAll}
             setStatus={setStatus}
             onOpenTaskDialog={openTaskDialog}
+          />
+        ) : view === "chat" ? (
+          <ExecutiveChatView
+            canChat={can("chat:write")}
+            api={api}
+            models={models}
+            route={orchestratorModel || recommendedModel}
+            onRouteChange={setOrchestratorModel}
+            setStatus={setStatus}
           />
         ) : view === "telemetry" ? (
           <TelemetryView
@@ -4515,6 +4572,279 @@ function OrchestratorChat({
         action="orchestrator chat is disabled"
       />
     </div>
+  );
+}
+
+function ExecutiveChatView({
+  canChat,
+  api,
+  models,
+  route,
+  onRouteChange,
+  setStatus,
+}: {
+  canChat: boolean;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  models: ModelInventory | null;
+  route: ModelRoute | null;
+  onRouteChange: (route: ModelRoute) => void;
+  setStatus: (status: string) => void;
+}) {
+  const [personas, setPersonas] = useState<PersonaInfo[]>([]);
+  const [threads, setThreads] = useState<ChatThread[]>([]);
+  const [selectedPersonaId, setSelectedPersonaId] = useState("");
+  const [thread, setThread] = useState<ChatThread | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [message, setMessage] = useState("");
+  const [pending, setPending] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const feedRef = useAutoScroll<HTMLDivElement>([thread?.thread_id, messages.length, pending]);
+
+  const executivePersonas = personas.filter((persona) => persona.kind === "executive");
+  const selectedPersona =
+    personas.find((persona) => persona.persona_id === selectedPersonaId) ||
+    executivePersonas[0] ||
+    personas[0] ||
+    null;
+
+  const loadThreads = useCallback(async () => {
+    const payload = await api<ThreadsPayload>("/api/chat/threads");
+    setThreads(payload.threads);
+    setPersonas(payload.personas);
+    setSelectedPersonaId((current) => {
+      if (current && payload.personas.some((persona) => persona.persona_id === current)) {
+        return current;
+      }
+      return (
+        payload.personas.find((persona) => persona.kind === "executive")?.persona_id ||
+        payload.personas[0]?.persona_id ||
+        ""
+      );
+    });
+    return payload;
+  }, [api]);
+
+  const loadMessages = useCallback(
+    async (nextThread: ChatThread) => {
+      const payload = await api<ThreadMessagesPayload>(
+        `/api/chat/threads/${encodeURIComponent(nextThread.thread_id)}/messages`,
+      );
+      setThread(payload.thread);
+      setMessages(payload.messages);
+    },
+    [api],
+  );
+
+  const openThread = useCallback(
+    async (personaId: string) => {
+      if (!personaId) {
+        setThread(null);
+        setMessages([]);
+        return null;
+      }
+      const opened = await api<ChatThread>("/api/chat/threads", {
+        method: "POST",
+        json: { persona: personaId },
+      });
+      setThread(opened);
+      await loadMessages(opened);
+      return opened;
+    },
+    [api, loadMessages],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    loadThreads()
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+        const personaId =
+          selectedPersonaId ||
+          payload.personas.find((persona) => persona.kind === "executive")?.persona_id ||
+          payload.personas[0]?.persona_id ||
+          "";
+        if (!personaId) {
+          setThread(null);
+          setMessages([]);
+          return;
+        }
+        return openThread(personaId);
+      })
+      .catch((error) => setStatus(errorMessage(error)))
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [loadThreads, openThread, selectedPersonaId, setStatus]);
+
+  async function switchPersona(personaId: string) {
+    setSelectedPersonaId(personaId);
+    setLoading(true);
+    try {
+      await openThread(personaId);
+      const persona = personas.find((item) => item.persona_id === personaId);
+      setStatus(`Chat opened: ${persona?.display_name || personaId}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function send() {
+    if (!message.trim() || !thread) {
+      return;
+    }
+    setPending(true);
+    setStatus("Sending executive chat");
+    try {
+      const result = await api<ThreadTurnResult>(
+        `/api/chat/threads/${encodeURIComponent(thread.thread_id)}/messages`,
+        {
+          method: "POST",
+          json: {
+            content: message,
+            idempotency_key: randomId("web-executive"),
+            ...modelRoutePayload(route),
+          },
+        },
+      );
+      setMessage("");
+      setStatus(`Executive chat ${result.status || "complete"}`);
+      await loadMessages(thread);
+      await loadThreads();
+    } finally {
+      setPending(false);
+    }
+  }
+
+  const assistantId =
+    selectedPersona?.agent_id ||
+    selectedPersona?.chief_agent_id ||
+    (thread?.persona === "front_desk" ? "front_desk" : thread?.persona || "");
+  const assistantMessages = new Set(["front_desk", "orchestrator", assistantId].filter(Boolean));
+
+  return (
+    <section className="executive-chat-view">
+      <div className="executive-chat-shell">
+        <aside className="ob-panel executive-sidebar">
+          <div className="ob-panel-head">
+            <span className="ob-panel-title">Chat Surface</span>
+            <span className="ob-badge">{personas.length}</span>
+          </div>
+          <div className="executive-persona-list">
+            {executivePersonas.length === 0 && (
+              <p className="warning-banner">No Executive is configured for this user.</p>
+            )}
+            {personas.map((persona) => (
+              <button
+                key={persona.persona_id}
+                type="button"
+                className={`executive-persona-row${
+                  selectedPersona?.persona_id === persona.persona_id ? " is-selected" : ""
+                }`}
+                onClick={() =>
+                  switchPersona(persona.persona_id).catch((error) => setStatus(errorMessage(error)))
+                }
+              >
+                <span className="ob-agent-avatar">
+                  {agentInitials(persona.display_name || persona.persona_id)}
+                </span>
+                <span>
+                  <strong>{persona.display_name}</strong>
+                  <small>{persona.kind.replace("_", " ")}</small>
+                </span>
+              </button>
+            ))}
+          </div>
+          <div className="executive-thread-list">
+            <span className="mini-label">Threads</span>
+            {threads.slice(0, 8).map((item) => (
+              <button
+                key={item.thread_id}
+                type="button"
+                className={thread?.thread_id === item.thread_id ? "is-selected" : ""}
+                onClick={() => {
+                  setSelectedPersonaId(item.persona);
+                  loadMessages(item).catch((error) => setStatus(errorMessage(error)));
+                }}
+              >
+                <span>{item.title || item.persona}</span>
+                <small>{item.status}</small>
+              </button>
+            ))}
+          </div>
+        </aside>
+
+        <section className="ob-panel executive-chat-panel">
+          <div className="executive-chat-head">
+            <div>
+              <h2>{selectedPersona?.display_name || "Executive Chat"}</h2>
+              <p>{thread?.channel || "Open /chat to talk with your Executive."}</p>
+            </div>
+            <ModelSelect
+              label="Chat model"
+              inventory={models}
+              route={route}
+              onChange={onRouteChange}
+            />
+          </div>
+          <div className="chat-feed executive-feed" ref={feedRef}>
+            {loading && <p className="muted">Loading chat.</p>}
+            {!loading && !thread && <p className="muted">No chat thread available.</p>}
+            {!loading && thread && messages.length === 0 && (
+              <p className="muted">No messages in this thread.</p>
+            )}
+            {messages.slice(-150).map((item) => (
+              <ChatMessageRow
+                key={item.message_id}
+                message={item}
+                html={assistantMessages.has(item.sender) ? renderMarkdownHtml(item.content) : undefined}
+                perspective={assistantId}
+              />
+            ))}
+          </div>
+          <div className="chat-compose executive-compose">
+            <textarea
+              value={message}
+              disabled={!canChat || pending || !thread}
+              onChange={(event) => setMessage(event.target.value)}
+              onKeyDown={(event) =>
+                handleChatSubmitKey(event, () =>
+                  send().catch((error) => setStatus(errorMessage(error))),
+                )
+              }
+              placeholder="Message your Executive - Ctrl+Enter to send, Enter for newline"
+            />
+            <div className="chat-actions">
+              <button
+                disabled={!canChat || pending || !message.trim() || !thread}
+                onClick={() => send().catch((error) => setStatus(errorMessage(error)))}
+                title="Send message (Ctrl+Enter)"
+              >
+                {pending ? "Sending" : "Send"}
+              </button>
+              <button
+                disabled={!thread || pending}
+                onClick={() => thread && loadMessages(thread).catch((error) => setStatus(errorMessage(error)))}
+              >
+                Refresh
+              </button>
+            </div>
+          </div>
+          <PermissionNotice
+            allowed={canChat}
+            permission="chat:write"
+            action="executive chat is disabled"
+          />
+        </section>
+      </div>
+    </section>
   );
 }
 

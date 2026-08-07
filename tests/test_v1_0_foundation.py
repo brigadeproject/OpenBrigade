@@ -17,6 +17,7 @@ from brigade.schemas import (
     assignment_from_dict,
     build_proposal,
     build_recurrence,
+    chat_message_from_dict,
     goal_from_dict,
 )
 from brigade.state import JsonStateStore
@@ -113,6 +114,36 @@ def test_build_proposal_validates_kind_and_status():
         build_proposal(kind="wish", title="nope")
     with pytest.raises(ValueError, match="proposal status"):
         build_proposal(kind="efficiency", title="nope", status="maybe")
+
+
+def test_json_store_audit_records_are_insert_only(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    message = {
+        "channel": "thread:1",
+        "sender": "owner",
+        "recipient": "sage",
+        "content": "first",
+        "message_id": "msg-1",
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    store.add_message(chat_message_from_dict(message))
+    store.add_message(chat_message_from_dict({**message, "content": "second"}))
+    store.add_usage_record(
+        {"usage_id": "usage-1", "recorded_at": "2026-01-01T00:00:00+00:00", "value": 1}
+    )
+    store.add_usage_record(
+        {"usage_id": "usage-1", "recorded_at": "2026-01-01T00:00:00+00:00", "value": 2}
+    )
+    store.add_provenance_record(
+        {"record_id": "prov-1", "created_at": "2026-01-01T00:00:00+00:00", "value": 1}
+    )
+    store.add_provenance_record(
+        {"record_id": "prov-1", "created_at": "2026-01-01T00:00:00+00:00", "value": 2}
+    )
+
+    assert store.messages()[0].content == "first"
+    assert store.usage_records()[0]["value"] == 1
+    assert store.provenance_records()[0]["value"] == 1
 
 
 def test_build_recurrence_validates_template_and_interval():
@@ -356,6 +387,36 @@ def test_cli_agent_onboard_with_specialties(tmp_path, monkeypatch, capsys):
 
     store = JsonStateStore(tmp_path / ".brigade" / "state.json")
     assert store.agents()[0].specialties == ["python", "networking"]
+
+
+def test_init_mvp_seeds_executive_baseline_and_policy_projections(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["init", "mvp", "--mission", "Prototype mission"]) == 0
+    capsys.readouterr()
+
+    store = JsonStateStore(tmp_path / ".brigade" / "state.json")
+    agents = {agent.agent_id: agent for agent in store.agents()}
+    assert agents["garde"].role == "infrastructure"
+    assert "infrastructure" in agents["garde"].specialties
+    assert agents["abacus"].role == "financial"
+    assert "finance" in agents["abacus"].specialties
+    assert agents["executive"].role == "executive"
+    assert agents["executive"].owner_username == "owner"
+
+    workspace = tmp_path / ".brigade" / "workspace-executive"
+    assert (workspace / "SKILLS.md").exists()
+    assert (workspace / "skills" / "executive" / "concierge-chat" / "SKILL.md").exists()
+    assert (workspace / "skills" / "executive" / "check-memory" / "SKILL.md").exists()
+
+    projections = store.policy_projections("executive")
+    projected_paths = {item["path"] for item in projections}
+    assert "IDENTITY.md" in projected_paths
+    assert "SKILLS.md" in projected_paths
+    assert "skills/executive/concierge-chat/SKILL.md" in projected_paths
+    assert all(item["content_hash"] for item in projections)
 
 
 def test_cli_proposal_list_approve_and_reject(tmp_path, monkeypatch, capsys):

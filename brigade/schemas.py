@@ -95,7 +95,25 @@ class Role(str, Enum):
     OBSERVER = "observer"
 
 
-PROPOSAL_KINDS = frozenset({"efficiency", "tool_request", "rest_insight"})
+AGENT_ROLE_LINE_WORKER = "line_worker"
+AGENT_ROLE_CREW_CHIEF = "crew_chief"
+AGENT_ROLE_EXECUTIVE = "executive"
+AGENT_ROLES = frozenset(
+    {
+        AGENT_ROLE_LINE_WORKER,
+        AGENT_ROLE_CREW_CHIEF,
+        AGENT_ROLE_EXECUTIVE,
+        "financial",
+        "infrastructure",
+        "planner",
+        "prototype",
+        "research",
+    }
+)
+
+PROPOSAL_KINDS = frozenset(
+    {"efficiency", "tool_request", "rest_insight", "policy_change"}
+)
 PROPOSAL_STATUSES = frozenset({"proposed", "approved", "rejected", "implemented", "expired"})
 
 # Marker embedded in the synthetic ``last_error`` a runner writes when a provider
@@ -306,17 +324,22 @@ class Agent:
     agent_id: str
     display_name: str
     workspace_path: str
-    role: str = "line_worker"
+    role: str = AGENT_ROLE_LINE_WORKER
     team_id: str | None = None
     model_provider: str = "ollama"
     model_name: str = "qwen2.5-coder:7b"
     specialties: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now_iso)
+    owner_username: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.agent_id, "agent_id")
         _require_text(self.display_name, "display_name")
         _require_text(self.workspace_path, "workspace_path")
+        if self.role not in AGENT_ROLES:
+            raise ValueError(f"invalid agent role: {self.role}")
+        if self.role == AGENT_ROLE_EXECUTIVE:
+            _require_text(self.owner_username or "", "owner_username")
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -490,12 +513,13 @@ def agent_from_dict(item: dict[str, Any]) -> Agent:
         agent_id=item["agent_id"],
         display_name=item["display_name"],
         workspace_path=item["workspace_path"],
-        role=item.get("role", "line_worker"),
+        role=item.get("role", AGENT_ROLE_LINE_WORKER),
         team_id=item.get("team_id"),
         model_provider=item.get("model_provider", "ollama"),
         model_name=item.get("model_name", "gpt-oss:20b"),
         specialties=item.get("specialties", []),
         created_at=item["created_at"],
+        owner_username=item.get("owner_username"),
     )
 
 

@@ -289,6 +289,39 @@ finishes); Google Chat runs synchronously with a tighter iteration cap. See the
 `BRIGADE_CHIEF_CHAT_*` settings in `.env.example`, including the
 `BRIGADE_OLLAMA_NUM_CTX` sizing note — loop prompts grow ~1-2KB per iteration.
 
+### Executive concierge (release 1.3)
+
+Release 1.3 introduces **Executive** agents: per-user personal concierges for
+the human operator. Executives are not mission workers and are excluded from the
+normal heartbeat assignment runner, idle mission synthesis, and rest scheduling.
+They use durable chat threads like Crew Chiefs, but their scope is the owner
+user: they can inspect Brigade state, create or modify goals and tasks, attach
+operator guidance, ingest notes into the Knowledge Base, save memory, and fetch
+small public HTTP(S) pages with the existing web-fetch safety gates.
+
+Create an owner user first, then onboard an Executive for that owner:
+
+```bash
+brigade user add --username owner --role owner
+brigade agent onboard --id exec --name "Executive" --role executive --owner-username owner
+```
+
+The web chat persona list includes `executive:<id>` for the authenticated owner.
+For terminal-only access, use the Executive TUI against the same durable chat
+thread:
+
+```bash
+brigade --as-user owner executive tui
+brigade --as-user owner executive tui --plain
+```
+
+The initial TUI slash commands are `/quit`, `/clear`, `/status`, and `/model`.
+Telegram can route approved users to their Executive when
+`BRIGADE_CONNECTOR_EXECUTIVE_CHAT_ENABLED=true`; otherwise connector behavior
+stays on the existing default-agent / chief-chat path. Full personal-assistant
+automation — email/calendar write actions, shell/curl workflows, and
+Playwright/Chrome button-clicking — remains 1.4 scope.
+
 OpenAI, OpenAI/Codex, Anthropic/Claude, and Gemini routes continue to use LiteLLM. API keys remain
 supported through `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`. Claude is API-key
 only for RC. OpenAI/Codex and Gemini OAuth credentials can be imported or manually exchanged and

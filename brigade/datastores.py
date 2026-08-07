@@ -23,6 +23,9 @@ KB_NEO4J_SCHEMA: dict[str, tuple[str, str]] = {
     "goal": ("Goal", "statement"),
     "team": ("Team", "team_id"),
     "decision": ("Decision", "decision_id"),
+    "evidence": ("Evidence", "evidence_id"),
+    "constraint": ("Constraint", "statement"),
+    "assumption": ("Assumption", "statement"),
 }
 
 HASH_FALLBACK_VECTOR_SIZE = 64
@@ -388,6 +391,13 @@ class QdrantChunkStore(QdrantCollectionStore):
             "document_type": chunk.get("document_type"),
             "chunk_index": chunk.get("chunk_index"),
             "source": chunk.get("source"),
+            "content_path": chunk.get("content_path"),
+            "title": chunk.get("title"),
+            "ingested_at": chunk.get("ingested_at"),
+            "ingestion_version": chunk.get("ingestion_version"),
+            "chunking_version": chunk.get("chunking_version"),
+            "embedding_model": self.embedding_model,
+            "content_hash": chunk.get("content_hash"),
             "text": text,
             "created_at": chunk.get("created_at"),
         }
@@ -441,7 +451,7 @@ class QdrantChunkStore(QdrantCollectionStore):
                     continue
             else:
                 vectors = [_text_vector(text) for text in texts]
-            for chunk, vector in zip(batch, vectors):
+            for chunk, vector in zip(batch, vectors, strict=False):
                 results.append(self.upsert_chunk(chunk, vector=vector))
         return results
 

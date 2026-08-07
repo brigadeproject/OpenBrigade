@@ -44,6 +44,7 @@ EMPTY_STATE: dict[str, Any] = {
     "conversations": [],
     "orchestrator_reasoning": [],
     "proposals": [],
+    "policy_projections": [],
     "recurrences": [],
     "orchestrator_policies": [],
     "usage_records": [],
@@ -347,7 +348,10 @@ class JsonStateStore:
 
     def add_message(self, message: ChatMessage) -> None:
         state = self.load()
-        state.setdefault("messages", []).append(message.to_dict())
+        messages = state.setdefault("messages", [])
+        if any(item.get("message_id") == message.message_id for item in messages):
+            return
+        messages.append(message.to_dict())
         self.save(state)
 
     def messages(self, channel: str | None = None) -> list[ChatMessage]:
@@ -493,6 +497,32 @@ class JsonStateStore:
             records.append(dict(proposal))
         self.save(state)
 
+    def upsert_policy_projection(self, projection: dict[str, Any]) -> None:
+        state = self.load()
+        records = state.setdefault("policy_projections", [])
+        for index, item in enumerate(records):
+            if (
+                item.get("agent_id") == projection.get("agent_id")
+                and item.get("path") == projection.get("path")
+            ):
+                records[index] = dict(projection)
+                break
+        else:
+            records.append(dict(projection))
+        self.save(state)
+
+    def policy_projection(self, agent_id: str, path: str) -> dict[str, Any] | None:
+        for item in self.load().get("policy_projections", []):
+            if item.get("agent_id") == agent_id and item.get("path") == path:
+                return dict(item)
+        return None
+
+    def policy_projections(self, agent_id: str | None = None) -> list[dict[str, Any]]:
+        records = [dict(item) for item in self.load().get("policy_projections", [])]
+        if agent_id is None:
+            return records
+        return [item for item in records if item.get("agent_id") == agent_id]
+
     def add_recurrence(self, recurrence: dict[str, Any]) -> dict[str, Any]:
         state = self.load()
         state.setdefault("recurrences", []).append(dict(recurrence))
@@ -561,7 +591,10 @@ class JsonStateStore:
 
     def add_usage_record(self, record: dict[str, Any]) -> None:
         state = self.load()
-        state.setdefault("usage_records", []).append(record)
+        records = state.setdefault("usage_records", [])
+        if any(item.get("usage_id") == record.get("usage_id") for item in records):
+            return
+        records.append(record)
         self.save(state)
 
     def usage_records(self) -> list[dict[str, Any]]:
@@ -601,7 +634,13 @@ class JsonStateStore:
 
     def add_transcript(self, transcript: dict[str, Any]) -> None:
         state = self.load()
-        state.setdefault("transcripts", []).append(transcript)
+        records = state.setdefault("transcripts", [])
+        if any(
+            item.get("transcript_id") == transcript.get("transcript_id")
+            for item in records
+        ):
+            return
+        records.append(transcript)
         self.save(state)
 
     def transcripts(self) -> list[dict[str, Any]]:
@@ -609,7 +648,10 @@ class JsonStateStore:
 
     def add_episode(self, episode: dict[str, Any]) -> None:
         state = self.load()
-        state.setdefault("episodes", []).append(episode)
+        records = state.setdefault("episodes", [])
+        if any(item.get("episode_id") == episode.get("episode_id") for item in records):
+            return
+        records.append(episode)
         self.save(state)
 
     def episodes(self) -> list[dict[str, Any]]:
@@ -678,7 +720,10 @@ class JsonStateStore:
 
     def add_provenance_record(self, record: dict[str, Any]) -> None:
         state = self.load()
-        state.setdefault("provenance_records", []).append(record)
+        records = state.setdefault("provenance_records", [])
+        if any(item.get("record_id") == record.get("record_id") for item in records):
+            return
+        records.append(record)
         self.save(state)
 
     def provenance_records(self) -> list[dict[str, Any]]:
@@ -692,7 +737,10 @@ class JsonStateStore:
 
     def add_connector_audit_event(self, record: dict[str, Any]) -> None:
         state = self.load()
-        state.setdefault("connector_audit_events", []).append(dict(record))
+        records = state.setdefault("connector_audit_events", [])
+        if any(item.get("event_id") == record.get("event_id") for item in records):
+            return
+        records.append(dict(record))
         self.save(state)
 
     def connector_audit_events(

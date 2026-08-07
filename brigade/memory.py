@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -7,6 +9,10 @@ from uuid import uuid4
 from brigade.time import utc_now, utc_now_iso
 
 MAX_MEMORY_BYTES = 2048
+EXPLICIT_MEMORY_REQUEST_RE = re.compile(
+    r"\b(remember that|remember this|remember:|note that|save this|keep in mind|don't forget)\b",
+    re.IGNORECASE,
+)
 
 
 def append_daily_memory(workspace: Path, date_key: str, note: str) -> Path:
@@ -16,6 +22,64 @@ def append_daily_memory(workspace: Path, date_key: str, note: str) -> Path:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(f"- {note.strip()}\n")
     return path
+
+
+def explicit_memory_request(text: str) -> bool:
+    return bool(EXPLICIT_MEMORY_REQUEST_RE.search(text))
+
+
+def build_memory_entry(
+    note: str,
+    *,
+    source: str,
+    author: str,
+    conversation_id: str | None = None,
+    message_id: str | None = None,
+    status: str = "active",
+) -> tuple[str, str, dict[str, object]]:
+    entry_id = str(uuid4())
+    metadata: dict[str, object] = {
+        "entry_id": entry_id,
+        "source": source,
+        "author": author,
+        "status": status,
+        "created_at": utc_now_iso(),
+    }
+    if conversation_id:
+        metadata["conversation_id"] = conversation_id
+    if message_id:
+        metadata["message_id"] = message_id
+    marker = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    line = f"- [{status}] {note.strip()} <!-- brigade-memory:{marker} -->"
+    return entry_id, line, metadata
+
+
+def record_memory_mutation(
+    store: object,
+    *,
+    agent_id: str | None,
+    memory_path: Path,
+    note: str,
+    metadata: dict[str, object],
+) -> None:
+    add_provenance = getattr(store, "add_provenance_record", None)
+    if not callable(add_provenance):
+        return
+    add_provenance(
+        {
+            "record_id": str(uuid4()),
+            "node_type": "memory_entry",
+            "node_id": str(metadata.get("entry_id")),
+            "source_refs": [str(memory_path)],
+            "metadata": {
+                "event": "memory_entry_added",
+                "agent_id": agent_id,
+                "note": note,
+                **metadata,
+            },
+            "created_at": utc_now_iso(),
+        }
+    )
 
 
 def curate_memory(workspace: Path, promoted_notes: list[str]) -> Path:
