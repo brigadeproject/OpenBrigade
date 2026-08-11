@@ -84,6 +84,31 @@ def test_load_settings_reads_executive_controls(tmp_path):
     assert settings.connector_executive_chat_enabled is True
 
 
+def test_load_settings_reads_research_tool_controls(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "\n".join(
+            [
+                "BRIGADE_SEARCH_BACKEND=duckduckgo",
+                "BRIGADE_SEARXNG_URL=http://search.local:8080",
+                "BRIGADE_BROWSER_WORKER_URL=http://browser.local:8765",
+                "BRIGADE_RESEARCH_STORAGE_PATH=/mnt/research-store",
+                "BRIGADE_MCP_CONFIG=/data/custom-mcp.json",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=tmp_path / "missing.json", env_path=env)
+
+    assert settings.search_backend == "duckduckgo"
+    assert settings.searxng_url == "http://search.local:8080"
+    assert settings.browser_worker_url == "http://browser.local:8765"
+    assert str(settings.research_storage_path) == "/mnt/research-store"
+    assert str(settings.mcp_config_path) == "/data/custom-mcp.json"
+
+
 def test_load_settings_uses_configured_ollama_as_live_default(tmp_path):
     env = tmp_path / ".env"
     env.write_text(

@@ -1,5 +1,15 @@
 # External Connector Runbook
 
+## Browser worker recovery
+
+Public browser research is served by the isolated `brigade_browser` worker. Diagnose it with
+`./ops/brigade-live.sh health --json` and `docker compose --env-file .env --profile app logs brigade_browser`.
+A saturated worker returns a bounded 429 observation; restart only the browser service with
+`docker compose --env-file .env --profile app up -d --build brigade_browser`. Public sessions do not
+survive restart. For a named authenticated profile, first revoke it through the worker's
+`clear-profile` operation, then rotate or revoke the external profile provider; never copy cookies or
+browser profile files into OpenBrigade configuration, logs, or tickets.
+
 External routes are disabled by default. Keep them disabled unless an operator is actively testing
 or operating that connector with Postgres and Redis available for durable audit records, approvals,
 rate limits, and queue state.

@@ -11,9 +11,16 @@ OAuth credential import for OpenAI/Codex and Gemini, Ollama/local routing, and p
 configuration during managed runs.
 
 The RC does not claim Claude OAuth, native Google Workspace tools, dynamic sub-agent spawning, or
-MCP client/server support as shipped features. Google Workspace tools are expected to arrive through
-the post-RC MCP client milestone described in `docs/MCP_CLIENT_POST_RC.md`. Dynamic sub-agent
-spawning is scoped to v1.1; the RC delegates tracked tasks across an existing, fixed agent roster.
+OpenBrigade-as-MCP-server support as shipped features. OpenBrigade can consume configured MCP
+servers as governed, tool-only agent integrations; Google Workspace tools are expected through community MCP servers rather
+than bespoke native integrations. See [the MCP client contract](docs/MCP_CLIENT_POST_RC.md) for its
+supported transports, lifecycle, policy, credential references, and limits. Dynamic sub-agent spawning is scoped to v1.1; the RC delegates
+tracked tasks across an existing, fixed agent roster.
+
+Governed public search, retained-source evidence, browser retrieval, and citation-bearing legal
+research are operated through the [research operations runbook](docs/RESEARCH_OPERATIONS_RUNBOOK.md).
+Legal citations distinguish primary authority from secondary interpretation (including Cornell LII);
+ordinary non-citation work remains plain prose.
 
 The PR-candidate path uses the `brigade_` Docker stack with Postgres, Redis, Qdrant, and Neo4j.
 Operator workflows require the containerized stores. Live commands should run through
@@ -254,7 +261,7 @@ brigade connector approvals reject --provider google_chat --external-user users/
 Release 1.1 lets operators converse with the brigade in natural language through
 **Crew Chiefs**. A chief behaves like a modern agent: it runs a multi-turn tool
 loop over query tools (`list_tasks`, `team_status`, `search_episodes`,
-`usage_summary`, `list_recurrences`, `web_fetch`, …) to answer from live and
+`usage_summary`, `list_recurrences`, `web_search`, `web_fetch`, …) to answer from live and
 historical state, keeps long-term memory (conversation continuity, episodic
 recall, curated notes), and stages state-changing actions (`create_assignment`,
 `cancel_assignment`, `set_priority`, `attach_guidance`,
@@ -268,10 +275,18 @@ Chiefs can schedule their own recurring jobs: "brief me every morning" stages a
 recurrence engine materializes each due slot. With `deliver_briefing` set, the
 finished run's summary is posted back into the conversation thread it was
 created from — and to the operator Telegram when
-`BRIGADE_OPERATOR_TELEGRAM_CHAT_ID` is configured. Chiefs can also fetch small
-HTTP(S) text responses mid-conversation with the same `web_fetch` tool
-assignment agents already have (`BRIGADE_CHIEF_CHAT_WEB_FETCH_ENABLED=false`
-keeps chat turns fully offline).
+`BRIGADE_OPERATOR_TELEGRAM_CHAT_ID` is configured. Chiefs can also search the
+public web for source URLs, fetch HTTP(S) text or PDF responses, and render
+JavaScript-heavy pages through the isolated browser worker with the same governed web tools
+assignment agents already have (`BRIGADE_CHIEF_CHAT_WEB_FETCH_ENABLED=false` keeps chat turns fully
+offline). Saved web material carries source-map metadata with original URL, final URL, retrieval
+tool, access time, content hash, and chunk offsets.
+
+When a Chief, Executive, or assignment is asked for legal research or explicit citations, OpenBrigade
+uses citation-bearing mode: it retains the retrieved source, validates supplied citation IDs once, and
+renders source-qualified footnotes. Ordinary research and operational chat remain plain prose. See
+[`docs/LIBRARY_SYSTEMS.md`](docs/LIBRARY_SYSTEMS.md#citation-bearing-answers) for source retention and
+citation-policy details.
 
 Threads are durable and identity-keyed, so the mobile SPA and an approved
 Telegram user with the same username share one conversation. Web/mobile use the
@@ -296,8 +311,9 @@ the human operator. Executives are not mission workers and are excluded from the
 normal heartbeat assignment runner, idle mission synthesis, and rest scheduling.
 They use durable chat threads like Crew Chiefs, but their scope is the owner
 user: they can inspect Brigade state, create or modify goals and tasks, attach
-operator guidance, ingest notes into the Knowledge Base, save memory, and fetch
-small public HTTP(S) pages with the existing web-fetch safety gates.
+operator guidance, ingest notes into the Knowledge Base, save memory, search
+the public web for source URLs, and fetch small public HTTP(S) text or PDF
+responses with the existing web safety gates.
 
 Create an owner user first, then onboard an Executive for that owner:
 

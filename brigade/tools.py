@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import socket
 import subprocess
@@ -11,15 +12,39 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+from brigade.evidence import classify_source, source_selection_hint
 from brigade.governance import (
     build_policy_change_proposal,
     is_governing_workspace_path,
     normalize_workspace_relative_path,
 )
-from brigade.knowledge import html_to_text, ingest_text, store_ingest_result
+from brigade.knowledge import (
+    extract_document_text,
+    html_to_text,
+    ingest_text,
+    pdf_text_with_page_map,
+    store_ingest_result,
+)
+from brigade.mcp_client import call_tool as call_mcp_tool
+from brigade.mcp_client import (
+    configured_servers,
+    discover_tools,
+    record_server_health,
+    redact_failure_reason,
+)
+from brigade.research import (
+    call_browser_worker,
+    record_search_health,
+    search_with_retry,
+    searxng_search,
+    source_map,
+)
+from brigade.research_control import reconcile_research_alert
 from brigade.schemas import Agent, Assignment, AssignmentKind, AssignmentStatus, Priority
 from brigade.store import StateStore
 from brigade.time import utc_now_iso
@@ -62,6 +87,34 @@ ToolHandler = Callable[[ToolContext, dict[str, Any]], ToolResult]
 MAX_DELEGATION_DEPTH = 2
 MAX_CHILDREN_PER_ASSIGNMENT = 5
 MAX_CREATE_SUBTASKS = 5
+WEB_SEARCH_DEFAULT_URL = "https://duckduckgo.com/html/"
+WEB_SEARCH_MAX_QUERY_CHARS = 200
+WEB_SEARCH_MAX_RESULTS = 8
+WEB_SEARCH_READ_CAP = 120_000
+WEB_FETCH_PDF_MAX_BYTES = 100_000_000
+WEB_FETCH_SAVE_MAX_CHARS = 2_000_000
+
+
+def _research_storage_root(store: StateStore) -> Path:
+    """Local default or an operator-mounted NAS path for retained sources."""
+    configured = os.environ.get("BRIGADE_RESEARCH_STORAGE_PATH", "").strip()
+    root = Path(configured) if configured else store.data_dir / "knowledge"
+    if not root.is_absolute() and configured:
+        raise ValueError("BRIGADE_RESEARCH_STORAGE_PATH must be an absolute mounted path")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _research_component_enabled(context: ToolContext, component: str) -> bool:
+    """Live policy switches default to enabled until an operator changes them."""
+    key = f"research_{component}_enabled"
+    try:
+        return bool((context.store.runtime_overrides() or {}).get(key, True))
+    except RuntimeError:
+        # An unavailable runtime store must not turn an intentional external
+        # denial into an accidental bypass; normal deployments have a durable
+        # state store, while offline tests retain the safe default.
+        return True
 
 
 class ToolRegistry:
@@ -90,8 +143,7 @@ def native_tool_specs(registry: ToolRegistry) -> list[dict[str, Any]]:
     specs = []
     for spec in registry.specs():
         properties = {
-            name: {"description": description}
-            for name, description in spec.argument_schema.items()
+            name: {"description": description} for name, description in spec.argument_schema.items()
         }
         required = [
             name
@@ -125,10 +177,7 @@ def default_tool_registry() -> ToolRegistry:
                 "team-shared workspace when the path starts with shared/."
             ),
             argument_schema={
-                "path": (
-                    "optional relative path; prefix shared/ for the "
-                    "team-shared workspace"
-                )
+                "path": ("optional relative path; prefix shared/ for the team-shared workspace")
             },
         ),
         _list_files,
@@ -141,10 +190,7 @@ def default_tool_registry() -> ToolRegistry:
                 "the team-shared workspace when the path starts with shared/."
             ),
             argument_schema={
-                "path": (
-                    "relative file path; prefix shared/ for the team-shared "
-                    "workspace"
-                )
+                "path": ("relative file path; prefix shared/ for the team-shared workspace")
             },
         ),
         _read_file,
@@ -157,10 +203,7 @@ def default_tool_registry() -> ToolRegistry:
                 "the team-shared workspace when the path starts with shared/."
             ),
             argument_schema={
-                "path": (
-                    "relative file path; prefix shared/ for the team-shared "
-                    "workspace"
-                ),
+                "path": ("relative file path; prefix shared/ for the team-shared workspace"),
                 "content": "text to write",
                 "append": "optional boolean, defaults false",
             },
@@ -184,8 +227,8 @@ def default_tool_registry() -> ToolRegistry:
         ToolSpec(
             name="web_fetch",
             description=(
-                "Fetch a small HTTP(S) text response for reference. Pass "
-                "save_to_knowledge true to keep the page in the shared knowledge base."
+                "Fetch a small HTTP(S) text or PDF response for reference. Pass "
+                "save_to_knowledge true to keep extracted text in the shared knowledge base."
             ),
             argument_schema={
                 "url": "http or https URL",
@@ -197,6 +240,29 @@ def default_tool_registry() -> ToolRegistry:
         ),
         _web_fetch,
     )
+    registry.register(
+        ToolSpec(
+            name="web_search",
+            description=(
+                "Search the public web for source URLs through the configured search backend. "
+                "Returns titles, URLs, snippets, engine, and rank; use web_fetch or "
+                "browser_extract with save_to_knowledge to retrieve useful results."
+            ),
+            argument_schema={
+                "query": "search query, maximum 200 characters",
+                "limit": "optional integer, maximum 8",
+                "intent": "optional general|legal, defaults general",
+                "jurisdiction": "optional jurisdiction for legal research",
+                "save_to_knowledge": (
+                    "optional boolean; store the result list and source URLs as "
+                    "a knowledge document"
+                ),
+            },
+        ),
+        _web_search,
+    )
+    _register_browser_tools(registry)
+    _register_mcp_tools(registry)
     registry.register(
         ToolSpec(
             name="delegate",
@@ -262,10 +328,7 @@ def default_tool_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="approve_proposal",
-            description=(
-                "Crew chiefs only: approve a pending proposal raised by your "
-                "own team."
-            ),
+            description=("Crew chiefs only: approve a pending proposal raised by your own team."),
             argument_schema={"proposal_id": "the proposal to approve"},
         ),
         _approve_proposal,
@@ -285,6 +348,232 @@ def default_tool_registry() -> ToolRegistry:
         _run_workspace_tool,
     )
     return registry
+
+
+def _register_browser_tools(registry: ToolRegistry) -> None:
+    registry.register(
+        ToolSpec(
+            name="browser_open",
+            description=(
+                "Open a public HTTP(S) URL in the isolated browser worker and return title/url. "
+                "Optional profile is restricted to Crew Chiefs and Executive."
+            ),
+            argument_schema={
+                "url": "public http or https URL",
+                "session_id": "optional browser session id",
+                "profile": "optional authenticated browser profile name",
+            },
+        ),
+        _browser_open,
+    )
+    registry.register(
+        ToolSpec(
+            name="browser_extract",
+            description=(
+                "Use the isolated browser worker to render a URL or current session and extract "
+                "readable body text and page HTML."
+            ),
+            argument_schema={
+                "url": "optional public http or https URL",
+                "session_id": "optional browser session id",
+                "profile": "optional authenticated browser profile name",
+                "save_to_knowledge": "optional boolean; save extracted text with source map",
+            },
+        ),
+        _browser_extract,
+    )
+    registry.register(
+        ToolSpec(
+            name="browser_click",
+            description="Click a CSS selector in an isolated browser session.",
+            argument_schema={
+                "selector": "CSS selector to click",
+                "session_id": "optional browser session id",
+                "profile": "optional authenticated browser profile name",
+            },
+        ),
+        _browser_click,
+    )
+    registry.register(
+        ToolSpec(
+            name="browser_screenshot",
+            description="Capture a screenshot from an isolated browser session.",
+            argument_schema={
+                "session_id": "optional browser session id",
+                "profile": "optional authenticated browser profile name",
+                "full_page": "optional boolean, defaults true",
+            },
+        ),
+        _browser_screenshot,
+    )
+    registry.register(
+        ToolSpec(
+            name="browser_clear_profile",
+            description="Revoke and clear an authorized authenticated browser profile.",
+            argument_schema={"profile": "authenticated browser profile name"},
+        ),
+        _browser_clear_profile,
+    )
+
+
+def _register_mcp_tools(registry: ToolRegistry) -> None:
+    data_dir = Path(os.environ.get("BRIGADE_DATA_DIR", ".brigade"))
+    try:
+        servers = configured_servers(data_dir)
+    except Exception:
+        return
+    for server in servers:
+        try:
+            tools = discover_tools(server)
+        except Exception as exc:  # The CLI health surface retains the safe reason.
+            record_server_health(data_dir, server, "unhealthy", str(exc))
+            continue
+        record_server_health(data_dir, server, "healthy")
+        for tool in tools:
+            registry.register(
+                ToolSpec(
+                    name=tool.registry_name,
+                    description=tool.description or f"MCP tool {tool.name} from {server.name}",
+                    argument_schema={
+                        key: str(value.get("description") or value.get("type") or "")
+                        if isinstance(value, dict)
+                        else str(value)
+                        for key, value in tool.argument_schema.items()
+                    },
+                ),
+                _mcp_handler(server, tool.name),
+            )
+
+
+def _mcp_handler(server, tool_name: str) -> ToolHandler:
+    def _handler(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        if not _research_component_enabled(context, "mcp"):
+            return ToolResult(False, "MCP research capability is disabled by operator policy")
+        agent = context.agent
+        principal = agent.agent_id if agent else None
+        team_id = agent.team_id if agent else None
+        if not server.allows_principal(principal, team_id):
+            result = ToolResult(
+                False, "MCP server policy denies this principal", {"server_id": server.id}
+            )
+            _record_mcp_tool_event(context, server, tool_name, result)
+            return result
+        result = call_mcp_tool(server, tool_name, arguments)
+        observation = ToolResult(result.ok, result.output, result.metadata)
+        _record_mcp_tool_event(context, server, tool_name, observation)
+        return observation
+
+    return _handler
+
+
+def _record_mcp_tool_event(
+    context: ToolContext, server: Any, tool_name: str, result: ToolResult
+) -> None:
+    """Record an argument-free MCP audit event and a safe health transition."""
+    data_dir = Path(os.environ.get("BRIGADE_DATA_DIR", context.store.data_dir))
+    reason = None if result.ok else redact_failure_reason(result.output)
+    record_server_health(data_dir, server, "healthy" if result.ok else "unhealthy", reason)
+    metadata = result.metadata or {}
+    record = {
+        "record_id": str(metadata.get("audit_ref") or uuid4()),
+        "node_id": server.id,
+        "node_type": "mcp_server",
+        "created_at": utc_now_iso(),
+        "event_type": "mcp_tool_call" if result.ok else "mcp_tool_failure",
+        "server_id": server.id,
+        "tool_name": tool_name,
+        "principal": context.agent.agent_id if context.agent else None,
+        "policy_outcome": "allowed" if result.ok else "denied_or_failed",
+        "failure_reason": reason[:240] if reason else None,
+    }
+    context.store.add_provenance_record(record)
+    _record_research_incident(
+        context,
+        rule=f"mcp_{server.id}",
+        failed=not result.ok,
+        message=f"MCP server {server.id} {record['event_type']}: {record['failure_reason'] or ''}",
+    )
+
+
+def _record_research_incident(
+    context: ToolContext,
+    *,
+    rule: str,
+    failed: bool,
+    message: str,
+) -> None:
+    correlation_id = f"research:{uuid4()}"
+    alert = reconcile_research_alert(
+        context.store.data_dir,
+        rule=rule,
+        failed=failed,
+        message=message,
+        correlation_id=correlation_id,
+    )
+    if alert.get("new"):
+        context.store.add_alert(str(alert["message"]))
+    context.store.add_provenance_record(
+        {
+            "record_id": correlation_id,
+            "node_id": rule,
+            "node_type": "research_control",
+            "created_at": utc_now_iso(),
+            "principal": context.agent.agent_id if context.agent else None,
+            "tool": "research_incident",
+            "policy_outcome": "degraded" if failed else "healthy",
+            "failure_reason": message[:240] if failed else None,
+            "alert_id": alert.get("alert_id"),
+        }
+    )
+
+
+def _record_research_event(
+    context: ToolContext,
+    *,
+    tool: str,
+    outcome: str,
+    source_url: str | None = None,
+    final_url: str | None = None,
+    document_id: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    """Persist a correlation-safe external-action row without request content."""
+    context.store.add_provenance_record(
+        {
+            "record_id": str(uuid4()),
+            "node_id": tool,
+            "node_type": "web_search" if tool == "web_search" else "browser",
+            "created_at": utc_now_iso(),
+            "principal": context.agent.agent_id if context.agent else None,
+            "tool": tool,
+            "policy_outcome": outcome,
+            "source_url": _redacted_external_url(source_url),
+            "final_url": _redacted_external_url(final_url),
+            "document_id": document_id,
+            "failure_reason": redact_failure_reason(failure_reason or "") or None,
+        }
+    )
+    external_events = [
+        item
+        for item in context.store.provenance_records()
+        if item.get("node_type") in {"mcp_server", "web_search", "browser"}
+    ]
+    _record_research_incident(
+        context,
+        rule="unexpected_research_usage_volume",
+        failed=len(external_events) >= 100,
+        message=(
+            f"research action volume reached {len(external_events)} events; "
+            "review the filtered research audit"
+        ),
+    )
+
+
+def _redacted_external_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def tool_manifest(registry: ToolRegistry) -> list[dict[str, Any]]:
@@ -352,16 +641,10 @@ def _tool_path(context: ToolContext, raw_path: str | None) -> tuple[Path, Path, 
     workspace. ``display_prefix`` reconstructs agent-facing paths.
     """
     relative = Path(raw_path or ".")
-    if (
-        not relative.is_absolute()
-        and relative.parts
-        and relative.parts[0] in _SHARED_PATH_PREFIXES
-    ):
+    if not relative.is_absolute() and relative.parts and relative.parts[0] in _SHARED_PATH_PREFIXES:
         root = context.store.data_dir / SHARED_WORKSPACE_DIRNAME
         root.mkdir(parents=True, exist_ok=True)
-        remainder = (
-            str(Path(*relative.parts[1:])) if len(relative.parts) > 1 else "."
-        )
+        remainder = str(Path(*relative.parts[1:])) if len(relative.parts) > 1 else "."
         return root.resolve(), _safe_workspace_path(root, remainder), "shared/"
     return (
         context.workspace.resolve(),
@@ -420,9 +703,7 @@ def _read_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
 
 
 def _write_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-    workspace_root, path, prefix = _tool_path(
-        context, _required_text(arguments, "path")
-    )
+    workspace_root, path, prefix = _tool_path(context, _required_text(arguments, "path"))
     content = _required_text(arguments, "content")
     relative_path = path.relative_to(workspace_root).as_posix()
     if not prefix and is_governing_workspace_path(relative_path):
@@ -456,8 +737,7 @@ def _write_file(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         path.write_text(content, encoding="utf-8")
     return ToolResult(
         True,
-        f"wrote {len(content)} characters to "
-        f"{prefix + str(path.relative_to(workspace_root))}",
+        f"wrote {len(content)} characters to {prefix + str(path.relative_to(workspace_root))}",
     )
 
 
@@ -556,10 +836,169 @@ class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 WEB_FETCH_SAVE_MIN_CHARS = 500
-WEB_FETCH_SAVE_MAX_CHARS = 60_000
+
+
+def _browser_open(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    payload = _browser_payload(context, arguments, require_url=True)
+    if isinstance(payload, ToolResult):
+        return payload
+    result = call_browser_worker("open", payload)
+    return _browser_result(result, context=context)
+
+
+def _browser_extract(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    payload = _browser_payload(context, arguments, require_url=False)
+    if isinstance(payload, ToolResult):
+        return payload
+    result = call_browser_worker("extract", payload)
+    if not result.get("ok"):
+        return _browser_result(result, context=context)
+    text = str(result.get("text") or "")
+    metadata = {
+        "url": result.get("url"),
+        "title": result.get("title"),
+        "detail": "truncated" if len(text) > 12_000 else "complete",
+    }
+    store = getattr(context, "store", None)
+    if bool(arguments.get("save_to_knowledge")) and store is not None and text.strip():
+        try:
+            metadata.update(
+                _save_browser_page(
+                    store,
+                    url=str(result.get("url") or payload.get("url") or ""),
+                    title=str(result.get("title") or ""),
+                    text=text[:WEB_FETCH_SAVE_MAX_CHARS],
+                    html=str(result.get("html") or ""),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            metadata["knowledge_save"] = f"failed: {exc}"
+    _record_research_event(
+        context,
+        tool="browser_extract",
+        outcome="allowed",
+        source_url=payload.get("url"),
+        final_url=str(result.get("url") or ""),
+        document_id=str(metadata.get("saved_document_id") or "") or None,
+    )
+    _record_research_incident(
+        context,
+        rule="browser_policy_or_capacity",
+        failed=False,
+        message="browser extract succeeded",
+    )
+    return ToolResult(True, text[:12_000], metadata)
+
+
+def _browser_click(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    payload = _browser_payload(context, arguments, require_url=False)
+    if isinstance(payload, ToolResult):
+        return payload
+    payload["selector"] = _required_text(arguments, "selector")
+    return _browser_result(call_browser_worker("click", payload), context=context)
+
+
+def _browser_screenshot(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    payload = _browser_payload(context, arguments, require_url=False)
+    if isinstance(payload, ToolResult):
+        return payload
+    payload["full_page"] = bool(arguments.get("full_page", True))
+    result = call_browser_worker("screenshot", payload)
+    if not result.get("ok"):
+        return _browser_result(result, context=context)
+    image = str(result.get("image_b64") or "")
+    return ToolResult(
+        True,
+        f"screenshot captured ({len(image)} base64 chars)",
+        {"image_b64": image, "url": result.get("url"), "title": result.get("title")},
+    )
+
+
+def _browser_clear_profile(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    payload = _browser_payload(context, arguments, require_url=False)
+    if isinstance(payload, ToolResult):
+        return payload
+    if not payload["profile"]:
+        return ToolResult(False, "profile is required")
+    return _browser_result(call_browser_worker("clear-profile", payload), context=context)
+
+
+def _browser_payload(
+    context: ToolContext, arguments: dict[str, Any], *, require_url: bool
+) -> dict[str, Any] | ToolResult:
+    if not _research_component_enabled(context, "browser"):
+        return ToolResult(False, "browser research capability is disabled by operator policy")
+    url = str(arguments.get("url") or "").strip()
+    if require_url and not url:
+        return ToolResult(False, "url is required")
+    if url:
+        if not url.startswith(("http://", "https://")):
+            return ToolResult(False, "url must start with http:// or https://")
+        reason = _private_address_reason(url)
+        if reason is not None:
+            return ToolResult(False, f"browser refused: {reason}")
+    profile = str(arguments.get("profile") or "").strip()
+    if profile and not _browser_profile_allowed(context):
+        return ToolResult(
+            False,
+            "authenticated browser profiles are restricted to Crew Chiefs and Executive",
+        )
+    return {
+        "url": url,
+        "session_id": str(arguments.get("session_id") or "default"),
+        "profile": profile,
+        "principal": str(getattr(getattr(context, "agent", None), "agent_id", "") or ""),
+        "team_id": str(getattr(getattr(context, "agent", None), "team_id", "") or ""),
+    }
+
+
+def _browser_profile_allowed(context: ToolContext) -> bool:
+    persona = getattr(context, "persona", None)
+    if persona is not None:
+        return str(getattr(persona, "kind", "")) in {"chief", "front_desk", "executive"}
+    agent = getattr(context, "agent", None)
+    if agent is None:
+        return False
+    if str(getattr(agent, "role", "")) in {"crew_chief", "executive"}:
+        return True
+    try:
+        return any(team.crew_chief_id == agent.agent_id for team in context.store.teams())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _browser_result(result: dict[str, Any], *, context: ToolContext | None = None) -> ToolResult:
+    if not result.get("ok"):
+        if context is not None:
+            _record_research_incident(
+                context,
+                rule="browser_policy_or_capacity",
+                failed=True,
+                message=f"browser action failed: {result.get('error') or 'unknown error'}",
+            )
+        return ToolResult(
+            False,
+            f"browser failed: {result.get('error') or 'unknown error'}",
+            {"error_code": result.get("error_code"), "audit_ref": result.get("audit_ref")},
+        )
+    if context is not None:
+        _record_research_incident(
+            context,
+            rule="browser_policy_or_capacity",
+            failed=False,
+            message="browser action succeeded",
+        )
+    output = json.dumps(
+        {key: value for key, value in result.items() if key != "image_b64"},
+        sort_keys=True,
+        indent=2,
+    )
+    return ToolResult(True, output[:12_000], result)
 
 
 def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    if not _research_component_enabled(context, "search"):
+        return ToolResult(False, "web retrieval capability is disabled by operator policy")
     url = _required_text(arguments, "url")
     if not (url.startswith("https://") or url.startswith("http://")):
         return ToolResult(False, "url must start with http:// or https://")
@@ -575,18 +1014,37 @@ def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
             autosave = bool((store.runtime_overrides() or {}).get("web_fetch_autosave"))
         except RuntimeError:
             autosave = False
-    read_cap = WEB_FETCH_SAVE_MAX_CHARS if (save_requested or autosave) else max_chars
+    wants_more_for_save = save_requested or autosave
+    read_cap = (
+        WEB_FETCH_PDF_MAX_BYTES
+        if _looks_like_pdf_url(url)
+        else (WEB_FETCH_SAVE_MAX_CHARS if wants_more_for_save else max_chars)
+    )
     request = urllib.request.Request(url, headers={"User-Agent": "OpenBrigade/1.0"})
     opener = urllib.request.build_opener(_PublicOnlyRedirectHandler())
     try:
         with opener.open(request, timeout=20) as response:
-            body = response.read(read_cap + 1).decode("utf-8", errors="replace")
             final_url = response.geturl() if hasattr(response, "geturl") else url
+            hint_url = final_url if _looks_like_pdf_url(final_url) else url
+            content_type = _response_content_type(response, hint_url)
+            response_read_cap = (
+                WEB_FETCH_PDF_MAX_BYTES if content_type == "application/pdf" else read_cap
+            )
+            raw_body = response.read(response_read_cap + 1)
     except urllib.error.URLError as exc:
+        return ToolResult(False, f"web_fetch failed: {exc}")
+    if len(raw_body) > response_read_cap:
+        raw_body = raw_body[:response_read_cap]
+    try:
+        body, page_map = _web_response_to_text(final_url, raw_body, content_type)
+    except ValueError as exc:
         return ToolResult(False, f"web_fetch failed: {exc}")
     truncated = body[:max_chars]
     metadata: dict[str, Any] = {
-        "detail": "truncated" if len(body) > max_chars else "complete"
+        "detail": "truncated" if len(body) > max_chars else "complete",
+        "content_type": content_type,
+        "source_url": url,
+        "http_final_url": final_url,
     }
     should_save = save_requested or (autosave and len(body) >= WEB_FETCH_SAVE_MIN_CHARS)
     if should_save:
@@ -597,7 +1055,10 @@ def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
                     store,
                     url=url,
                     body=body[:WEB_FETCH_SAVE_MAX_CHARS],
+                    raw_body=raw_body,
                     final_url=final_url,
+                    content_type=content_type,
+                    page_map=page_map,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -605,14 +1066,478 @@ def _web_fetch(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     return ToolResult(True, truncated, metadata)
 
 
+def _looks_like_pdf_url(url: str) -> bool:
+    return urllib.parse.urlparse(url).path.lower().endswith(".pdf")
+
+
+def _response_content_type(response: Any, final_url: str) -> str:
+    headers = getattr(response, "headers", None)
+    raw = ""
+    if headers is not None:
+        try:
+            raw = headers.get("content-type", "") or headers.get("Content-Type", "")
+        except AttributeError:
+            raw = ""
+    content_type = raw.split(";", 1)[0].strip().lower()
+    if content_type:
+        return content_type
+    return "application/pdf" if _looks_like_pdf_url(final_url) else "text/plain"
+
+
+def _web_response_to_text(
+    final_url: str, body: bytes, content_type: str
+) -> tuple[str, list[dict[str, int]] | None]:
+    if content_type == "application/pdf" or _looks_like_pdf_url(final_url):
+        try:
+            return pdf_text_with_page_map(body)
+        except Exception:  # Compatibility path for an extractor supplied by an integration.
+            return extract_document_text("document.pdf", body), None
+    if content_type in {"text/html", "application/xhtml+xml"}:
+        return html_to_text(body.decode("utf-8", errors="replace")), None
+    return body.decode("utf-8", errors="replace"), None
+
+
+@dataclass(frozen=True)
+class WebSearchResult:
+    title: str
+    url: str
+    snippet: str
+    engine: str = ""
+    rank: int = 0
+    published_at: str | None = None
+    publication_status: str | None = None
+
+
+class _DuckDuckGoHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: list[WebSearchResult] = []
+        self._in_title = False
+        self._in_snippet = False
+        self._href = ""
+        self._title_parts: list[str] = []
+        self._snippet_parts: list[str] = []
+        self._pending_title: tuple[str, str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = {name: value or "" for name, value in attrs}
+        classes = set(attr_map.get("class", "").split())
+        if tag == "a" and "result__a" in classes:
+            self._in_title = True
+            self._href = attr_map.get("href", "")
+            self._title_parts = []
+        elif tag in {"a", "div"} and "result__snippet" in classes:
+            self._in_snippet = True
+            self._snippet_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._in_title and tag == "a":
+            self._in_title = False
+            title = " ".join(" ".join(self._title_parts).split())
+            url = _decode_duckduckgo_result_url(self._href)
+            if title and url:
+                self._pending_title = (title, url)
+                self._append_pending(snippet="")
+        elif self._in_snippet and tag in {"a", "div"}:
+            self._in_snippet = False
+            snippet = " ".join(" ".join(self._snippet_parts).split())
+            self._append_pending(snippet=snippet)
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self._title_parts.append(data)
+        if self._in_snippet:
+            self._snippet_parts.append(data)
+
+    def _append_pending(self, *, snippet: str) -> None:
+        if self._pending_title is None:
+            return
+        title, url = self._pending_title
+        for index, result in enumerate(self.results):
+            if result.url == url:
+                if snippet and not result.snippet:
+                    self.results[index] = WebSearchResult(
+                        title=result.title, url=url, snippet=snippet
+                    )
+                return
+        self.results.append(WebSearchResult(title=title, url=url, snippet=snippet))
+
+
+def _decode_duckduckgo_result_url(raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    parsed = urllib.parse.urlparse(raw_url)
+    if parsed.path == "/l/":
+        values = urllib.parse.parse_qs(parsed.query)
+        target = (values.get("uddg") or [""])[0]
+        if target:
+            raw_url = target
+    if raw_url.startswith("//"):
+        raw_url = "https:" + raw_url
+    if raw_url.startswith(("http://", "https://")):
+        return raw_url
+    return ""
+
+
+def _web_search(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    if not _research_component_enabled(context, "search"):
+        return ToolResult(False, "web search capability is disabled by operator policy")
+    query = _required_text(arguments, "query").strip()
+    if not query:
+        return ToolResult(False, "query is required")
+    if len(query) > WEB_SEARCH_MAX_QUERY_CHARS:
+        return ToolResult(False, f"query exceeds {WEB_SEARCH_MAX_QUERY_CHARS} characters")
+    limit = max(1, min(int(arguments.get("limit") or 5), WEB_SEARCH_MAX_RESULTS))
+    intent = str(arguments.get("intent") or "general").strip().lower()
+    if intent not in {"general", "legal"}:
+        return ToolResult(False, "intent must be general or legal")
+    jurisdiction = str(arguments.get("jurisdiction") or "").strip() or None
+    backend = os.environ.get("BRIGADE_SEARCH_BACKEND", "searxng").strip().lower()
+    final_url = ""
+    search_error = ""
+    try:
+        if backend == "searxng":
+            found, final_url = search_with_retry(
+                query, limit=limit, search=lambda value: searxng_search(value, limit=limit)
+            )
+            results = [
+                WebSearchResult(
+                    title=item.title,
+                    url=item.url,
+                    snippet=item.snippet,
+                    engine=item.engine,
+                    rank=item.rank,
+                    published_at=item.published_at,
+                    publication_status=item.publication_status,
+                )
+                for item in found
+            ]
+        else:
+            results, final_url = _duckduckgo_search(query, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        search_error = str(exc)
+        if backend != "searxng":
+            _record_research_incident(
+                context,
+                rule="search_backend_degraded",
+                failed=True,
+                message=f"search backend failed: {search_error}",
+            )
+            return ToolResult(False, f"web_search failed: {search_error}")
+        store = getattr(context, "store", None)
+        if store is not None:
+            record_search_health(
+                store.data_dir,
+                backend="searxng",
+                state="degraded",
+                reason=search_error,
+            )
+        try:
+            results, final_url = _duckduckgo_search(query, limit=limit)
+            backend = "duckduckgo-fallback"
+        except Exception as fallback_exc:  # noqa: BLE001
+            _record_research_incident(
+                context,
+                rule="search_backend_degraded",
+                failed=True,
+                message=f"search backend failed: {search_error}; fallback failed: {fallback_exc}",
+            )
+            _record_research_event(
+                context,
+                tool="web_search",
+                outcome="failed",
+                failure_reason=f"{search_error}; fallback failed: {fallback_exc}",
+            )
+            return ToolResult(
+                False,
+                f"web_search failed: {search_error}; fallback failed: {fallback_exc}",
+            )
+    else:
+        store = getattr(context, "store", None)
+        if store is not None and backend == "searxng":
+            record_search_health(store.data_dir, backend="searxng", state="healthy")
+    results = [result for result in results if _private_address_reason(result.url) is None]
+    classified = []
+    for result in results:
+        tier, detected_jurisdiction, authority = classify_source(
+            result.url, publication_status=result.publication_status
+        )
+        row = result.__dict__.copy()
+        row.update(
+            {
+                "source_tier": tier,
+                "jurisdiction": detected_jurisdiction or jurisdiction,
+                "authority": authority,
+                "result_timestamp": utc_now_iso(),
+                "publication_date": result.published_at,
+                "publication_status": result.publication_status,
+            }
+        )
+        classified.append(row)
+    if intent == "legal":
+        priority = {
+            "court_material": 0,
+            "primary_legal": 0,
+            "official_government": 1,
+            "secondary_legal": 2,
+            "academic": 3,
+            "academic_index": 3,
+            "academic_preprint": 3,
+            "academic_peer_reviewed": 3,
+            "general_web": 4,
+            "discovery_only": 5,
+        }
+        classified.sort(key=lambda item: (priority.get(str(item["source_tier"]), 4), item["rank"]))
+    for selection_rank, row in enumerate(classified, start=1):
+        row["selection_rank"] = selection_rank
+    results = [
+        WebSearchResult(
+            **{
+                key: value
+                for key, value in item.items()
+                if key in WebSearchResult.__dataclass_fields__
+            }
+        )
+        for item in classified
+    ]
+    if not results:
+        _record_research_event(
+            context,
+            tool="web_search",
+            outcome="allowed",
+            final_url=final_url,
+        )
+        return ToolResult(
+            True, "No search results found.", {"results": [], "source_url": final_url}
+        )
+    lines: list[str] = []
+    for index, result in enumerate(results, start=1):
+        lines.append(f"{index}. {result.title}\n   {result.url}")
+        classification = classified[index - 1]
+        if classification["source_tier"] == "discovery_only":
+            lines.append(
+                "   Discovery pointer only; retrieve an independent source before relying on it."
+            )
+        if result.snippet:
+            lines.append(f"   {result.snippet[:300]}")
+    metadata: dict[str, Any] = {
+        "source_url": final_url,
+        "query": query,
+        "backend": backend,
+        "backend_error": search_error,
+        "mode": "fallback" if backend == "duckduckgo-fallback" else "normal",
+        "intent": intent,
+        "jurisdiction": jurisdiction,
+        "selection_hint": source_selection_hint(intent, jurisdiction),
+        "results": classified,
+        "source_urls": [result.url for result in results],
+    }
+    store = getattr(context, "store", None)
+    if bool(arguments.get("save_to_knowledge")) and store is not None:
+        try:
+            metadata.update(
+                _save_search_results(
+                    store,
+                    query=query,
+                    source_url=final_url,
+                    results=results,
+                    classified_results=classified,
+                    backend=backend,
+                    mode="fallback" if backend == "duckduckgo-fallback" else "normal",
+                    backend_error=search_error,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            metadata["knowledge_save"] = f"failed: {exc}"
+    _record_research_event(
+        context,
+        tool="web_search",
+        outcome="fallback" if backend == "duckduckgo-fallback" else "allowed",
+        final_url=final_url,
+        document_id=str(metadata.get("saved_document_id") or "") or None,
+    )
+    _record_research_incident(
+        context,
+        rule="search_backend_degraded",
+        failed=backend == "duckduckgo-fallback",
+        message=(
+            f"SearXNG degraded; serving DuckDuckGo fallback: {search_error}"
+            if backend == "duckduckgo-fallback"
+            else "search backend succeeded"
+        ),
+    )
+    return ToolResult(True, "\n".join(lines), metadata)
+
+
+def _duckduckgo_search(query: str, *, limit: int) -> tuple[list[WebSearchResult], str]:
+    search_url = WEB_SEARCH_DEFAULT_URL + "?" + urllib.parse.urlencode({"q": query})
+    reason = _private_address_reason(search_url)
+    if reason is not None:
+        raise urllib.error.URLError(f"web_search refused: {reason}")
+    request = urllib.request.Request(search_url, headers={"User-Agent": "OpenBrigade/1.0"})
+    opener = urllib.request.build_opener(_PublicOnlyRedirectHandler())
+    with opener.open(request, timeout=20) as response:
+        html = response.read(WEB_SEARCH_READ_CAP + 1).decode("utf-8", errors="replace")
+        final_url = response.geturl() if hasattr(response, "geturl") else search_url
+    parser = _DuckDuckGoHTMLParser()
+    parser.feed(html)
+    return parser.results[:limit], final_url
+
+
+def _save_search_results(
+    store: StateStore,
+    *,
+    query: str,
+    source_url: str,
+    results: list[WebSearchResult],
+    classified_results: list[dict[str, Any]] | None = None,
+    backend: str = "",
+    mode: str = "normal",
+    backend_error: str = "",
+) -> dict[str, Any]:
+    body_lines = [f"Search query: {query}", f"Search URL: {source_url}", ""]
+    retained_results = []
+    for index, result in enumerate(results, start=1):
+        body_lines.append(f"{index}. {result.title}")
+        body_lines.append(f"URL: {result.url}")
+        if result.engine:
+            body_lines.append(f"Engine: {result.engine}")
+        body_lines.append("")
+        source_row = (
+            (classified_results or [])[index - 1]
+            if classified_results
+            else result.__dict__.copy()
+        )
+        retained_results.append(
+            {key: value for key, value in source_row.items() if key != "snippet"}
+        )
+    body = "\n".join(body_lines).strip()
+    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    for document in store.knowledge_documents():
+        doc_metadata = document.get("metadata") or {}
+        if (
+            doc_metadata.get("content_type") == "web_search"
+            and doc_metadata.get("query") == query
+            and doc_metadata.get("content_hash") == content_hash
+        ):
+            return {
+                "knowledge_save": "skipped-duplicate",
+                "saved_document_id": document.get("document_id"),
+            }
+    content_dir = _research_storage_root(store) / "web_search"
+    content_dir.mkdir(parents=True, exist_ok=True)
+    content_path = content_dir / f"{content_hash}.txt"
+    content_path.write_text(body, encoding="utf-8")
+    result = ingest_text(
+        title=f"Web search: {query}",
+        source=source_url,
+        document_type="web_search",
+        content=body,
+        content_path=str(content_path),
+        extra_metadata={
+            "content_type": "web_search",
+            "source_url": source_url,
+            "query": query,
+            "result_urls": [item.url for item in results],
+            "searched_at": utc_now_iso(),
+            "content_hash": content_hash,
+            "backend": backend,
+            "search_mode": mode,
+            "backend_error": backend_error or None,
+            "source_map": source_map(
+                source_url=source_url,
+                title=f"Web search: {query}",
+                retrieval_tool="web_search",
+                content_type="web_search",
+                content_hash=content_hash,
+                byte_size=len(body.encode("utf-8")),
+                extra={
+                    "results": retained_results,
+                    "snippets_retained": False,
+                    "backend": backend,
+                    "search_mode": mode,
+                    "backend_error": backend_error or None,
+                },
+            ),
+        },
+    )
+    saved = store_ingest_result(store, result)
+    return {
+        "knowledge_save": "saved",
+        "saved_document_id": saved["document_id"],
+    }
+
+
+def _save_browser_page(
+    store: StateStore,
+    *,
+    url: str,
+    title: str,
+    text: str,
+    html: str,
+) -> dict[str, Any]:
+    source_tier, jurisdiction, authority = classify_source(url)
+    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    content_dir = _research_storage_root(store) / "browser"
+    content_dir.mkdir(parents=True, exist_ok=True)
+    content_path = content_dir / f"{content_hash}.txt"
+    content_path.write_text(text, encoding="utf-8")
+    retained_path: Path | None = None
+    if html:
+        retained_path = content_dir / f"{content_hash}.html"
+        retained_path.write_text(html, encoding="utf-8")
+    result = ingest_text(
+        title=title or url,
+        source=url,
+        document_type="web",
+        content=text,
+        content_path=str(content_path),
+        extra_metadata={
+            "content_type": "text/html",
+            "source_url": url,
+            "http_final_url": url,
+            "fetched_at": utc_now_iso(),
+            "content_hash": content_hash,
+            "retained_source_path": str(retained_path) if retained_path else None,
+            "source_tier": source_tier,
+            "jurisdiction": jurisdiction,
+            "authority": authority,
+            "source_map": source_map(
+                source_url=url,
+                final_url=url,
+                title=title or url,
+                retrieval_tool="browser_extract",
+                content_type="text/html",
+                content_hash=content_hash,
+                byte_size=len(html.encode("utf-8")) if html else len(text.encode("utf-8")),
+                quote=text[:500],
+                extra={
+                    "retained_source_path": str(retained_path) if retained_path else None,
+                    "rendered_text_byte_size": len(text.encode("utf-8")),
+                    "source_tier": source_tier,
+                    "jurisdiction": jurisdiction,
+                    "authority": authority,
+                },
+            ),
+        },
+    )
+    saved = store_ingest_result(store, result)
+    return {"knowledge_save": "saved", "saved_document_id": saved["document_id"]}
+
+
 def _save_fetched_page(
     store: StateStore,
     *,
     url: str,
     body: str,
+    raw_body: bytes,
     final_url: str,
+    content_type: str = "text/plain",
+    page_map: list[dict[str, int]] | None = None,
 ) -> dict[str, Any]:
-    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    """Retain the original response file and the parsed text used by knowledge stores."""
+    content_hash = hashlib.sha256(raw_body).hexdigest()
+    source_tier, jurisdiction, authority = classify_source(final_url)
     previous_versions: list[str] = []
     for document in store.knowledge_documents():
         doc_metadata = document.get("metadata") or {}
@@ -625,14 +1550,20 @@ def _save_fetched_page(
             }
         if not doc_metadata.get("superseded_by"):
             previous_versions.append(str(document.get("document_id")))
-    content_dir = store.data_dir / "knowledge" / "web"
+    content_dir = _research_storage_root(store) / "web"
     content_dir.mkdir(parents=True, exist_ok=True)
-    content_path = content_dir / f"{content_hash}.txt"
-    content_path.write_text(body, encoding="utf-8")
-    # Ingest clean text, not raw markup: chunks/embeddings hold prose. The raw
-    # body stays on disk for audit and the hash (dedup) is still over the raw
-    # bytes, so change-detection is unaffected.
+    if content_type == "application/pdf":
+        suffix = ".pdf"
+    elif content_type in {"text/html", "application/xhtml+xml"}:
+        suffix = ".html"
+    else:
+        suffix = ".bin"
+    retained_path = content_dir / f"{content_hash}{suffix}"
+    retained_path.write_bytes(raw_body)
+    # Ingest clean text, not raw markup or PDF bytes: chunks/embeddings hold prose.
     extracted = html_to_text(body).strip() or body
+    content_path = content_dir / f"{content_hash}.txt"
+    content_path.write_text(extracted, encoding="utf-8")
     parsed = urllib.parse.urlparse(url)
     title = f"{parsed.netloc}{parsed.path}".rstrip("/") or url
     result = ingest_text(
@@ -642,12 +1573,34 @@ def _save_fetched_page(
         content=extracted,
         content_path=str(content_path),
         extra_metadata={
-            "content_type": "web",
+            "content_type": content_type,
             "source_url": url,
             "http_final_url": final_url,
             "fetched_at": utc_now_iso(),
             "content_hash": content_hash,
+            "retained_source_path": str(retained_path),
+            "source_tier": source_tier,
+            "jurisdiction": jurisdiction,
+            "authority": authority,
+            "source_map": source_map(
+                source_url=url,
+                final_url=final_url,
+                title=title,
+                retrieval_tool="web_fetch",
+                content_type=content_type,
+                content_hash=content_hash,
+                byte_size=len(raw_body),
+                quote=extracted[:500],
+                extra={
+                    "retained_source_path": str(retained_path),
+                    "raw_byte_size": len(raw_body),
+                    "source_tier": source_tier,
+                    "jurisdiction": jurisdiction,
+                    "authority": authority,
+                },
+            ),
         },
+        page_map=page_map,
     )
     saved = store_ingest_result(store, result)
     outcome: dict[str, Any] = {
@@ -1009,9 +1962,7 @@ def _create_subtasks(context: ToolContext, arguments: dict[str, Any]) -> ToolRes
     record_orchestration_events(
         context.store,
         source="create_subtasks",
-        decision_summary=(
-            f"{context.agent.agent_id} created {len(created)} child assignment(s)"
-        ),
+        decision_summary=(f"{context.agent.agent_id} created {len(created)} child assignment(s)"),
         mission_statement=mission.statement if mission else None,
         events=[
             orchestration_event(
@@ -1071,8 +2022,7 @@ def _request_tool(context: ToolContext, arguments: dict[str, Any]) -> ToolResult
     if persisted.get("proposal_id") != proposal["proposal_id"]:
         return ToolResult(
             True,
-            f"tool request for '{name}' already pending "
-            f"as proposal {persisted.get('proposal_id')}",
+            f"tool request for '{name}' already pending as proposal {persisted.get('proposal_id')}",
             {"proposal_id": persisted.get("proposal_id"), "status": "existing"},
         )
     context.store.add_alert(

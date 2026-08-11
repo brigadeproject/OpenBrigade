@@ -29,6 +29,7 @@ const TAB_VIEWS = [
   { id: "agents", label: "Agents & Teams" },
   { id: "proposals", label: "Proposals" },
   { id: "knowledge", label: "Knowledge Base" },
+  { id: "research", label: "Research" },
   { id: "telemetry", label: "Telemetry" },
 ] as const;
 
@@ -59,6 +60,21 @@ type AuthMe = {
     issued_at?: number | null;
     expires_at?: number | null;
   };
+};
+
+type ResearchComponent = {
+  state?: string;
+  last_failure?: string | null;
+  updated_at?: string | null;
+  configured_servers?: number;
+  healthy_servers?: number;
+};
+
+type ResearchStatus = {
+  updated_at?: string;
+  mcp: ResearchComponent;
+  search: ResearchComponent;
+  browser: ResearchComponent;
 };
 
 type Mission = {
@@ -177,6 +193,36 @@ type AlertRecord = {
   count: number;
   first_seen?: string | null;
   last_seen?: string | null;
+};
+
+type ResearchComponentStatus = {
+  state?: string;
+  last_failure?: string | null;
+  updated_at?: string | null;
+  configured_servers?: number;
+  healthy_servers?: number;
+};
+
+type ResearchPolicyProposal = {
+  proposal_id: string;
+  status: string;
+  actor?: string;
+  created_at?: string;
+  proposed?: Record<string, boolean>;
+};
+
+type ResearchStatus = {
+  updated_at?: string;
+  mcp: ResearchComponentStatus;
+  search: ResearchComponentStatus;
+  browser: ResearchComponentStatus;
+  policy?: {
+    active?: Record<string, boolean>;
+    pending_proposals?: ResearchPolicyProposal[];
+  };
+  alerts?: {
+    active?: { alert_id: string; rule: string; status: string; message?: string; count?: number }[];
+  };
 };
 
 type OrchestrationEvent = {
@@ -873,6 +919,8 @@ function App() {
           <Suspense fallback={<div className="ob-kb-loading">Loading knowledge base…</div>}>
             <KnowledgeView api={api} setStatus={setStatus} canWrite={can("knowledge:write")} />
           </Suspense>
+        ) : view === "research" ? (
+          <ResearchView api={api} canTest={can("task:write")} setStatus={setStatus} />
         ) : view === "proposals" ? (
           <ProposalsView
             proposals={proposals}
@@ -1167,6 +1215,116 @@ function MetricCard({
   );
 }
 
+function ResearchView({
+  api,
+  canTest,
+  setStatus,
+}: {
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  canTest: boolean;
+  setStatus: (message: string) => void;
+}) {
+  const [research, setResearch] = useState<ResearchStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [testing, setTesting] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      setResearch(await api<ResearchStatus>("/api/research/status"));
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      setLoading(false);
+    }
+  }, [api, setStatus]);
+
+  useEffect(() => {
+    load().catch(() => undefined);
+  }, [load]);
+
+  const runTest = async (component: string) => {
+    setTesting(component);
+    try {
+      const result = await api<{ ok: boolean; reason?: string }>(`/api/research/test/${component}`, {
+        method: "POST",
+      });
+      setStatus(result.ok ? `${component} health check passed` : `${component} health check failed: ${result.reason || "unknown"}`);
+      await load();
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      setTesting(null);
+    }
+  };
+
+  const rows: Array<{ id: "mcp" | "search" | "browser"; label: string; detail: string }> = [
+    {
+      id: "mcp",
+      label: "MCP tool servers",
+      detail: research?.mcp.configured_servers === undefined
+        ? "No server inventory yet"
+        : `${research.mcp.healthy_servers || 0}/${research.mcp.configured_servers} healthy`,
+    },
+    { id: "search", label: "Public search", detail: "SearXNG with bounded fallback reporting" },
+    { id: "browser", label: "Browser worker", detail: "Isolated public-session retrieval" },
+  ];
+
+  return (
+    <section className="telemetry ob-telemetry-view">
+      <div className="ob-tele-head">
+        <span className="ob-panel-title">Governed Research</span>
+        <span className="ob-badge subtle">PUBLIC WEB ONLY</span>
+      </div>
+      <p className="muted">
+        This surface reports dependency health and runs bounded checks. It does not expose credentials,
+        browser profiles, query parameters, or retained source content.
+      </p>
+      <div className="ob-panel ob-tele-panel">
+        <div className="ob-panel-head">
+          <span className="ob-panel-title">Dependencies</span>
+          <button className="ob-button secondary" onClick={() => load()} disabled={loading}>
+            {loading ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
+        <div className="ob-tele-list">
+          {rows.map((row) => {
+            const component = research?.[row.id];
+            const state = component?.state || "unknown";
+            const healthy = state === "healthy" || state === "configured";
+            const degraded = state === "degraded" || state === "invalid_configuration" || state === "unhealthy";
+            return (
+              <div className="ob-tele-row" key={row.id}>
+                <span className={`status-light ${healthy ? "ok" : degraded ? "bad" : ""}`} />
+                <span className="ob-tele-row-main">
+                  <span className="ob-tele-row-name">{row.label}</span>
+                  <span className="ob-tele-row-detail">
+                    {component?.last_failure || row.detail}
+                  </span>
+                </span>
+                {canTest && (
+                  <button
+                    className="ob-button secondary"
+                    onClick={() => runTest(row.id)}
+                    disabled={testing !== null}
+                  >
+                    {testing === row.id ? "Testing…" : "Test"}
+                  </button>
+                )}
+                <span className="ob-tele-row-tag">{state.replace(/_/g, " ").toUpperCase()}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div className="ob-tele-banner">
+        Citations are enforced only for citation-bearing requests backed by retrieved sources. OpenBrigade
+        does not represent this release as legal research or legal advice.
+      </div>
+    </section>
+  );
+}
+
 function TelemetryRow({
   tone,
   name,
@@ -1275,6 +1433,96 @@ function TelemetryView({
   const [staleDraft, setStaleDraft] = useState(String(staleSetting));
   const [iterationsDraft, setIterationsDraft] = useState(String(iterationsSetting));
   const [savingRuntime, setSavingRuntime] = useState(false);
+  const [research, setResearch] = useState<ResearchStatus | null>(null);
+  const [researchBusy, setResearchBusy] = useState<string | null>(null);
+
+  const refreshResearch = useCallback(async () => {
+    try {
+      setResearch(await api<ResearchStatus>("/api/research/status"));
+    } catch (error) {
+      setStatus(`Research status unavailable: ${errorMessage(error)}`);
+    }
+  }, [api, setStatus]);
+
+  useEffect(() => {
+    void refreshResearch();
+  }, [refreshResearch]);
+
+  const testResearch = async (component: "mcp" | "search" | "browser") => {
+    setResearchBusy(`test:${component}`);
+    try {
+      const result = await api<{ ok: boolean; reason?: string }>(`/api/research/test/${component}`, {
+        method: "POST",
+      });
+      await refreshResearch();
+      setStatus(
+        result.ok
+          ? `${component.toUpperCase()} research check passed.`
+          : `${component.toUpperCase()} research check failed: ${result.reason || "unknown"}`,
+      );
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      setResearchBusy(null);
+    }
+  };
+
+  const stageResearch = async (component: "mcp" | "search" | "browser", enabled: boolean) => {
+    setResearchBusy(`stage:${component}`);
+    try {
+      const result = await api<{ proposal: ResearchPolicyProposal }>("/api/research/policy/proposals", {
+        method: "POST",
+        json: { values: { [`research_${component}_enabled`]: enabled } },
+      });
+      await refreshResearch();
+      setStatus(
+        `Staged ${enabled ? "enable" : "disable"} for ${component}. Apply ${result.proposal.proposal_id.slice(0, 8)} to activate it.`,
+      );
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      setResearchBusy(null);
+    }
+  };
+
+  const applyResearch = async (proposalId: string) => {
+    setResearchBusy(`apply:${proposalId}`);
+    try {
+      await api(`/api/research/policy/proposals/${proposalId}/apply`, { method: "POST" });
+      await refreshResearch();
+      setStatus("Research policy applied.");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      setResearchBusy(null);
+    }
+  };
+
+  const rollbackResearch = async () => {
+    setResearchBusy("rollback");
+    try {
+      await api("/api/research/policy/rollback", { method: "POST" });
+      await refreshResearch();
+      setStatus("Research policy rolled back to the last known-good settings.");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      setResearchBusy(null);
+    }
+  };
+
+  const acknowledgeResearchAlert = async (alertId: string) => {
+    setResearchBusy(`ack:${alertId}`);
+    try {
+      await api(`/api/research/alerts/${alertId}/acknowledge`, { method: "POST" });
+      await refreshResearch();
+      setStatus("Research alert acknowledged.");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      setResearchBusy(null);
+    }
+  };
 
   useEffect(() => {
     setCadenceDraft(String(cadenceSetting));
@@ -1477,6 +1725,98 @@ function TelemetryView({
                   tag={opt.available ? "AVAILABLE" : opt.configured ? "CONFIGURED" : "OFFLINE"}
                 />
               ))}
+            </div>
+          </div>
+
+          <div className="ob-panel ob-tele-panel ob-tele-controls">
+            <div className="ob-panel-head">
+              <span className="ob-panel-title">Governed Research</span>
+              <button type="button" className="ob-mo-btn" onClick={() => void refreshResearch()}>
+                Refresh
+              </button>
+            </div>
+            <p className="ob-tele-control-note">
+              Health checks are bounded and secret-free. Enablement changes are staged before they
+              affect agents.
+            </p>
+            {(["mcp", "search", "browser"] as const).map((component) => {
+              const item = research?.[component];
+              const enabled = research?.policy?.active?.[`research_${component}_enabled`] ?? true;
+              const state = item?.state || "unknown";
+              const healthy = state === "healthy" || state === "configured";
+              return (
+                <div className="ob-sys-row" key={component}>
+                  <span>
+                    {component.toUpperCase()} · {enabled ? "enabled" : "disabled"}
+                    {item?.last_failure ? <small> — {item.last_failure}</small> : null}
+                  </span>
+                  <span className="ob-sys-val">
+                    <span className={`ob-badge ${healthy ? "ok" : state === "unknown" ? "subtle" : "warn"}`}>
+                      {state.toUpperCase()}
+                    </span>{" "}
+                    <button
+                      type="button"
+                      className="ob-mo-btn"
+                      disabled={!canEdit || researchBusy !== null}
+                      onClick={() => void testResearch(component)}
+                    >
+                      {researchBusy === `test:${component}` ? "Testing…" : "Test"}
+                    </button>{" "}
+                    <button
+                      type="button"
+                      className="ob-mo-btn"
+                      disabled={!canEdit || researchBusy !== null}
+                      onClick={() => void stageResearch(component, !enabled)}
+                    >
+                      Stage {enabled ? "disable" : "enable"}
+                    </button>
+                  </span>
+                </div>
+              );
+            })}
+            {(research?.policy?.pending_proposals || []).map((proposal) => (
+              <div className="ob-sys-row" key={proposal.proposal_id}>
+                <span>Pending {proposal.proposal_id.slice(0, 8)} by {proposal.actor || "operator"}</span>
+                <span className="ob-sys-val">
+                  <button
+                    type="button"
+                    className="ob-mo-btn primary"
+                    disabled={!canEdit || researchBusy !== null}
+                    onClick={() => void applyResearch(proposal.proposal_id)}
+                  >
+                    {researchBusy === `apply:${proposal.proposal_id}` ? "Applying…" : "Apply"}
+                  </button>
+                </span>
+              </div>
+            ))}
+            {(research?.alerts?.active || []).map((alert) => (
+              <div className="ob-sys-row" key={alert.alert_id}>
+                <span>{alert.message || alert.rule} ({alert.count || 1}×)</span>
+                <span className="ob-sys-val">
+                  <span className="ob-badge warn">{alert.status.toUpperCase()}</span>{" "}
+                  {alert.status === "active" && (
+                    <button
+                      type="button"
+                      className="ob-mo-btn"
+                      disabled={!canEdit || researchBusy !== null}
+                      onClick={() => void acknowledgeResearchAlert(alert.alert_id)}
+                    >
+                      {researchBusy === `ack:${alert.alert_id}` ? "Acknowledging…" : "Acknowledge"}
+                    </button>
+                  )}
+                </span>
+              </div>
+            ))}
+            <div className="ob-control-actions">
+              {!canEdit && <span className="muted">Operator or owner role required to test or change policy.</span>}
+              <button
+                type="button"
+                className="ob-mo-btn"
+                disabled={!canEdit || researchBusy !== null}
+                onClick={() => void rollbackResearch()}
+              >
+                {researchBusy === "rollback" ? "Rolling back…" : "Rollback last good"}
+              </button>
             </div>
           </div>
         </div>

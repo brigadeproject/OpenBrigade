@@ -53,6 +53,17 @@ from brigade.providers import (
     provider_from_settings,
 )
 from brigade.rbac import ROLE_PERMISSIONS, can
+from brigade.research_control import (
+    acknowledge_research_alert,
+    apply_research_policy,
+    reconcile_research_alert,
+    research_audit,
+    research_policy,
+    research_status,
+    rollback_research_policy,
+    stage_research_policy,
+    test_research_component,
+)
 from brigade.schemas import (
     AGENT_ROLE_EXECUTIVE,
     AGENT_ROLES,
@@ -74,6 +85,7 @@ from brigade.services import (
     UnknownProposalError,
     _classify_chat_confirmation,
     _pending_chat_proposal,
+    _record_operator_event,
     attach_operator_guidance,
     build_chat_payload,
     build_cockpit_payload,
@@ -1355,6 +1367,167 @@ def create_app(
             ),
             "api_version": __version__,
         }
+
+    @app.get("/api/research/status")
+    async def research_component_status(current: AuthResult = auth_dependency) -> dict[str, object]:
+        require("status:read", current)
+        return research_status(settings.data_dir)
+
+    @app.post("/api/research/test/{component}")
+    async def test_research_component_route(
+        component: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        try:
+            result = test_research_component(settings.data_dir, component)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        correlation_id = f"research-check:{uuid4()}"
+        alert = reconcile_research_alert(
+            settings.data_dir,
+            rule=f"{component}_health",
+            failed=not bool(result["ok"]),
+            message=(
+                f"research {component} health check failed: "
+                f"{result.get('reason') or 'unknown'}"
+            ),
+            correlation_id=correlation_id,
+        )
+        if alert.get("new"):
+            store.add_alert(str(alert["message"]))
+        store.add_provenance_record(
+            {
+                "record_id": correlation_id,
+                "node_id": component,
+                "node_type": "research_control",
+                "created_at": utc_now_iso(),
+                "principal": user.username if user else "web",
+                "tool": "health_check",
+                "policy_outcome": "healthy" if result["ok"] else "degraded",
+                "failure_reason": result.get("reason"),
+                "alert_id": alert.get("alert_id"),
+            }
+        )
+        _record_operator_event(
+            store,
+            action="research_component_test",
+            summary=f"tested research {component}: {'ok' if result['ok'] else 'failed'}",
+            assignment_id=f"research:{component}",
+            by=user.username if user else "web",
+            payload={"component": component, "ok": result["ok"], "correlation_id": correlation_id},
+        )
+        return {**result, "alert": alert, "correlation_id": correlation_id}
+
+    @app.get("/api/research/policy")
+    async def get_research_policy(current: AuthResult = auth_dependency) -> dict[str, object]:
+        require("status:read", current)
+        return research_policy(settings.data_dir)
+
+    @app.get("/api/research/audit")
+    async def research_audit_route(
+        limit: int = 100,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        require("task:write", current)
+        return research_audit(store, limit=limit)
+
+    @app.post("/api/research/alerts/{alert_id}/acknowledge")
+    async def acknowledge_research_alert_route(
+        alert_id: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        try:
+            alert = acknowledge_research_alert(
+                settings.data_dir, alert_id, actor=user.username if user else "web"
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _record_operator_event(
+            store,
+            action="research_alert_acknowledged",
+            summary="acknowledged research alert",
+            assignment_id=f"research-alert:{alert_id}",
+            by=user.username if user else "web",
+            payload={"rule": alert.get("rule")},
+        )
+        return alert
+
+    @app.post("/api/research/policy/proposals")
+    async def stage_research_policy_route(
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        try:
+            proposal = stage_research_policy(
+                settings.data_dir,
+                dict((payload or {}).get("values") or {}),
+                actor=user.username if user else "web",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _record_operator_event(
+            store,
+            action="research_policy_staged",
+            summary="staged research policy change",
+            assignment_id=f"research-policy:{proposal['proposal_id']}",
+            by=user.username if user else "web",
+            payload={"proposed": proposal.get("proposed")},
+        )
+        return {"proposal": proposal, "policy": research_policy(settings.data_dir)}
+
+    @app.post("/api/research/policy/proposals/{proposal_id}/apply")
+    async def apply_research_policy_route(
+        proposal_id: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        try:
+            result = apply_research_policy(
+                settings.data_dir,
+                proposal_id,
+                apply_values=lambda values: set_runtime_overrides(
+                    store, values, by=user.username if user else "web"
+                ),
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _record_operator_event(
+            store,
+            action="research_policy_applied",
+            summary="applied staged research policy",
+            assignment_id=f"research-policy:{proposal_id}",
+            by=user.username if user else "web",
+            payload={"active": result["active"], "rollback_point": result["rollback_point"]},
+        )
+        return {**result, "policy": research_policy(settings.data_dir)}
+
+    @app.post("/api/research/policy/rollback")
+    async def rollback_research_policy_route(
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        try:
+            result = rollback_research_policy(
+                settings.data_dir,
+                apply_values=lambda values: set_runtime_overrides(
+                    store, values, by=user.username if user else "web"
+                ),
+                actor=user.username if user else "web",
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _record_operator_event(
+            store,
+            action="research_policy_rolled_back",
+            summary="rolled back research policy",
+            assignment_id="research-policy:rollback",
+            by=user.username if user else "web",
+            payload={"active": result["active"], "rollback_point": result["rollback_point"]},
+        )
+        return {**result, "policy": research_policy(settings.data_dir)}
 
     @app.put("/api/settings/runtime")
     async def update_runtime_settings(

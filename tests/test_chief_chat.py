@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 
+import brigade.chief_chat as chief_chat
 from brigade.chief_chat import (
     parse_chief_chat_reply,
     resolve_persona,
@@ -11,6 +13,7 @@ from brigade.chief_chat import (
 )
 from brigade.schemas import Agent, Assignment, AssignmentStatus, Team
 from brigade.state import JsonStateStore
+from brigade.tools import ToolResult
 from tests.helpers import SequencedTestProvider
 
 
@@ -117,6 +120,51 @@ def test_tool_call_then_answer(tmp_path):
     assert len(usage) == 2
     # The turn left an episode behind.
     assert store.episodes()[-1]["source"] == "chief_chat"
+
+
+def test_legal_chief_answer_repairs_and_renders_only_supplied_citation(tmp_path, monkeypatch):
+    store = _fleet(tmp_path)
+    source_url = "https://uscode.house.gov/view.xhtml?section=1030"
+    source_id = f"external:{sha256(source_url.encode('utf-8')).hexdigest()[:16]}"
+    monkeypatch.setattr(
+        chief_chat,
+        "_web_fetch",
+        lambda context, arguments: ToolResult(
+            True,
+            "retrieved primary source",
+            {"source_url": source_url, "final_url": source_url, "title": "18 USC 1030"},
+        ),
+    )
+    provider = SequencedTestProvider(
+        [
+            _tool_call("web_fetch", url=source_url),
+            "The statute prohibits the described conduct.",
+            f"The statute prohibits the described conduct. [[cite:{source_id}]]",
+        ]
+    )
+
+    result = _turn(store, provider, content="Give me a legal answer about this statute.")
+
+    message = store.messages(result["conversation_id"])[-1]
+    assert message.metadata["citation_required"] is True
+    assert message.metadata["citation_repaired"] is True
+    assert message.metadata["citations"][0]["source_id"] == source_id
+    assert "[^1]: [18 USC 1030]" in message.content
+
+
+def test_legal_chief_answer_without_retrieval_is_transparent(tmp_path):
+    store = _fleet(tmp_path)
+
+    result = _turn(
+        store,
+        SequencedTestProvider(["The model should not answer this from memory."]),
+        content="Give a legal analysis of this statute.",
+    )
+
+    message = store.messages(result["conversation_id"])[-1]
+    assert message.metadata["citation_required"] is True
+    assert message.metadata["citations"] == []
+    assert "cannot substantiate" in message.content
 
 
 def test_empty_reply_retries_then_answers(tmp_path):
@@ -295,10 +343,12 @@ def test_web_fetch_absent_when_disabled(tmp_path):
     provider = SequencedTestProvider(["All quiet."])
     _turn(store, provider, enable_web_fetch=False)
     assert "web_fetch" not in provider.calls[0]["prompt"]
+    assert "web_search" not in provider.calls[0]["prompt"]
 
     enabled = SequencedTestProvider(["All quiet."])
     _turn(store, enabled, content="again")
     assert "web_fetch" in enabled.calls[0]["prompt"]
+    assert "web_search" in enabled.calls[0]["prompt"]
 
 
 def test_list_recurrences_tool_is_team_scoped(tmp_path):
@@ -536,6 +586,78 @@ def test_thread_send_route_runs_the_loop(tmp_path, monkeypatch):
         )
     )
     assert denied.status_code == 403
+
+
+def test_thread_api_preserves_rendered_citation_metadata(tmp_path, monkeypatch):
+    import asyncio
+
+    import pytest
+
+    pytest.importorskip("fastapi")
+    import brigade.web as web
+    from brigade.auth import issue_token
+    from brigade.config import Settings
+    from brigade.schemas import Role, User
+    from brigade.tools import ToolResult
+    from tests.test_v0_9 import _asgi_request
+
+    store = _fleet(tmp_path)
+    owner = User(username="owner", role=Role.OWNER)
+    store.add_user(owner)
+    settings = Settings(
+        config_path=tmp_path / "brigade.config.json",
+        data_dir=tmp_path,
+        require_auth=True,
+        jwt_secret="x" * 40,
+        allow_json_store=True,
+    )
+    source_url = "https://uscode.house.gov/view.xhtml?section=1030"
+    source_id = f"external:{sha256(source_url.encode('utf-8')).hexdigest()[:16]}"
+    monkeypatch.setattr(
+        chief_chat,
+        "_web_fetch",
+        lambda context, arguments: ToolResult(
+            True,
+            "primary law",
+            {"source_url": source_url, "http_final_url": source_url, "title": "18 USC 1030"},
+        ),
+    )
+    provider = SequencedTestProvider(
+        [
+            _tool_call("web_fetch", url=source_url),
+            f"A source fact [[cite:{source_id}]]",
+        ]
+    )
+    monkeypatch.setattr(web, "_provider_from_payload", lambda payload, settings: provider)
+    app = web.create_app(settings, store)
+    headers = {"Authorization": f"Bearer {issue_token(settings, owner)}"}
+    opened = asyncio.run(
+        _asgi_request(
+            app,
+            "POST",
+            "/api/chat/threads",
+            headers=headers,
+            json_payload={"persona": "chief0"},
+        )
+    )
+    thread_id = opened.json()["thread_id"]
+    sent = asyncio.run(
+        _asgi_request(
+            app,
+            "POST",
+            f"/api/chat/threads/{thread_id}/messages",
+            headers=headers,
+            json_payload={"content": "Give me a legal answer."},
+        )
+    )
+    assert sent.status_code == 200, sent.text
+    messages = asyncio.run(
+        _asgi_request(app, "GET", f"/api/chat/threads/{thread_id}/messages", headers=headers)
+    ).json()["messages"]
+
+    assert messages[-1]["metadata"]["citation_required"] is True
+    assert messages[-1]["metadata"]["citations"][0]["source_id"] == source_id
+    assert "[^1]: [18 USC 1030]" in messages[-1]["content"]
 
 
 def test_usage_summary_and_episode_tools_answer(tmp_path):

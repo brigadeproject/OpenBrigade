@@ -49,6 +49,7 @@ from brigade.governance import ensure_policy_projections_current
 from brigade.health import HealthCheck, check_configured_datastores
 from brigade.knowledge import ingest_local_document, store_ingest_result
 from brigade.logging import configure_json_logging
+from brigade.mcp_client import configured_servers, server_health
 from brigade.memory import (
     append_daily_memory,
     archive_stale_daily_memories,
@@ -71,6 +72,16 @@ from brigade.providers import (
     provider_from_settings,
 )
 from brigade.rbac import can
+from brigade.research_control import (
+    apply_research_policy,
+    reconcile_research_alert,
+    research_audit,
+    research_policy,
+    research_status,
+    rollback_research_policy,
+    stage_research_policy,
+    test_research_component,
+)
 from brigade.runner import (
     _acquire_local_inference_lock,
     _release_local_inference_lock,
@@ -115,6 +126,7 @@ from brigade.services import (
     reissue_assignment,
     send_user_chat,
     set_config_value,
+    set_runtime_overrides,
 )
 from brigade.store import RedisRuntimeClient, StateStore, open_state_store
 from brigade.time import utc_now_iso
@@ -716,6 +728,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also check configured datastores and alert on failures.",
     )
 
+    mcp = subcommands.add_parser("mcp", help="Inspect configured MCP tool servers.")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp_sub.add_parser(
+        "status",
+        help="Show non-secret configured-server policy and last known health.",
+    )
+
+    research = subcommands.add_parser(
+        "research", help="Inspect and test governed research dependencies."
+    )
+    research_sub = research.add_subparsers(dest="research_command", required=True)
+    research_sub.add_parser("status", help="Show redacted MCP, search, and browser health.")
+    research_test = research_sub.add_parser(
+        "test", help="Run one bounded research dependency health check."
+    )
+    research_test.add_argument("component", choices=["mcp", "search", "browser"])
+    research_audit_command = research_sub.add_parser(
+        "audit", help="Show bounded external-research audit records."
+    )
+    research_audit_command.add_argument("--limit", type=int, default=100)
+    research_change = research_sub.add_parser(
+        "enable", help="Stage enablement for one research component."
+    )
+    research_change.add_argument("component", choices=["mcp", "search", "browser"])
+    research_change = research_sub.add_parser(
+        "disable", help="Stage disablement for one research component."
+    )
+    research_change.add_argument("component", choices=["mcp", "search", "browser"])
+    research_apply = research_sub.add_parser(
+        "apply", help="Apply a validated staged research policy proposal."
+    )
+    research_apply.add_argument("proposal_id")
+    research_sub.add_parser("rollback", help="Restore the last known-good research policy.")
+
     chat = subcommands.add_parser(
         "chat",
         help="Send or inspect chat messages.",
@@ -958,9 +1004,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
-            "  brigade model complete --prompt \"Summarize the mission\"\n"
+            '  brigade model complete --prompt "Summarize the mission"\n'
             "  brigade model complete --provider ollama --model gpt-oss:20b "
-            "--prompt \"Summarize the mission\""
+            '--prompt "Summarize the mission"'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1200,9 +1246,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 "default_provider": settings.default_provider,
                 "default_model": settings.default_model,
                 "ollama_base_url": settings.ollama_base_url,
-                "store_backend": "PostgresStateStore"
-                if settings.postgres_dsn
-                else "unconfigured",
+                "store_backend": "PostgresStateStore" if settings.postgres_dsn else "unconfigured",
                 "postgres_required": True,
             }
         )
@@ -1277,8 +1321,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                         "store_backend": "unconfigured",
                         "ok": False,
                         "reason": (
-                            "Postgres is required and is not configured; "
-                            "migrations are disabled."
+                            "Postgres is required and is not configured; migrations are disabled."
                         ),
                     },
                     indent=2,
@@ -1417,8 +1460,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
         _require_permission(store, settings, actor, "chat:write")
         if _find_agent(store, args.agent) is None:
             raise ValueError(f"unknown agent: {args.agent}")
-        allowlist = set(args.allow_user) if args.allow_user else parse_allowlist(
-            settings.telegram_allowlist
+        allowlist = (
+            set(args.allow_user)
+            if args.allow_user
+            else parse_allowlist(settings.telegram_allowlist)
         )
         result = handle_telegram_update(
             store,
@@ -1433,8 +1478,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
         _require_permission(store, settings, actor, "chat:write")
         if _find_agent(store, args.agent) is None:
             raise ValueError(f"unknown agent: {args.agent}")
-        allowlist = set(args.allow_user) if args.allow_user else parse_allowlist(
-            settings.google_chat_allowlist
+        allowlist = (
+            set(args.allow_user)
+            if args.allow_user
+            else parse_allowlist(settings.google_chat_allowlist)
         )
         result = handle_google_chat_event(
             store,
@@ -1606,13 +1653,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 owner_username=args.owner_username,
             )
         if args.specialties is not None:
-            updates["specialties"] = [
-                item.strip() for item in args.specialties if item.strip()
-            ]
+            updates["specialties"] = [item.strip() for item in args.specialties if item.strip()]
         if not updates:
-            raise ValueError(
-                "nothing to update: pass --role, --owner-username, and/or --specialty"
-            )
+            raise ValueError("nothing to update: pass --role, --owner-username, and/or --specialty")
         updated = replace(agent, **updates)
         if updated.role == AGENT_ROLE_EXECUTIVE and not updated.owner_username:
             raise ValueError("executive agents require --owner-username")
@@ -1796,13 +1839,13 @@ def _main(argv: Sequence[str] | None = None) -> int:
         try:
             result = run_agent_once(args.id, store, provider)
         except RuntimeError as exc:
-            if _provider_args_explicit(args) or _provider_identity(provider) == _provider_identity(
-                default_provider
-            ) or is_local_inference_backpressure(exc):
+            if (
+                _provider_args_explicit(args)
+                or _provider_identity(provider) == _provider_identity(default_provider)
+                or is_local_inference_backpressure(exc)
+            ):
                 raise
-            store.add_alert(
-                f"agent {args.id} provider failed; retrying with default provider"
-            )
+            store.add_alert(f"agent {args.id} provider failed; retrying with default provider")
             result = run_agent_once(args.id, store, default_provider)
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         return 0
@@ -2022,20 +2065,14 @@ def _main(argv: Sequence[str] | None = None) -> int:
             reason=args.reason,
             by=actor_label,
         )
-        print(
-            json.dumps(
-                {"cancelled": results, "count": len(results)}, indent=2, sort_keys=True
-            )
-        )
+        print(json.dumps({"cancelled": results, "count": len(results)}, indent=2, sort_keys=True))
         return 0
 
     if args.command == "status":
         _require_permission(store, settings, actor, "status:read")
         payload = _status_payload(store)
         print(
-            json.dumps(payload, indent=2, sort_keys=True)
-            if args.json
-            else _format_status(payload)
+            json.dumps(payload, indent=2, sort_keys=True) if args.json else _format_status(payload)
         )
         return 0
 
@@ -2087,6 +2124,107 @@ def _main(argv: Sequence[str] | None = None) -> int:
             include_health=args.include_health,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "mcp" and args.mcp_command == "status":
+        _require_permission(store, settings, actor, "status:read")
+        try:
+            servers = configured_servers(settings.data_dir)
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(
+                json.dumps(
+                    {"ok": False, "reason": str(exc), "servers": []}, indent=2, sort_keys=True
+                )
+            )
+            return 1
+        print(
+            json.dumps(
+                {"ok": True, "servers": server_health(settings.data_dir, servers)},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "research" and args.research_command == "status":
+        _require_permission(store, settings, actor, "status:read")
+        print(json.dumps(research_status(settings.data_dir), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "research" and args.research_command == "audit":
+        _require_permission(store, settings, actor, "task:write")
+        print(json.dumps(research_audit(store, limit=args.limit), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "research" and args.research_command == "test":
+        user = _require_permission(store, settings, actor, "task:write")
+        result = test_research_component(settings.data_dir, args.component)
+        correlation_id = f"research-check:{uuid4()}"
+        alert = reconcile_research_alert(
+            settings.data_dir,
+            rule=f"{args.component}_health",
+            failed=not bool(result["ok"]),
+            message=(
+                f"research {args.component} health check failed: "
+                f"{result.get('reason') or 'unknown'}"
+            ),
+            correlation_id=correlation_id,
+        )
+        if alert.get("new"):
+            store.add_alert(str(alert["message"]))
+        store.add_provenance_record(
+            {
+                "record_id": correlation_id,
+                "node_id": args.component,
+                "node_type": "research_control",
+                "created_at": utc_now_iso(),
+                "principal": user.username if user else "bootstrap",
+                "tool": "health_check",
+                "policy_outcome": "healthy" if result["ok"] else "degraded",
+                "failure_reason": result.get("reason"),
+                "alert_id": alert.get("alert_id"),
+            }
+        )
+        print(json.dumps({**result, "alert": alert, "correlation_id": correlation_id}, indent=2))
+        return 0 if result["ok"] else 1
+
+    if args.command == "research" and args.research_command in {"enable", "disable"}:
+        user = _require_permission(store, settings, actor, "task:write")
+        key = f"research_{args.component}_enabled"
+        proposal = stage_research_policy(
+            settings.data_dir,
+            {key: args.research_command == "enable"},
+            actor=user.username if user else "bootstrap",
+        )
+        print(
+            json.dumps(
+                {"proposal": proposal, "policy": research_policy(settings.data_dir)}, indent=2
+            )
+        )
+        return 0
+
+    if args.command == "research" and args.research_command == "apply":
+        user = _require_permission(store, settings, actor, "task:write")
+        result = apply_research_policy(
+            settings.data_dir,
+            args.proposal_id,
+            apply_values=lambda values: set_runtime_overrides(
+                store, values, by=user.username if user else "bootstrap"
+            ),
+        )
+        print(json.dumps({**result, "policy": research_policy(settings.data_dir)}, indent=2))
+        return 0
+
+    if args.command == "research" and args.research_command == "rollback":
+        user = _require_permission(store, settings, actor, "task:write")
+        result = rollback_research_policy(
+            settings.data_dir,
+            apply_values=lambda values: set_runtime_overrides(
+                store, values, by=user.username if user else "bootstrap"
+            ),
+            actor=user.username if user else "bootstrap",
+        )
+        print(json.dumps({**result, "policy": research_policy(settings.data_dir)}, indent=2))
         return 0
 
     if args.command == "chat" and args.chat_command == "send":
@@ -2505,8 +2643,7 @@ def _live_chat_tui_command(
     if running_in_container:
         return None
     is_chat_tui = (
-        getattr(args, "command", None) == "chat"
-        and getattr(args, "chat_command", None) == "tui"
+        getattr(args, "command", None) == "chat" and getattr(args, "chat_command", None) == "tui"
     )
     is_executive_tui = (
         getattr(args, "command", None) == "executive"
@@ -2542,10 +2679,7 @@ def _add_provider_args(parser: argparse.ArgumentParser, require_prompt: bool = F
     parser.add_argument(
         "--base-url",
         default=None,
-        help=(
-            "Provider base URL. Default: BRIGADE_OLLAMA_BASE_URL "
-            "or http://127.0.0.1:11434."
-        ),
+        help=("Provider base URL. Default: BRIGADE_OLLAMA_BASE_URL or http://127.0.0.1:11434."),
     )
     parser.add_argument("--api-key", default=None, help="Optional API key for provider auth.")
     if require_prompt:
@@ -2614,9 +2748,7 @@ def _exchange_oauth_code(args: argparse.Namespace) -> dict[str, Any]:
     if token_url is None and args.provider == "gemini":
         token_url = "https://oauth2.googleapis.com/token"
     if token_url is None:
-        raise ValueError(
-            "--token-url is required for OAuth code exchange with this provider"
-        )
+        raise ValueError("--token-url is required for OAuth code exchange with this provider")
     if not args.client_id:
         raise ValueError("--client-id is required for OAuth code exchange")
     if not args.redirect_uri:
@@ -2660,11 +2792,7 @@ def _provider_from_args(args: argparse.Namespace, settings: Settings | None = No
         else os.environ.get("BRIGADE_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
     )
     base_url = args.base_url or default_base_url
-    api_base = (
-        None
-        if base_url == default_base_url
-        else base_url
-    )
+    api_base = None if base_url == default_base_url else base_url
     if settings is not None:
         return provider_from_settings(
             settings,
@@ -2794,8 +2922,7 @@ def _status_payload(store: StateStore) -> dict[str, object]:
         "teams": [item.to_dict() for item in store.teams()],
         "agent_states": {key: value.to_dict() for key, value in store.agent_states().items()},
         "goals": {
-            key: [goal.to_dict() for goal in values]
-            for key, values in store.goals().items()
+            key: [goal.to_dict() for goal in values] for key, values in store.goals().items()
         },
         "assignments": assignments,
         "assignment_history": store.assignment_history(),
@@ -2890,9 +3017,7 @@ def _validate_agent_owner_username(
         None,
     )
     if owner is None:
-        raise ValueError(
-            "executive agents require --owner-username to name an existing owner user"
-        )
+        raise ValueError("executive agents require --owner-username to name an existing owner user")
     return owner_username
 
 
@@ -3243,8 +3368,7 @@ def _route_team_work(
 
     priority = Priority.URGENT if urgency == "urgent" else Priority(urgency)
     rationale = (
-        f"Team-aware route: scope={scope}, urgency={urgency}, "
-        f"policy={team.delegation_policy}."
+        f"Team-aware route: scope={scope}, urgency={urgency}, policy={team.delegation_policy}."
     )
     assignment = Assignment(
         assignment=assignment_text,
@@ -3349,8 +3473,7 @@ def _escalate_team_work(
             _reasoning_event(
                 source="cross_team_escalation",
                 decision_summary=(
-                    f"{from_team_id} escalated work to {to_team_id} "
-                    f"via {to_team.crew_chief_id}"
+                    f"{from_team_id} escalated work to {to_team_id} via {to_team.crew_chief_id}"
                 ),
                 payload=payload,
             )

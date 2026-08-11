@@ -7,6 +7,7 @@ from brigade.providers import ModelResponse
 from brigade.runner import MAX_AGENT_ITERATIONS, run_agent_once
 from brigade.schemas import Agent, Assignment
 from brigade.state import JsonStateStore
+from brigade.tools import ToolRegistry, ToolResult, ToolSpec
 from brigade.workspace import write_heartbeat_assignment
 from tests.helpers import TestProvider
 
@@ -166,6 +167,59 @@ def test_completion_claiming_existing_file_passes(tmp_path):
 
     assert result.status == "complete"
     assert len(provider.prompts) == 1
+
+
+def test_citation_bearing_assignment_retries_once_and_renders_evidence(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    _make_agent_with_assignment(tmp_path, store)
+    assignment = store.assignments()[0]
+    assignment.assignment = "Prepare a legal research answer about the statute"
+    store.update_assignment(assignment)
+    source_url = "https://uscode.house.gov/view.xhtml?section=1030"
+    import hashlib
+
+    source_id = f"external:{hashlib.sha256(source_url.encode('utf-8')).hexdigest()[:16]}"
+    received: list[dict] = []
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec("web_fetch", "retrieve evidence", {"url": "http or https URL"}),
+        lambda context, arguments: (
+            received.append(arguments)
+            or ToolResult(
+                True,
+                "primary text",
+                {"source_url": source_url, "http_final_url": source_url, "title": "18 USC 1030"},
+            )
+        ),
+    )
+    provider = _SequencedProvider(
+        [
+            json.dumps(
+                {"status": "tool_call", "tool": "web_fetch", "arguments": {"url": source_url}}
+            ),
+            json.dumps(
+                {"status": "complete", "summary": "Uncited legal conclusion", "blockers": []}
+            ),
+            json.dumps(
+                {
+                    "status": "complete",
+                    "summary": f"Supported legal conclusion [[cite:{source_id}]]",
+                    "blockers": [],
+                }
+            ),
+        ]
+    )
+
+    result = run_agent_once("sage", store, provider, tool_registry=registry)
+
+    assert result.status == "complete"
+    assert received == [{"url": source_url, "save_to_knowledge": True}]
+    assert "[^1]: [18 USC 1030]" in result.summary
+    assert "citation-bearing summary rejected" in provider.prompts[2]
+    assert store.transcripts()[-1]["citations"][0]["source_id"] == source_id
+    assert store.transcripts()[-1]["claim_classes"] == [
+        {"kind": "source_fact", "citation_ids": [source_id]}
+    ]
 
 
 def test_persistent_fabricated_completion_is_downgraded_to_working(tmp_path):
@@ -393,6 +447,39 @@ def test_wrap_up_tool_call_falls_back_to_observation_summary(tmp_path):
     assert result.status == "working"
     assert "tool iteration budget exhausted" in result.summary
     assert f"list_files x{MAX_AGENT_ITERATIONS}" in result.summary
+
+
+def test_citation_bearing_wrap_up_cannot_bypass_validation(tmp_path):
+    store = JsonStateStore(tmp_path / "state.json")
+    _make_agent_with_assignment(tmp_path, store)
+    assignment = store.assignments()[0]
+    assignment.assignment = "Prepare a legal research answer"
+    store.update_assignment(assignment)
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec("web_fetch", "retrieve evidence", {}),
+        lambda context, arguments: ToolResult(
+            True,
+            "primary text",
+            {
+                "source_url": "https://uscode.house.gov/view.xhtml",
+                "http_final_url": "https://uscode.house.gov/view.xhtml",
+                "title": "US Code",
+            },
+        ),
+    )
+    wrap_up = json.dumps(
+        {"status": "working", "summary": "Uncited legal conclusion", "blockers": []}
+    )
+    provider = _SequencedProvider([_tool_call("web_fetch")] * MAX_AGENT_ITERATIONS + [wrap_up])
+
+    result = run_agent_once("sage", store, provider, tool_registry=registry)
+
+    assert result.status == "blocked"
+    assert "unable to substantiate" in result.summary
+    control_alert = store.alerts()
+    assert control_alert
+    assert "citation validation failed" in control_alert[0]
 
 
 def test_wrap_up_completion_with_missing_files_is_downgraded(tmp_path):

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from hashlib import sha256
 
 import pytest
 
+import brigade.executive as executive_module
 from brigade.auth import issue_token
 from brigade.config import Settings
 from brigade.executive import (
@@ -17,6 +19,7 @@ from brigade.executive import (
 from brigade.runner import run_managed_agents
 from brigade.schemas import Agent, Assignment, Role, User
 from brigade.state import JsonStateStore
+from brigade.tools import ToolResult
 from brigade.workspace import (
     REQUIRED_AGENT_FILES,
     agent_workspace_files,
@@ -123,6 +126,46 @@ def test_executive_can_stage_and_apply_task_action(tmp_path):
     assert assignment.source == "executive_chat"
     assert assignment.assigned_to == "ada"
     assert assignment.created_by_role == "executive"
+
+
+def test_legal_executive_answer_requires_a_valid_retrieved_citation(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    persona = resolve_executive_persona(store, "owner")
+    thread = store.resolve_active_conversation("owner", persona.persona_id)
+    source_url = "https://www.law.cornell.edu/uscode/text/18/1030"
+    source_id = f"external:{sha256(source_url.encode('utf-8')).hexdigest()[:16]}"
+    monkeypatch.setattr(
+        executive_module,
+        "_web_fetch",
+        lambda context, arguments: ToolResult(
+            True,
+            "secondary interpretation",
+            {"source_url": source_url, "final_url": source_url, "title": "LII interpretation"},
+        ),
+    )
+    provider = SequencedTestProvider(
+        [
+            json.dumps(
+                {"status": "tool_call", "tool": "web_fetch", "arguments": {"url": source_url}}
+            ),
+            f"A secondary interpretation. [[cite:{source_id}]]",
+        ]
+    )
+
+    result = run_executive_chat_turn(
+        store,
+        thread=thread,
+        persona=persona,
+        operator="owner",
+        content="Provide a legal citation.",
+        provider=provider,
+    )
+
+    message = store.messages(result["conversation_id"])[-1]
+    assert message.metadata["citation_required"] is True
+    assert message.metadata["citations"][0]["source_id"] == source_id
+    assert "[^1]: [LII interpretation]" in message.content
+    assert "secondary legal" in message.content
 
 
 def test_executive_actions_can_create_goal_guidance_and_kb_note(tmp_path):

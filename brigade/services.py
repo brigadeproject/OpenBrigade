@@ -239,6 +239,9 @@ SAFE_CONFIG_KEYS = {
     "executive_max_iterations": int,
     "executive_web_fetch_enabled": bool,
     "connector_executive_chat_enabled": bool,
+    "search_backend": str,
+    "searxng_url": str,
+    "browser_worker_url": str,
 }
 
 # Keys an operator can change live from the Telemetry page. These are layered onto
@@ -253,6 +256,11 @@ RUNTIME_OVERRIDE_KEYS = {
     "stale_work_seconds": int,
     "max_agent_iterations": int,
     "web_fetch_autosave": bool,
+    # Governed-research component switches are staged through the research
+    # control plane, then applied as live overrides on the next tool turn.
+    "research_mcp_enabled": bool,
+    "research_search_enabled": bool,
+    "research_browser_enabled": bool,
     # TTL (days) for web-fetched knowledge at retrieval time; 0 = never expire.
     "web_knowledge_max_age_days": int,
 }
@@ -2520,6 +2528,9 @@ def build_settings_payload(
         "executive_max_iterations": settings.executive_max_iterations,
         "executive_web_fetch_enabled": settings.executive_web_fetch_enabled,
         "connector_executive_chat_enabled": settings.connector_executive_chat_enabled,
+        "search_backend": settings.search_backend,
+        "searxng_url": settings.searxng_url,
+        "browser_worker_url": settings.browser_worker_url,
         "editable_keys": sorted(SAFE_CONFIG_KEYS),
     }
 

@@ -99,6 +99,11 @@ class Settings:
     executive_max_iterations: int = 6
     executive_web_fetch_enabled: bool = True
     connector_executive_chat_enabled: bool = False
+    search_backend: str = "searxng"
+    searxng_url: str = "http://brigade_searxng:8080"
+    browser_worker_url: str = "http://brigade_browser:8765"
+    research_storage_path: Path | None = None
+    mcp_config_path: Path | None = None
     allow_json_store: bool = False
 
 
@@ -140,6 +145,15 @@ def _env_int(
     default: int | str,
 ) -> int:
     return int(_env(name, dotenv, str(default)) or default)
+
+
+def _env_path(
+    name: str,
+    dotenv: dict[str, str],
+    default: str | Path | None = None,
+) -> Path | None:
+    raw = _env(name, dotenv, str(default) if default is not None else None)
+    return Path(raw) if raw else None
 
 
 def _compose_host(dotenv: dict[str, str], config: dict[str, Any]) -> str:
@@ -619,6 +633,36 @@ def load_settings(
             "BRIGADE_CONNECTOR_EXECUTIVE_CHAT_ENABLED",
             dotenv,
             config.get("connector_executive_chat_enabled", False),
+        ),
+        search_backend=(
+            _env("BRIGADE_SEARCH_BACKEND", dotenv, config.get("search_backend", "searxng"))
+            or "searxng"
+        ),
+        searxng_url=(
+            _env(
+                "BRIGADE_SEARXNG_URL",
+                dotenv,
+                config.get("searxng_url", "http://brigade_searxng:8080"),
+            )
+            or "http://brigade_searxng:8080"
+        ),
+        browser_worker_url=(
+            _env(
+                "BRIGADE_BROWSER_WORKER_URL",
+                dotenv,
+                config.get("browser_worker_url", "http://brigade_browser:8765"),
+            )
+            or "http://brigade_browser:8765"
+        ),
+        research_storage_path=_env_path(
+            "BRIGADE_RESEARCH_STORAGE_PATH",
+            dotenv,
+            config.get("research_storage_path"),
+        ),
+        mcp_config_path=_env_path(
+            "BRIGADE_MCP_CONFIG",
+            dotenv,
+            config.get("mcp_config_path"),
         ),
         allow_json_store=_env_bool(
             "BRIGADE_ALLOW_JSON_STORE",

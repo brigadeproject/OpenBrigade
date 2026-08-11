@@ -73,6 +73,12 @@ services:
       BRIGADE_OPENAI_AUTH_MODE: ${BRIGADE_OPENAI_AUTH_MODE:-api_key}
       BRIGADE_OPENAI_CODEX_AUTH_MODE: ${BRIGADE_OPENAI_CODEX_AUTH_MODE:-api_key}
       BRIGADE_GEMINI_AUTH_MODE: ${BRIGADE_GEMINI_AUTH_MODE:-api_key}
+      BRIGADE_SEARCH_BACKEND: ${BRIGADE_SEARCH_BACKEND:-searxng}
+      BRIGADE_SEARXNG_URL: ${BRIGADE_SEARXNG_URL:-http://brigade_searxng:8080}
+      BRIGADE_SEARCH_ALLOWED_ENGINES: ${BRIGADE_SEARCH_ALLOWED_ENGINES:-google cse}
+      BRIGADE_BROWSER_WORKER_URL: ${BRIGADE_BROWSER_WORKER_URL:-http://brigade_browser:8765}
+      BRIGADE_RESEARCH_STORAGE_PATH: ${BRIGADE_RESEARCH_STORAGE_PATH:-}
+      BRIGADE_MCP_CONFIG: ${BRIGADE_MCP_CONFIG:-/data/mcp_servers.json}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
@@ -92,6 +98,8 @@ services:
       - brigade_redis
       - brigade_qdrant
       - brigade_neo4j
+      - brigade_searxng
+      - brigade_browser
 
   brigade_web:
     build: .
@@ -120,6 +128,12 @@ services:
       BRIGADE_OPENAI_AUTH_MODE: ${BRIGADE_OPENAI_AUTH_MODE:-api_key}
       BRIGADE_OPENAI_CODEX_AUTH_MODE: ${BRIGADE_OPENAI_CODEX_AUTH_MODE:-api_key}
       BRIGADE_GEMINI_AUTH_MODE: ${BRIGADE_GEMINI_AUTH_MODE:-api_key}
+      BRIGADE_SEARCH_BACKEND: ${BRIGADE_SEARCH_BACKEND:-searxng}
+      BRIGADE_SEARXNG_URL: ${BRIGADE_SEARXNG_URL:-http://brigade_searxng:8080}
+      BRIGADE_SEARCH_ALLOWED_ENGINES: ${BRIGADE_SEARCH_ALLOWED_ENGINES:-google cse}
+      BRIGADE_BROWSER_WORKER_URL: ${BRIGADE_BROWSER_WORKER_URL:-http://brigade_browser:8765}
+      BRIGADE_RESEARCH_STORAGE_PATH: ${BRIGADE_RESEARCH_STORAGE_PATH:-}
+      BRIGADE_MCP_CONFIG: ${BRIGADE_MCP_CONFIG:-/data/mcp_servers.json}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
@@ -141,6 +155,44 @@ services:
       - brigade_redis
       - brigade_qdrant
       - brigade_neo4j
+      - brigade_searxng
+      - brigade_browser
+
+  brigade_searxng:
+    image: searxng/searxng:2026.7.28-c01178d03
+    container_name: brigade_searxng
+    restart: unless-stopped
+    profiles:
+      - app
+    environment:
+      SEARXNG_BASE_URL: ${BRIGADE_SEARXNG_PUBLIC_URL:-http://brigade_searxng:8080/}
+    volumes:
+      - ./ops/searxng-settings.yml:/etc/searxng/settings.yml:ro
+    networks:
+      - brigade_net
+
+  brigade_browser:
+    build:
+      context: .
+      dockerfile: ops/browser-worker.Dockerfile
+    image: openbrigade/browser-worker:local
+    container_name: brigade_browser
+    restart: unless-stopped
+    profiles:
+      - app
+    command:
+      - python3
+      - /app/ops/browser_worker.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --profile-root
+      - /data/browser_profiles
+    volumes:
+      - brigade_browser_profiles:/data/browser_profiles
+    networks:
+      - brigade_net
 
   brigade_postgres:
     image: postgres:16-alpine
@@ -215,3 +267,5 @@ volumes:
     name: brigade_neo4j_logs
   brigade_app_data:
     name: brigade_app_data
+  brigade_browser_profiles:
+    name: brigade_browser_profiles

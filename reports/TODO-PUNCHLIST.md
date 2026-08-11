@@ -61,8 +61,13 @@ latent-feature gaps have since landed: per-agent model selection
 during managed runs, structured subtask creation, delegation guards, malformed
 orchestrator-output degradation, default-provider fallback for managed agent runs, connector
 rate/size limits, and packaged web build serving all exist in code and tests. The remaining
-work is final live/operator validation, keeping README wording honest, and treating **MCP
-client** as the flagship first post-RC milestone.
+work is final live/operator validation, keeping README wording honest, and finishing the MCP
+client operator-management layer after the first tool-consumption slice.
+
+The detailed, sequential hardening plan for MCP, browser isolation, search quality, citation
+enforcement, and operator controls is maintained in
+[Governed Research Capability TODO](RESEARCH-CAPABILITY-TODO.md). It is the source of truth for
+this post-RC work; advance one phase at a time with its recorded acceptance evidence.
 
 ---
 
@@ -71,12 +76,14 @@ client** as the flagship first post-RC milestone.
 These were the four candidate blockers. With the owner's decisions, **none block the RC**;
 each becomes a documentation change now + a roadmap item later.
 
-1. **MCP client (consume external MCP servers as tools).** — **L** — *flagship post-RC, do first.*
+1. **MCP client (consume external MCP servers as tools).** — **L** — *first slice implemented.*
    - *Decision:* Not RC-blocking, but it is the **single highest-value next build** and the
-     chosen delivery path for Google tools. Schedule it as the first milestone after RC.
-   - *Where:* new module alongside [`brigade/tools.py`](../brigade/tools.py); register MCP
-     tools into `ToolRegistry`; config in [`brigade/config.py`](../brigade/config.py).
-   - *RC action:* in the README, list MCP as "on the roadmap," not a current feature.
+     chosen delivery path for Google tools.
+   - *Status:* `brigade/mcp_client.py` reads stdio/HTTP server config, discovers tools, and
+     registers them into `ToolRegistry` as provider-safe `mcp__<server>__<tool>` names. Agents can
+     call those tools and receive normal tool observations.
+   - *Remaining:* operator CLI/GUI management, credential helpers, and operator-visible alerts for
+     failed server startup or missing credentials.
    - *Report:* [02](02-external-connectors.md).
 
 2. **Claude OAuth.** — **S (reword)** — *nice-to-have, deferred.*

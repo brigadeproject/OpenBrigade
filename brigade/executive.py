@@ -19,6 +19,13 @@ from brigade.chief_chat import (
     parse_chief_chat_reply,
     search_episode_summaries,
 )
+from brigade.citations import (
+    citation_context,
+    citation_instructions,
+    citation_retrieval_arguments,
+    classify_rendered_claims,
+    enforce_citation_answer,
+)
 from brigade.connectors import ConnectorChatReply, IncomingConnectorMessage
 from brigade.knowledge import ingest_text, store_ingest_result
 from brigade.memory import (
@@ -27,6 +34,7 @@ from brigade.memory import (
     record_memory_mutation,
 )
 from brigade.providers import ModelProvider, ModelResponse
+from brigade.research_control import record_citation_validation
 from brigade.runner import MAX_OBSERVATION_CHARS, _truncate
 from brigade.schemas import (
     AGENT_ROLE_EXECUTIVE,
@@ -50,7 +58,16 @@ from brigade.services import (
 )
 from brigade.store import StateStore
 from brigade.time import utc_now_iso
-from brigade.tools import ToolRegistry, ToolResult, ToolSpec, _web_fetch, native_tool_specs
+from brigade.tools import (
+    ToolRegistry,
+    ToolResult,
+    ToolSpec,
+    _register_browser_tools,
+    _register_mcp_tools,
+    _web_fetch,
+    _web_search,
+    native_tool_specs,
+)
 
 EXECUTIVE_CHAT_KIND_PREFIX = "executive_chat"
 
@@ -225,12 +242,16 @@ def _tool_search_knowledge(context: ExecutiveToolContext, arguments: dict[str, A
             matches.append(document)
     for episode in search_episode_summaries(context.store, query, limit=5):
         matches.append({"kind": "episode", **episode})
-    return ToolResult(True, _compact_json({"count": len(matches), "matches": matches[:20]}))
+    selected = matches[:20]
+    return ToolResult(
+        True,
+        _compact_json({"count": len(matches), "matches": selected}),
+        {"document_ids": [item["document_id"] for item in selected if item.get("document_id")]},
+    )
 
 
 def _tool_web_fetch(context: ExecutiveToolContext, arguments: dict[str, Any]) -> ToolResult:
-    del context
-    return _web_fetch(None, arguments)
+    return _web_fetch(context, arguments)
 
 
 def _tool_remember(context: ExecutiveToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -309,14 +330,38 @@ def executive_query_registry(*, include_web_fetch: bool = True) -> ToolRegistry:
         registry.register(
             ToolSpec(
                 name="web_fetch",
-                description="Fetch a small public HTTP(S) text response for reference.",
+                description="Fetch a small public HTTP(S) text or PDF response for reference.",
                 argument_schema={
                     "url": "http or https URL",
                     "max_chars": "optional integer",
+                    "save_to_knowledge": (
+                        "optional boolean; store extracted text as a knowledge document"
+                    ),
                 },
             ),
             _tool_web_fetch,
         )
+        registry.register(
+            ToolSpec(
+                name="web_search",
+                description=(
+                    "Search the public web for source URLs. Use web_fetch to retrieve "
+                    "promising results."
+                ),
+                argument_schema={
+                    "query": "search query, maximum 200 characters",
+                    "limit": "optional integer, maximum 8",
+                    "intent": "optional general|legal, defaults general",
+                    "jurisdiction": "optional jurisdiction for legal research",
+                    "save_to_knowledge": (
+                        "optional boolean; store the result list and source URLs as knowledge"
+                    ),
+                },
+            ),
+            _web_search,
+        )
+        _register_browser_tools(registry)
+        _register_mcp_tools(registry)
     registry.register(
         ToolSpec(
             name="remember",
@@ -351,6 +396,7 @@ def build_executive_prompt(
     observations: list[dict[str, Any]],
     pending: dict[str, Any] | None = None,
     demand_final: bool = False,
+    citation_instruction: str = "",
 ) -> str:
     context: dict[str, Any] = {
         "operator": operator,
@@ -371,6 +417,11 @@ def build_executive_prompt(
             "Use tools to inspect Brigade state and answer accurately. For state "
             "changes, propose actions."
         ),
+        (
+            "Citation requirements for retrieved sources are supplied only for "
+            "citation-bearing requests."
+        ),
+        citation_instruction,
         "",
         *_tool_manifest(registry),
         "",
@@ -630,6 +681,9 @@ def run_executive_chat_turn(
             observations=observations,
             pending=pending,
             demand_final=demand_final,
+            citation_instruction=citation_instructions(
+                citation_context(store, content, observations)
+            ),
         )
         response = _complete_model_call(store, provider, prompt, tools=tools, holder=agent_label)
         reply: ChiefChatReply = parse_chief_chat_reply(response.text)
@@ -649,7 +703,13 @@ def run_executive_chat_turn(
             return {**result, "iterations": iterations, "tools_used": tools_used}
         _record_executive_usage(store, response, channel=channel, agent_id=agent_label)
         if reply.kind == "tool_call" and not demand_final:
-            tool_result = registry.execute(reply.tool_name, context, reply.tool_arguments)
+            tool_result = registry.execute(
+                reply.tool_name,
+                context,
+                citation_retrieval_arguments(
+                    content, observations, reply.tool_name, reply.tool_arguments
+                ),
+            )
             observation = tool_result.to_observation(reply.tool_name)
             observation["output"] = _truncate(str(observation["output"]), MAX_OBSERVATION_CHARS)
             observations.append(observation)
@@ -665,6 +725,39 @@ def run_executive_chat_turn(
         raise RuntimeError("executive chat turn produced no model response")
     if not final_text:
         final_text = "I checked what I could, but I need a more specific instruction."
+    citation_errors: list[str] = []
+    citations: list[dict[str, object]] = []
+    claim_classes: list[dict[str, object]] = []
+    citation_repaired = False
+
+    def repair_citations(repair_prompt: str) -> str:
+        repair_response = _complete_model_call(
+            store, provider, repair_prompt, tools=[], holder=agent_label
+        )
+        _record_executive_usage(store, repair_response, channel=channel, agent_id=agent_label)
+        return parse_chief_chat_reply(repair_response.text).text
+
+    (
+        final_text,
+        citation_state,
+        citations,
+        citation_errors,
+        citation_repaired,
+    ) = enforce_citation_answer(
+        store,
+        content,
+        observations,
+        final_text,
+        repair=repair_citations,
+    )
+    claim_classes = classify_rendered_claims(final_text, citations)
+    if citation_state.required:
+        record_citation_validation(
+            store,
+            errors=citation_errors,
+            principal=agent_label,
+            correlation_id=f"citation:executive:{uuid4()}",
+        )
     response_message = ChatMessage(
         channel=channel,
         sender=agent_label,
@@ -679,6 +772,11 @@ def run_executive_chat_turn(
             "provider": response.provider,
             "model": response.model,
             "route_type": response.route_type,
+            "citation_required": citation_state.required,
+            "citations": citations,
+            "citation_validation_errors": citation_errors,
+            "citation_repaired": citation_repaired,
+            "claim_classes": claim_classes,
         },
     )
     store.add_message(response_message)

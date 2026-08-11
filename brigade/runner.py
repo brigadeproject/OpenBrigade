@@ -7,12 +7,19 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from brigade.citations import (
+    citation_context,
+    citation_instructions,
+    citation_retrieval_arguments,
+    classify_rendered_claims,
+    validate_and_render_answer,
+)
 from brigade.finance import persist_financial_report
 from brigade.governance import (
     PolicyProjectionStaleError,
@@ -27,6 +34,7 @@ from brigade.providers import (
     demote_unavailable_model,
     is_model_not_found_error,
 )
+from brigade.research_control import record_citation_validation
 from brigade.schemas import (
     AGENT_ROLE_EXECUTIVE,
     MALFORMED_PROVIDER_OUTPUT_MARKER,
@@ -112,6 +120,8 @@ class ParsedAgentResponse:
     tool_name: str | None = None
     tool_arguments: dict[str, Any] | None = None
     expected_next_activity_at: str | None = None
+    citations: list[dict[str, object]] = field(default_factory=list)
+    claim_classes: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -400,6 +410,11 @@ def run_agent_once(
                 "route_type": response.route_type,
                 "path": str(transcript_path),
                 "created_at": utc_now_iso(),
+                "citation_required": citation_context(
+                    store, assignment.assignment, observations
+                ).required,
+                "citations": parsed.citations,
+                "claim_classes": parsed.claim_classes,
             }
         )
         for index, response_item in enumerate(responses, start=1):
@@ -479,6 +494,62 @@ def _complete_assignment_with_tools(
         )
         responses.append(response)
         parsed = parse_agent_response(response.text)
+        citation_state = citation_context(store, assignment.assignment, observations)
+        if citation_state.required and parsed.status != "tool_call":
+            rendered_summary, citations, citation_errors = validate_and_render_answer(
+                parsed.summary, citation_state
+            )
+            if citation_errors:
+                completion_rejections += 1
+                if (
+                    citation_state.citations
+                    and completion_rejections < MAX_COMPLETION_VALIDATION_RETRIES
+                ):
+                    observations.append(
+                        {
+                            "tool": "citation_validation",
+                            "ok": False,
+                            "output": (
+                                "citation-bearing summary rejected: "
+                                f"{' ; '.join(citation_errors)}. Repair it with only supplied "
+                                "[[cite:SOURCE_ID]] markers, or report awaiting_human."
+                            ),
+                            "metadata": {"source_ids": sorted(citation_state.ids)},
+                        }
+                    )
+                    continue
+                record_citation_validation(
+                    store,
+                    errors=citation_errors,
+                    principal=agent.agent_id,
+                    correlation_id=f"citation:assignment:{uuid4()}",
+                )
+                return (
+                    responses,
+                    ParsedAgentResponse(
+                        status="awaiting_human",
+                        summary=(
+                            "unable to substantiate this citation-bearing assignment from "
+                            "retrieved evidence; primary or authoritative source retrieval "
+                            "is needed"
+                        ),
+                        blockers=["citation validation failed"],
+                        awaiting_human=True,
+                    ),
+                    observations,
+                )
+            parsed = replace(
+                parsed,
+                summary=rendered_summary,
+                citations=citations,
+                claim_classes=classify_rendered_claims(rendered_summary, citations),
+            )
+            record_citation_validation(
+                store,
+                errors=[],
+                principal=agent.agent_id,
+                correlation_id=f"citation:assignment:{uuid4()}",
+            )
         if parsed.status == "complete" and assignment.kind != AssignmentKind.REST:
             if (
                 assignment.source in DECOMPOSITION_SOURCES
@@ -574,7 +645,12 @@ def _complete_assignment_with_tools(
         result = registry.execute(
             parsed.tool_name or "",
             context,
-            parsed.tool_arguments or {},
+            citation_retrieval_arguments(
+                assignment.assignment,
+                observations,
+                parsed.tool_name or "",
+                parsed.tool_arguments or {},
+            ),
         )
         LOGGER.info(
             "agent_tool_call",
@@ -680,6 +756,39 @@ def _wrap_up_exhausted_cycle(
     parsed = parse_agent_response(response.text)
     if parsed.status == "tool_call" or not parsed.summary.strip():
         return fallback
+    citation_state = citation_context(store, assignment.assignment, observations)
+    if citation_state.required:
+        rendered_summary, citations, citation_errors = validate_and_render_answer(
+            parsed.summary, citation_state
+        )
+        if citation_errors:
+            record_citation_validation(
+                store,
+                errors=citation_errors,
+                principal=agent.agent_id,
+                correlation_id=f"citation:assignment:{uuid4()}",
+            )
+            return ParsedAgentResponse(
+                status="awaiting_human",
+                summary=(
+                    "unable to substantiate this citation-bearing assignment from "
+                    "retrieved evidence after the tool budget was exhausted"
+                ),
+                blockers=["citation validation failed"],
+                awaiting_human=True,
+            )
+        parsed = replace(
+            parsed,
+            summary=rendered_summary,
+            citations=citations,
+            claim_classes=classify_rendered_claims(rendered_summary, citations),
+        )
+        record_citation_validation(
+            store,
+            errors=[],
+            principal=agent.agent_id,
+            correlation_id=f"citation:assignment:{uuid4()}",
+        )
     if parsed.status == "complete" and assignment.kind != AssignmentKind.REST:
         # No retry budget left for completion validation, so a claim that
         # fails it is downgraded to progress instead of re-asked.
@@ -839,6 +948,9 @@ def build_assignment_prompt(
             "Use expected_next_activity_at on working responses when this task is "
             "intentionally waiting until a future UTC timestamp.",
             "Use blocked or awaiting_human when you need outside intervention.",
+            citation_instructions(
+                citation_context(store, assignment.assignment, observations or [])
+            ),
             "",
             "Floor JSON:",
             compact_json(context),

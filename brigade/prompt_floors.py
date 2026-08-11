@@ -148,7 +148,8 @@ CREW_CHIEF_CHAT_PROMPT = "\n".join(
         "your next turn.",
         "When you have what you need, reply with your final answer as plain "
         "Markdown prose (no JSON). Keep answers short and concrete; cite task "
-        "ids when you reference tasks.",
+        "ids when you reference tasks. Citation requirements for retrieved sources "
+        "are supplied only when this is a citation-bearing request.",
         "If the operator asks you to change state (create or cancel tasks, set "
         "priority, attach guidance, retry blocked work), do NOT apply it yet. "
         "Reply with exactly one JSON object describing your plan:",

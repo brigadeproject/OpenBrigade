@@ -7,6 +7,8 @@ from dataclasses import dataclass
 class Chunk:
     index: int
     text: str
+    start: int = 0
+    end: int = 0
 
 
 def chunk_text(text: str, max_chars: int = 1200, overlap: int = 120) -> list[Chunk]:
@@ -20,7 +22,7 @@ def chunk_text(text: str, max_chars: int = 1200, overlap: int = 120) -> list[Chu
     start = 0
     while start < len(clean):
         end = min(start + max_chars, len(clean))
-        chunks.append(Chunk(index=len(chunks), text=clean[start:end]))
+        chunks.append(Chunk(index=len(chunks), text=clean[start:end], start=start, end=end))
         if end == len(clean):
             break
         start = end - overlap

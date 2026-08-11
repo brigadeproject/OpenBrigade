@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "target_jurisdictions": ["US federal"],
+  "thresholds": {
+    "recall": 0.8,
+    "precision": 0.6,
+    "authority": 0.7,
+    "freshness": 0.75,
+    "max_duplicate_rate": 0.1
+  },
+  "cases": [
+    {
+      "query_id": "us-statute",
+      "query": "18 USC 1030 text",
+      "intent": "legal",
+      "jurisdiction": "US federal",
+      "expected_urls": ["https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title18-section1030"],
+      "preferred_tiers": ["primary_legal", "official_government"],
+      "results": [
+        {"url": "https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title18-section1030", "source_tier": "primary_legal", "publication_date": "2025-01-01"}
+      ]
+    },
+    {
+      "query_id": "federal-regulation",
+      "query": "17 CFR 240.10b-5 text",
+      "intent": "legal",
+      "jurisdiction": "US federal",
+      "expected_urls": ["https://www.ecfr.gov/current/title-17/chapter-II/part-240/section-240.10b-5"],
+      "preferred_tiers": ["primary_legal", "official_government"],
+      "results": [
+        {"url": "https://www.ecfr.gov/current/title-17/chapter-II/part-240/section-240.10b-5", "source_tier": "primary_legal", "publication_date": "2025-02-01"}
+      ]
+    },
+    {
+      "query_id": "court-opinion",
+      "query": "Supreme Court recent opinion",
+      "intent": "legal",
+      "jurisdiction": "US federal",
+      "expected_urls": ["https://www.supremecourt.gov/opinions/slipopinion/25"],
+      "preferred_tiers": ["court_material", "primary_legal"],
+      "results": [
+        {"url": "https://www.supremecourt.gov/opinions/slipopinion/25", "source_tier": "court_material", "publication_date": "2025-06-01"}
+      ]
+    },
+    {
+      "query_id": "academic-preprint",
+      "query": "retrieval augmented generation evaluation paper",
+      "intent": "general",
+      "jurisdiction": "",
+      "expected_urls": ["https://arxiv.org/abs/2401.00001"],
+      "preferred_tiers": ["academic_preprint", "academic", "academic_index"],
+      "fresh_after": "2024-01-01",
+      "results": [
+        {"url": "https://arxiv.org/abs/2401.00001", "source_tier": "academic_preprint", "publication_date": "2024-01-02"}
+      ]
+    },
+    {
+      "query_id": "general-research",
+      "query": "NIST AI risk management framework",
+      "intent": "general",
+      "jurisdiction": "US",
+      "expected_urls": ["https://www.nist.gov/itl/ai-risk-management-framework"],
+      "preferred_tiers": ["official_government", "general_web"],
+      "results": [
+        {"url": "https://www.nist.gov/itl/ai-risk-management-framework", "source_tier": "official_government", "publication_date": "2025-01-01"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+use_default_settings: true
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+server:
+  limiter: false
+  public_instance: false
+  secret_key: "openbrigade-local-change-me"
+  method: "GET"

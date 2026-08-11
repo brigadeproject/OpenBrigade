@@ -16,7 +16,7 @@ SUPPORTED_TEXT_EXTENSIONS = {".md", ".txt"}
 SUPPORTED_INGEST_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | {".pdf", ".html", ".htm"}
 
 
-def _pdf_to_text(data: bytes) -> str:
+def pdf_text_with_page_map(data: bytes) -> tuple[str, list[dict[str, int]]]:
     try:
         from pypdf import PdfReader
     except ImportError as exc:  # pragma: no cover - depends on the ingest extra
@@ -26,8 +26,24 @@ def _pdf_to_text(data: bytes) -> str:
     import io
 
     reader = PdfReader(io.BytesIO(data))
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n\n".join(part.strip() for part in pages if part.strip())
+    parts: list[str] = []
+    page_map: list[dict[str, int]] = []
+    offset = 0
+    for number, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if not text:
+            continue
+        if parts:
+            offset += 2
+        start = offset
+        parts.append(text)
+        offset += len(text)
+        page_map.append({"page": number, "char_start": start, "char_end": offset})
+    return "\n\n".join(parts), page_map
+
+
+def _pdf_to_text(data: bytes) -> str:
+    return pdf_text_with_page_map(data)[0]
 
 
 def _strip_html_tags(html: str) -> str:
@@ -129,6 +145,7 @@ def ingest_text(
     *,
     content_path: str,
     extra_metadata: dict[str, object] | None = None,
+    page_map: list[dict[str, int]] | None = None,
 ) -> IngestResult:
     """Build the document/chunks/episode/provenance records for a text body.
 
@@ -153,14 +170,15 @@ def ingest_text(
     chunks = []
     for chunk in chunk_text(content):
         chunk_id = str(uuid4())
-        chunks.append(
-            {
+        record = {
                 "chunk_id": chunk_id,
                 "kb_id": f"chunk:{chunk_id}",
                 "document_id": document.document_id,
                 "document_type": document_type,
                 "chunk_index": chunk.index,
                 "text": chunk.text,
+                "char_start": chunk.start,
+                "char_end": chunk.end,
                 "source": source,
                 "content_path": content_path,
                 "title": title,
@@ -170,7 +188,16 @@ def ingest_text(
                 "content_hash": content_hash,
                 "created_at": utc_now_iso(),
             }
-        )
+        if page_map:
+            pages = [
+                item["page"]
+                for item in page_map
+                if item["char_start"] < chunk.end and item["char_end"] > chunk.start
+            ]
+            if pages:
+                record["page_start"] = min(pages)
+                record["page_end"] = max(pages)
+        chunks.append(record)
     summary = _extract_summary(content, title)
     episode_id = str(uuid4())
     episode = {
@@ -212,6 +239,8 @@ def ingest_text(
                 "metadata": {
                     "document_id": document.document_id,
                     "chunk_index": chunk["chunk_index"],
+                    "char_start": chunk.get("char_start"),
+                    "char_end": chunk.get("char_end"),
                 },
                 "created_at": utc_now_iso(),
             }

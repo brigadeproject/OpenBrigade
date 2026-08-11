@@ -23,6 +23,22 @@ def test_cli_config_show(tmp_path, monkeypatch, capsys):
     assert payload["data_dir"] == ".brigade"
 
 
+def test_cli_research_status_and_staged_policy(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["research", "status"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["mcp"]["state"] == "not_configured"
+
+    assert main(["research", "disable", "browser"]) == 0
+    proposal = json.loads(capsys.readouterr().out)["proposal"]
+    assert proposal["status"] == "pending"
+
+    assert main(["research", "apply", proposal["proposal_id"]]) == 0
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["active"]["research_browser_enabled"] is False
+
+
 def test_cli_task_create_and_cycle(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
 
