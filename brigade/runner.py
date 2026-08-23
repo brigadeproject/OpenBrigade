@@ -14,10 +14,13 @@ from typing import Any
 from uuid import uuid4
 
 from brigade.citations import (
+    available_citations,
     citation_context,
     citation_instructions,
     citation_retrieval_arguments,
+    citation_validation_status,
     classify_rendered_claims,
+    enforce_citation_answer,
     validate_and_render_answer,
 )
 from brigade.finance import persist_financial_report
@@ -122,6 +125,11 @@ class ParsedAgentResponse:
     expected_next_activity_at: str | None = None
     citations: list[dict[str, object]] = field(default_factory=list)
     claim_classes: list[dict[str, object]] = field(default_factory=list)
+    citation_validation_status: str = "not_required"
+    citation_validation_errors: list[str] = field(default_factory=list)
+    available_citations: list[dict[str, object]] = field(default_factory=list)
+    citation_draft: str | None = None
+    resume_next_cycle: bool = False
 
 
 @dataclass(frozen=True)
@@ -415,6 +423,10 @@ def run_agent_once(
                 ).required,
                 "citations": parsed.citations,
                 "claim_classes": parsed.claim_classes,
+                "citation_validation_status": parsed.citation_validation_status,
+                "citation_validation_errors": parsed.citation_validation_errors,
+                "available_citations": parsed.available_citations,
+                "citation_draft": parsed.citation_draft,
             }
         )
         for index, response_item in enumerate(responses, start=1):
@@ -500,41 +512,33 @@ def _complete_assignment_with_tools(
                 parsed.summary, citation_state
             )
             if citation_errors:
-                completion_rejections += 1
-                if (
-                    citation_state.citations
-                    and completion_rejections < MAX_COMPLETION_VALIDATION_RETRIES
-                ):
-                    observations.append(
-                        {
-                            "tool": "citation_validation",
-                            "ok": False,
-                            "output": (
-                                "citation-bearing summary rejected: "
-                                f"{' ; '.join(citation_errors)}. Repair it with only supplied "
-                                "[[cite:SOURCE_ID]] markers, or report awaiting_human."
-                            ),
-                            "metadata": {"source_ids": sorted(citation_state.ids)},
-                        }
-                    )
-                    continue
                 record_citation_validation(
                     store,
                     errors=citation_errors,
                     principal=agent.agent_id,
                     correlation_id=f"citation:assignment:{uuid4()}",
                 )
+                fallback, _, _, _, _ = enforce_citation_answer(
+                    store, assignment.assignment, observations, parsed.summary
+                )
                 return (
                     responses,
                     ParsedAgentResponse(
                         status="awaiting_human",
-                        summary=(
-                            "unable to substantiate this citation-bearing assignment from "
-                            "retrieved evidence; primary or authoritative source retrieval "
-                            "is needed"
-                        ),
+                        summary=fallback,
                         blockers=["citation validation failed"],
                         awaiting_human=True,
+                        claim_classes=(
+                            [{"kind": "unverified_draft", "citation_ids": []}]
+                            if citation_state.citations
+                            else []
+                        ),
+                        citation_validation_status=citation_validation_status(
+                            citation_state, citation_errors
+                        ),
+                        citation_validation_errors=citation_errors,
+                        available_citations=available_citations(citation_state),
+                        citation_draft=parsed.summary if citation_state.citations else None,
                     ),
                     observations,
                 )
@@ -543,6 +547,8 @@ def _complete_assignment_with_tools(
                 summary=rendered_summary,
                 citations=citations,
                 claim_classes=classify_rendered_claims(rendered_summary, citations),
+                citation_validation_status="validated",
+                available_citations=available_citations(citation_state),
             )
             record_citation_validation(
                 store,
@@ -715,6 +721,7 @@ def _wrap_up_exhausted_cycle(
         status="working",
         summary=_exhausted_cycle_fallback_summary(observations, iteration_budget),
         blockers=[],
+        resume_next_cycle=True,
     )
     prompt = "\n".join(
         [
@@ -768,20 +775,33 @@ def _wrap_up_exhausted_cycle(
                 principal=agent.agent_id,
                 correlation_id=f"citation:assignment:{uuid4()}",
             )
+            fallback_text, _, _, _, _ = enforce_citation_answer(
+                store, assignment.assignment, observations, parsed.summary
+            )
             return ParsedAgentResponse(
                 status="awaiting_human",
-                summary=(
-                    "unable to substantiate this citation-bearing assignment from "
-                    "retrieved evidence after the tool budget was exhausted"
-                ),
+                summary=fallback_text,
                 blockers=["citation validation failed"],
                 awaiting_human=True,
+                claim_classes=(
+                    [{"kind": "unverified_draft", "citation_ids": []}]
+                    if citation_state.citations
+                    else []
+                ),
+                citation_validation_status=citation_validation_status(
+                    citation_state, citation_errors
+                ),
+                citation_validation_errors=citation_errors,
+                available_citations=available_citations(citation_state),
+                citation_draft=parsed.summary if citation_state.citations else None,
             )
         parsed = replace(
             parsed,
             summary=rendered_summary,
             citations=citations,
             claim_classes=classify_rendered_claims(rendered_summary, citations),
+            citation_validation_status="validated",
+            available_citations=available_citations(citation_state),
         )
         record_citation_validation(
             store,
@@ -798,6 +818,7 @@ def _wrap_up_exhausted_cycle(
             return replace(
                 parsed,
                 status="working",
+                resume_next_cycle=True,
                 summary=(
                     "completion claimed at wrap-up, but this planning assignment "
                     "created no tasks (no create_subtasks or delegate calls); "
@@ -809,6 +830,7 @@ def _wrap_up_exhausted_cycle(
             return replace(
                 parsed,
                 status="working",
+                resume_next_cycle=True,
                 summary=(
                     "completion claimed at wrap-up, but these files do not exist "
                     f"in the workspace: {', '.join(missing)}; treating as "
@@ -826,7 +848,7 @@ def _wrap_up_exhausted_cycle(
                     f"found in workspace: {', '.join(unverified)}]"
                 ),
             )
-    return parsed
+    return replace(parsed, resume_next_cycle=parsed.status == "working")
 
 
 def _exhausted_cycle_fallback_summary(
@@ -914,6 +936,19 @@ def build_assignment_prompt(
     # models miss it there — a directive from the human deserves its own
     # plainly-worded section.
     guidance_lines: list[str] = []
+    if assignment.continuation_reason == "tool_budget_exhausted":
+        guidance_lines.extend(
+            [
+                "CONTINUATION CHECKPOINT:",
+                "- The previous run used its tool budget and was queued for this cycle.",
+                "- Resume from the recorded progress; do not repeat prior tool calls "
+                "without a reason.",
+                "- If the remaining work is independently executable, use "
+                "create_subtasks or delegate to split it, then synthesize the child "
+                "results before completing the parent.",
+                "",
+            ]
+        )
     if assignment.operator_guidance:
         guidance_lines.append(
             "OPERATOR GUIDANCE (direct instruction from the human operator — "
@@ -1117,43 +1152,33 @@ def _apply_agent_response(
         )
 
     if parsed.status == "working":
-        assignment.mark_cycle_incomplete(summary=parsed.summary, blockers=parsed.blockers)
+        assignment.mark_cycle_incomplete(
+            summary=parsed.summary,
+            blockers=parsed.blockers,
+            resume_queued=parsed.resume_next_cycle,
+            continuation_reason=(
+                "tool_budget_exhausted" if parsed.resume_next_cycle else None
+            ),
+        )
         if parsed.expected_next_activity_at:
             assignment.checkpoint_at = parsed.expected_next_activity_at
         write_heartbeat_assignment(agent, assignment, store.data_dir)
-        if assignment.status == AssignmentStatus.ABANDONED:
-            abandoned_summary = (
-                f"abandoned after {assignment.cycle_count} cycles: {parsed.summary}"
+        store.update_assignment(assignment)
+        store.upsert_agent_state(
+            AgentState(
+                agent=agent_id,
+                status="queued" if parsed.resume_next_cycle else "working",
+                current_assignment_id=assignment.assignment_id,
+                current_assignment_summary=assignment.assignment,
+                assignment_progress=parsed.summary,
+                blockers=parsed.blockers,
+                next_available=(
+                    "next available orchestrator cycle"
+                    if parsed.resume_next_cycle
+                    else assignment.checkpoint_at or "after_current_assignment"
+                ),
             )
-            store.archive_assignment(
-                assignment,
-                executive_summary=abandoned_summary,
-            )
-            store.add_alert(
-                f"assignment {assignment.assignment_id} "
-                f"abandoned after {assignment.cycle_count} cycles"
-            )
-            store.upsert_agent_state(
-                AgentState(
-                    agent=agent_id,
-                    status="blocked",
-                    last_completed=f"abandoned: {parsed.summary}",
-                    blockers=parsed.blockers,
-                )
-            )
-        else:
-            store.update_assignment(assignment)
-            store.upsert_agent_state(
-                AgentState(
-                    agent=agent_id,
-                    status="working",
-                    current_assignment_id=assignment.assignment_id,
-                    current_assignment_summary=assignment.assignment,
-                    assignment_progress=parsed.summary,
-                    blockers=parsed.blockers,
-                    next_available=assignment.checkpoint_at or "after_current_assignment",
-                )
-            )
+        )
         return RunResult(
             assignment_id=assignment.assignment_id,
             status=assignment.status.value,

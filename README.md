@@ -212,13 +212,32 @@ brigade web --host 127.0.0.1 --port 8080
 Operational setup, bounded-smoke, rollback, disable-switch, limit, and audit procedures live in
 `docs/CONNECTORS_RUNBOOK.md`.
 
+For a host-native application with only support services containerized, follow
+`docs/ONBOARDING-DEDICATED-SERVER.md`; it uses `/srv/openbrigade` for persistent
+data and copied systemd unit files rather than the all-container live harness.
+
+Telegram supports either local long polling (recommended) or a public HTTPS
+webhook. Google Chat remains webhook-only.
+
 Live webhook routes:
 
 - `POST /api/connectors/telegram/webhook`
 - `POST /api/connectors/google-chat/webhook`
 
-Telegram setup follows the BotFather webhook-secret pattern. Keep the bot token and webhook secret
-in `.env`, then register the public HTTPS route with Telegram:
+For local deployments, use Telegram long polling. The orchestrator calls
+`getUpdates`, retains a Redis-backed update cursor, and clears any prior
+Telegram webhook during startup, so it does not need public ingress. Do not
+run another poller, such as OpenClaw, with the same bot token.
+
+```bash
+BRIGADE_TELEGRAM_BOT_TOKEN=<botfather-token>
+BRIGADE_TELEGRAM_POLLING_ENABLED=true
+BRIGADE_TELEGRAM_WEBHOOK_ENABLED=false
+BRIGADE_TELEGRAM_DEFAULT_AGENT=sage
+```
+
+Webhook mode remains available for public deployments. Keep the bot token and
+webhook secret in `.env`, then register the public HTTPS route with Telegram:
 
 ```bash
 BRIGADE_TELEGRAM_WEBHOOK_ENABLED=true

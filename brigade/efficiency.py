@@ -14,6 +14,7 @@ import hashlib
 import logging
 import re
 import statistics
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -160,11 +161,13 @@ def materialize_due_recurrences(
     store: StateStore,
     *,
     now: datetime | None = None,
+    executive_executor: Callable[[dict[str, Any], str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Turn due recurrences into queued assignments exactly once per due slot,
     then advance ``next_due_at`` past now."""
     now = now or utc_now()
     materialized: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     for recurrence in store.recurrences(enabled=True):
         next_due_at = str(recurrence.get("next_due_at") or "")
@@ -174,12 +177,45 @@ def materialize_due_recurrences(
             continue
         if due > now:
             continue
-        interval_seconds = int(recurrence.get("interval_seconds") or 0)
-        if interval_seconds <= 0:
+        if not _has_valid_schedule(recurrence):
             continue
         recurrence_id = str(recurrence.get("recurrence_id"))
         key = recurrence_idempotency_key(recurrence_id, next_due_at)
         template = recurrence.get("template") or {}
+        if template.get("target_kind") == "executive":
+            entry = {
+                "recurrence_id": recurrence_id,
+                "due_at": next_due_at,
+                "idempotency_key": key,
+                "agent_id": template.get("assigned_to"),
+            }
+            if executive_executor is None:
+                deferred.append({**entry, "reason": "no_provider"})
+                continue
+            try:
+                result = executive_executor(recurrence, next_due_at, key)
+            except Exception as exc:  # keep the due slot durable for a later cycle
+                LOGGER.warning("scheduled_executive_failed", exc_info=True)
+                deferred.append({**entry, "reason": str(exc)})
+                continue
+            entry["result"] = result
+            materialized.append(entry)
+            recurrence["last_executive_result"] = result
+            _advance_recurrence(recurrence, now=now, due_at=next_due_at)
+            store.update_recurrence(recurrence)
+            events.append(
+                orchestration_event(
+                    EVENT_RECURRENCE_MATERIALIZED,
+                    f"Scheduled Executive task {recurrence_id} ran for slot {next_due_at}.",
+                    source="orchestrator_recurrence",
+                    decision="executed",
+                    trigger="recurrence_due",
+                    agent_id=str(template.get("assigned_to") or ""),
+                    idempotency_key=key,
+                    payload=entry,
+                )
+            )
+            continue
         if store.find_assignment_by_idempotency_key(key) is None:
             # Chief-first: orchestrator-created work targets the crew chief
             # managing the template's agent; the chief decomposes or delegates.
@@ -225,14 +261,38 @@ def materialize_due_recurrences(
             )
         # Advance past now even when the slot was already materialized, so a
         # missed window never double-fires.
-        advanced = next_due_at
+        _advance_recurrence(recurrence, now=now, due_at=next_due_at)
+        store.update_recurrence(recurrence)
+    return {"materialized": materialized, "deferred": deferred, "events": events}
+
+
+def _has_valid_schedule(recurrence: dict[str, Any]) -> bool:
+    if recurrence.get("cron"):
+        return True
+    return int(recurrence.get("interval_seconds") or 0) > 0
+
+
+def _advance_recurrence(
+    recurrence: dict[str, Any], *, now: datetime, due_at: str
+) -> None:
+    """Advance a durable schedule beyond now, intentionally skipping missed slots."""
+    cron = recurrence.get("cron")
+    if cron:
+        from brigade.scheduling import next_cron_due
+
+        advanced_at = parse_utc_iso(due_at)
+        advanced = next_cron_due(str(cron), advanced_at)
+        while advanced <= now:
+            advanced = next_cron_due(str(cron), advanced)
+        recurrence["next_due_at"] = advanced.isoformat()
+    else:
+        interval_seconds = int(recurrence.get("interval_seconds") or 0)
+        advanced = due_at
         while parse_utc_iso(advanced) <= now:
             advanced = add_seconds_iso(advanced, interval_seconds)
         recurrence["next_due_at"] = advanced
-        recurrence["last_materialized_at"] = next_due_at
-        recurrence["updated_at"] = now.isoformat()
-        store.update_recurrence(recurrence)
-    return {"materialized": materialized, "events": events}
+    recurrence["last_materialized_at"] = due_at
+    recurrence["updated_at"] = now.isoformat()
 
 
 EVENT_RECURRENCE_BRIEFING_DELIVERED = "recurrence_briefing_delivered"
@@ -358,10 +418,26 @@ def run_recurrence_step(
     now: datetime | None = None,
     telegram_bot_token: str | None = None,
     operator_telegram_chat_id: str | None = None,
+    provider: Any | None = None,
+    executive_max_iterations: int = 6,
+    executive_web_fetch_enabled: bool = True,
 ) -> dict[str, Any]:
     """Cycle step 5: materialize due recurrences, deliver finished briefings,
     then detect new patterns."""
-    materialization = materialize_due_recurrences(store, now=now)
+    materialization = materialize_due_recurrences(
+        store,
+        now=now,
+        executive_executor=(
+            _scheduled_executive_executor(
+                store,
+                provider,
+                max_iterations=executive_max_iterations,
+                enable_web_fetch=executive_web_fetch_enabled,
+            )
+            if provider is not None
+            else None
+        ),
+    )
     delivery = deliver_recurrence_briefings(
         store,
         telegram_bot_token=telegram_bot_token,
@@ -375,6 +451,7 @@ def run_recurrence_step(
     )
     return {
         "materialized": materialization["materialized"],
+        "deferred": materialization["deferred"],
         "delivered": delivery["delivered"],
         "proposals": detection["proposals"],
         "events": [
@@ -383,6 +460,46 @@ def run_recurrence_step(
             *detection["events"],
         ],
     }
+
+
+def _scheduled_executive_executor(
+    store: StateStore,
+    provider: Any,
+    *,
+    max_iterations: int,
+    enable_web_fetch: bool,
+) -> Callable[[dict[str, Any], str, str], dict[str, Any]]:
+    """Build a private, owner-scoped executor for scheduled Executive turns."""
+    from brigade.executive import resolve_executive_persona, run_executive_chat_turn
+
+    def execute(recurrence: dict[str, Any], due_at: str, idempotency_key: str) -> dict[str, Any]:
+        template = recurrence.get("template") or {}
+        owner = str(template.get("owner_username") or "").strip()
+        requested = str(template.get("assigned_to") or "").strip()
+        task = str(template.get("assignment") or "").strip()
+        if not owner or not requested or not task:
+            raise ValueError("scheduled Executive task is missing owner, agent, or task text")
+        persona = resolve_executive_persona(store, owner, requested)
+        thread = store.resolve_active_conversation(
+            owner, persona.persona_id, title=persona.display_name
+        )
+        return run_executive_chat_turn(
+            store,
+            thread=thread,
+            persona=persona,
+            operator=owner,
+            content=(
+                "Scheduled task configured by the operator. Complete this task now; "
+                "do not treat it as a new user confirmation for mutations.\n\n"
+                f"Due (UTC): {due_at}\nTask: {task}"
+            ),
+            provider=provider,
+            max_iterations=max_iterations,
+            enable_web_fetch=enable_web_fetch,
+            idempotency_key=f"scheduled-executive:v1:{idempotency_key}",
+        )
+
+    return execute
 
 
 def _episode_evidence(store: StateStore, pattern: str) -> list[dict[str, Any]]:

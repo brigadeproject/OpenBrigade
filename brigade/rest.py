@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from datetime import datetime, time
 from typing import Any
 
 from brigade.memory import (
+    append_daily_memory,
     archive_stale_daily_memories,
     curate_workspace_memory,
 )
@@ -75,7 +77,10 @@ def rest_assignment_text(date_key: str) -> str:
             "archived (candidates graduate when they prove useful, archive "
             "after long disuse).",
             "3. Process up to three questions from PONDER.md, the "
-            "open-questions queue; write conclusions or sharper questions.",
+            "open-questions queue; write conclusions or sharper questions. If "
+            "there are no questions, summarize today's completed tasks and "
+            "failures in the daily memory, analyze each failure, and record "
+            "candidate remedies that could become proposals (do not enact them).",
             f"4. Write a structured report to rest/{date_key}-REST.md with "
             "sections '## Promoted', '## Pruned', '## Reflections', "
             "'## Ponderings', and '## Proposals' (each proposal a bullet "
@@ -236,6 +241,10 @@ def finalize_rest_assignment(
             store.add_proposal(proposal)
             proposals.append(proposal)
 
+    daily_review = None
+    if not _ponder_has_questions(workspace):
+        daily_review = _append_empty_ponder_daily_review(store, agent, assignment, workspace)
+
     event = orchestration_event(
         EVENT_REST_COMPLETED,
         f"Rest cycle completed for {agent.agent_id}: {report_summary}; "
@@ -250,6 +259,7 @@ def finalize_rest_assignment(
             "report": str(report_path) if report_path else None,
             "archived_episodes": len(archived),
             "proposal_ids": [item["proposal_id"] for item in proposals],
+            "daily_review": daily_review,
         },
     )
     record_orchestration_events(
@@ -262,6 +272,7 @@ def finalize_rest_assignment(
         "report": str(report_path) if report_path else None,
         "archived_episodes": archived,
         "proposals": proposals,
+        "daily_review": daily_review,
         "event": event,
     }
 
@@ -326,6 +337,117 @@ def _latest_rest_report(workspace) -> Any:
         return None
     reports = sorted(rest_dir.glob("*-REST.md"))
     return reports[-1] if reports else None
+
+
+def _ponder_has_questions(workspace) -> bool:
+    """Treat only real queue entries as questions, not the seeded instructions."""
+    for filename in ("PONDER.md", "ponder.md"):
+        path = workspace / filename
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- ") or stripped.startswith("* "):
+                return True
+            if re.match(r"^\d+[.)]\s+", stripped):
+                return True
+    return False
+
+
+def _append_empty_ponder_daily_review(
+    store: StateStore,
+    agent: Agent,
+    assignment: Assignment,
+    workspace,
+) -> dict[str, object]:
+    """Persist a bounded daily review when pondering has no operator questions.
+
+    This is deterministic so a weak rest-model response cannot erase the day's
+    outcome trail. Remedies are candidates only; proposal creation remains the
+    explicit rest-report/approval workflow.
+    """
+    date_key = _rest_date_key(assignment)
+    marker = f"rest-review:{assignment.assignment_id}"
+    memory_path = workspace / "memory" / f"{date_key}-MEMORY.md"
+    if memory_path.exists() and marker in memory_path.read_text(encoding="utf-8"):
+        return {"path": str(memory_path), "status": "already_recorded"}
+
+    completed, failures = _daily_assignment_outcomes(store, agent.agent_id, date_key)
+    task_summary = "; ".join(completed[:5]) or "none recorded"
+    failure_summary = "; ".join(failures[:3]) or "none recorded"
+    remedies = [_failure_remedy(failure) for failure in failures[:3]]
+    remedy_summary = "; ".join(remedies) or "none needed"
+    note = (
+        f"Nightly review ({marker}): completed tasks: {task_summary}; "
+        f"failures: {failure_summary}; potential solutions: {remedy_summary}."
+    )
+    path = append_daily_memory(workspace, date_key, note)
+    return {
+        "path": str(path),
+        "status": "recorded",
+        "completed": completed,
+        "failures": failures,
+        "potential_solutions": remedy_summary,
+    }
+
+
+def _rest_date_key(assignment: Assignment) -> str:
+    key = str(assignment.idempotency_key or "")
+    parts = key.split(":")
+    if len(parts) >= 4 and parts[0] == "rest" and parts[1] == "v1":
+        candidate = parts[3]
+        if len(candidate) == 8 and candidate.isdigit():
+            return candidate
+    return assignment.updated_at[:10].replace("-", "")
+
+
+def _daily_assignment_outcomes(
+    store: StateStore, agent_id: str, date_key: str
+) -> tuple[list[str], list[str]]:
+    completed: list[str] = []
+    failures: list[str] = []
+    for entry in store.assignment_history():
+        record = entry.get("record") or {}
+        if record.get("assigned_to") != agent_id:
+            continue
+        if str(entry.get("archived_at") or "").replace("-", "")[:8] != date_key:
+            continue
+        if record.get("kind") == AssignmentKind.REST.value:
+            continue
+        title = str(record.get("assignment") or "assignment").strip()
+        if entry.get("final_status") == AssignmentStatus.COMPLETE.value:
+            completed.append(title)
+        elif entry.get("failure_info") or entry.get("final_status") in {
+            AssignmentStatus.FAILED.value,
+            AssignmentStatus.ABANDONED.value,
+        }:
+            failures.append(f"{title}: {entry.get('failure_info') or entry.get('final_status')}")
+    for current in store.assignments():
+        if current.assigned_to != agent_id or current.kind == AssignmentKind.REST:
+            continue
+        if current.last_run_at and current.last_run_at.replace("-", "")[:8] == date_key:
+            if current.status == AssignmentStatus.BLOCKED or current.last_error:
+                detail = current.last_error or current.progress_summary
+                failures.append(f"{current.assignment}: {detail}")
+    return completed, failures
+
+
+def _failure_remedy(failure: str) -> str:
+    lower = failure.lower()
+    if "tool" in lower or "capabil" in lower:
+        remedy = "propose the missing tool or split the work around the unavailable capability"
+    elif "citation" in lower or "evidence" in lower or "source" in lower:
+        remedy = "retrieve supporting evidence and propose a bounded source-review subtask"
+    elif "policy projection" in lower or "permission" in lower or "approval" in lower:
+        remedy = "request the required reconciliation or operator approval"
+    elif "timeout" in lower or "provider" in lower or "unavailable" in lower:
+        remedy = "retry with backoff after provider health recovers or propose a fallback route"
+    else:
+        remedy = (
+            "inspect the blocker, then propose a retry, bounded subtasks, "
+            "or operator escalation"
+        )
+    return f"{failure} -> {remedy}"
 
 
 def _section_bullets(content: str, section: str) -> list[str]:

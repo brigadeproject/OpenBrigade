@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenBrigade web gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=brigade
+Group=brigade
+WorkingDirectory=/opt/openbrigade
+EnvironmentFile=/opt/openbrigade/.env
+ExecStart=/opt/openbrigade/.venv/bin/brigade web --host ${BRIGADE_BIND_ADDRESS} --port ${BRIGADE_WEB_PORT}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

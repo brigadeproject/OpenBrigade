@@ -151,6 +151,7 @@ ALLOWED_TRANSITIONS = {
         AssignmentStatus.ABANDONED,
     },
     AssignmentStatus.BLOCKED: {
+        AssignmentStatus.QUEUED,
         AssignmentStatus.ASSIGNED,
         AssignmentStatus.COMPLETE,
         AssignmentStatus.FAILED,
@@ -211,6 +212,7 @@ class Assignment:
     estimated_cycles: int = 1
     cycle_count: int = 0
     checkpoint_at: str | None = None
+    continuation_reason: str | None = None
     parent_assignment_id: str | None = None
     result_artifact_ids: list[str] = field(default_factory=list)
     transcript_path: str | None = None
@@ -256,6 +258,9 @@ class Assignment:
         self,
         summary: str | None = None,
         blockers: list[str] | None = None,
+        *,
+        resume_queued: bool = False,
+        continuation_reason: str | None = None,
     ) -> None:
         if self.status in TERMINAL_STATUSES:
             raise ValueError(f"cannot update terminal assignment {self.status}")
@@ -265,9 +270,8 @@ class Assignment:
         self.checkpoint_at = utc_now_iso()
         self.updated_at = self.checkpoint_at
         self.awaiting_human = False
-        self.status = (
-            AssignmentStatus.ABANDONED if self.cycle_count >= 10 else AssignmentStatus.WORKING
-        )
+        self.continuation_reason = continuation_reason
+        self.status = AssignmentStatus.QUEUED if resume_queued else AssignmentStatus.WORKING
 
     def register_failure(
         self,
@@ -282,6 +286,7 @@ class Assignment:
         self.progress_summary = error.strip()
         self.blockers = list(blockers or self.blockers)
         self.awaiting_human = awaiting_human or self.consecutive_failures >= 5
+        self.continuation_reason = None
         self.status = AssignmentStatus.BLOCKED
         self.updated_at = utc_now_iso()
         self.checkpoint_at = self.updated_at
@@ -292,6 +297,7 @@ class Assignment:
         self.blockers = []
         self.consecutive_failures = 0
         self.last_error = None
+        self.continuation_reason = None
         self.transition_to(AssignmentStatus.COMPLETE)
 
     def to_dict(self) -> dict[str, Any]:
@@ -470,6 +476,7 @@ def assignment_from_dict(item: dict[str, Any]) -> Assignment:
         estimated_cycles=item.get("estimated_cycles", 1),
         cycle_count=item.get("cycle_count", 0),
         checkpoint_at=item.get("checkpoint_at"),
+        continuation_reason=item.get("continuation_reason"),
         parent_assignment_id=item.get("parent_assignment_id"),
         result_artifact_ids=item.get("result_artifact_ids", []),
         transcript_path=item.get("transcript_path"),
@@ -608,21 +615,30 @@ def build_proposal(
 def build_recurrence(
     *,
     template: dict[str, Any],
-    interval_seconds: int,
+    interval_seconds: int | None = None,
+    cron: str | None = None,
     next_due_at: str,
     proposal_id: str | None = None,
     enabled: bool = True,
 ) -> dict[str, Any]:
     if not isinstance(template, dict) or not str(template.get("assignment") or "").strip():
         raise ValueError("recurrence template requires assignment text")
-    if interval_seconds <= 0:
+    if (interval_seconds is None) == (cron is None):
+        raise ValueError("recurrence requires exactly one of interval_seconds or cron")
+    normalized_cron = None
+    if interval_seconds is not None and interval_seconds <= 0:
         raise ValueError("recurrence interval_seconds must be positive")
+    if cron is not None:
+        from brigade.scheduling import normalize_cron
+
+        normalized_cron = normalize_cron(cron)
     _require_text(next_due_at, "recurrence next_due_at")
     now = utc_now_iso()
     return {
         "recurrence_id": str(uuid4()),
         "enabled": enabled,
-        "interval_seconds": int(interval_seconds),
+        "interval_seconds": int(interval_seconds) if interval_seconds is not None else None,
+        "cron": normalized_cron,
         "next_due_at": next_due_at,
         "template": dict(template),
         "proposal_id": proposal_id,

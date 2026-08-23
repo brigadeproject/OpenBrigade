@@ -220,6 +220,8 @@ def test_load_settings_reads_external_connection_flags(tmp_path):
             [
                 "BRIGADE_TELEGRAM_WEBHOOK_ENABLED=true",
                 "BRIGADE_TELEGRAM_WEBHOOK_SECRET=telegram-secret",
+                "BRIGADE_TELEGRAM_POLLING_ENABLED=false",
+                "BRIGADE_TELEGRAM_POLLING_TIMEOUT_SECONDS=25",
                 "BRIGADE_TELEGRAM_DEFAULT_AGENT=sage",
                 "BRIGADE_GOOGLE_CHAT_WEBHOOK_ENABLED=1",
                 "BRIGADE_GOOGLE_CHAT_SECRET=chat-secret",
@@ -237,6 +239,8 @@ def test_load_settings_reads_external_connection_flags(tmp_path):
 
     assert settings.telegram_webhook_enabled is True
     assert settings.telegram_webhook_secret == "telegram-secret"
+    assert settings.telegram_polling_enabled is False
+    assert settings.telegram_polling_timeout_seconds == 25
     assert settings.telegram_default_agent == "sage"
     assert settings.google_chat_webhook_enabled is True
     assert settings.google_chat_secret == "chat-secret"

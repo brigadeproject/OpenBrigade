@@ -19,7 +19,9 @@ from brigade.time import utc_now_iso
 _CITATION_MARKER = re.compile(r"\[\[cite:([A-Za-z0-9_.:-]+)\]\]")
 _CLAIM_MARKER = re.compile(r"\[\[(inference|operator_assertion)\]\]", re.I)
 _CITATION_REQUEST = re.compile(
-    r"\b(cite|citation|sources?|legal|law|statute|regulation|case law)\b", re.I
+    r"\b(?:cite|citation|references?)\b|\bsource\s+links?\b|"
+    r"\b(?:provide|with)\s+sources?\b",
+    re.I,
 )
 _RETRIEVED_TOOLS = {
     "web_fetch",
@@ -43,13 +45,8 @@ class CitationContext:
 
 def citation_required(message: str, observations: list[dict[str, Any]]) -> bool:
     """Citation policy is opt-in by task intent; ordinary prose remains ordinary."""
-    if _CITATION_REQUEST.search(message):
-        return True
-    return any(
-        str(item.get("tool") or "") == "web_search"
-        and str((item.get("metadata") or {}).get("intent") or "") == "legal"
-        for item in observations
-    )
+    del observations  # Retrieval alone must never silently change task intent.
+    return bool(_CITATION_REQUEST.search(message))
 
 
 def citation_retrieval_arguments(
@@ -221,24 +218,64 @@ def enforce_citation_answer(
     *,
     repair: Callable[[str], str] | None = None,
 ) -> tuple[str, CitationContext, list[dict[str, object]], list[str], bool]:
-    """Render a valid answer, retrying once only for citation-bearing work."""
+    """Render validated citations or a clearly-labelled, non-evidentiary draft.
+
+    Citation formatting is a model-output concern, not a reason to spend more
+    agent turns.  We therefore retain the operator-visible draft when evidence
+    exists, while deliberately keeping it out of the validated-citation and
+    source-fact surfaces.
+    """
     context = citation_context(store, message, observations)
     rendered, citations, errors = validate_and_render_answer(draft, context)
     if not errors:
         return rendered, context, citations, errors, False
-    if context.citations and repair is not None:
-        repaired = repair(
-            "Repair this draft into a concise answer. "
-            f"{citation_instructions(context)}\n\nDraft:\n{draft}"
+    del repair
+    if context.citations:
+        return (
+            _render_unvalidated_draft(draft, context.citations),
+            context,
+            [],
+            errors,
+            False,
         )
-        rendered, citations, errors = validate_and_render_answer(repaired, context)
-        if not errors:
-            return rendered, context, citations, errors, True
     return (
         "I cannot substantiate this citation-bearing request from the retrieved evidence. "
         "Please retrieve a relevant primary or otherwise authoritative source first.",
         context,
         [],
         errors,
-        repair is not None,
+        False,
+    )
+
+
+def citation_validation_status(context: CitationContext, errors: list[str]) -> str:
+    """Expose a stable, operator-facing citation validation outcome."""
+    if not context.required:
+        return "not_required"
+    if not errors:
+        return "validated"
+    if not context.citations:
+        return "no_retrieved_evidence"
+    return "unvalidated_draft"
+
+
+def available_citations(context: CitationContext) -> list[dict[str, object]]:
+    """Return retrieved sources without asserting that the draft cites them."""
+    return [citation.to_dict() for citation in context.citations]
+
+
+def _render_unvalidated_draft(draft: str, citations: tuple[Citation, ...]) -> str:
+    """Keep a failed draft visible without displaying fabricated footnotes."""
+    safe_draft = _CITATION_MARKER.sub("[unverified citation]", draft).strip()
+    safe_draft = _CLAIM_MARKER.sub("", safe_draft).strip()
+    sources = "\n".join(
+        f"- {render_citation(citation.to_dict())}" for citation in citations
+    )
+    return (
+        "> **Citation validation warning:** The following model draft could not be "
+        "validated against the retrieved evidence. Do not treat its claims as source-backed.\n\n"
+        "## Unvalidated draft\n\n"
+        f"{safe_draft}\n\n"
+        "## Retrieved sources\n\n"
+        f"{sources}"
     )

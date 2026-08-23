@@ -27,7 +27,7 @@ def test_assignment_rejects_invalid_transition():
         assignment.transition_to(AssignmentStatus.COMPLETE)
 
 
-def test_assignment_abandons_after_ten_incomplete_cycles():
+def test_assignment_keeps_incomplete_work_resumable_after_ten_cycles():
     assignment = Assignment(
         assignment="Long-running task",
         assigned_to="sage",
@@ -38,4 +38,4 @@ def test_assignment_abandons_after_ten_incomplete_cycles():
     for _ in range(10):
         assignment.mark_cycle_incomplete()
 
-    assert assignment.status == AssignmentStatus.ABANDONED
+    assert assignment.status == AssignmentStatus.WORKING

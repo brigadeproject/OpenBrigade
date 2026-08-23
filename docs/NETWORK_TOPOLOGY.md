@@ -2,6 +2,11 @@
 
 This document describes the expected local network shape for v0.9.
 
+For Dedicated Server mode, `compose.dedicated.yml` runs only support services on
+loopback ports while host-native systemd units connect through those ports. The
+web gateway remains loopback-only and authenticated by default; a LAN bind must
+name a specific host address and have an accompanying firewall rule.
+
 ## Compose Services
 
 The root `docker-compose.yml` defines the live stack under the `app` profile:

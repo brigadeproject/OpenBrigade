@@ -1,0 +1,80 @@
+name: brigade-dedicated
+
+# Dedicated-server mode runs OpenBrigade itself from the host. Only supporting
+# datastores and the isolated browser worker live in containers.
+services:
+  brigade_postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${BRIGADE_POSTGRES_DB:-brigade}
+      POSTGRES_USER: ${BRIGADE_POSTGRES_USER:-brigade}
+      POSTGRES_PASSWORD: ${BRIGADE_POSTGRES_PASSWORD:?set BRIGADE_POSTGRES_PASSWORD in .env}
+    ports:
+      - "${BRIGADE_SUPPORT_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - ${BRIGADE_SERVICE_DATA_ROOT:-/srv/openbrigade/services}/postgres:/var/lib/postgresql/data
+    networks: [brigade_dedicated_net]
+
+  brigade_redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${BRIGADE_SUPPORT_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_REDIS_PORT:-56379}:6379"
+    volumes:
+      - ${BRIGADE_SERVICE_DATA_ROOT:-/srv/openbrigade/services}/redis:/data
+    networks: [brigade_dedicated_net]
+
+  brigade_qdrant:
+    image: qdrant/qdrant:v1.14.1
+    restart: unless-stopped
+    ports:
+      - "${BRIGADE_SUPPORT_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_QDRANT_HTTP_PORT:-56333}:6333"
+      - "${BRIGADE_SUPPORT_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_QDRANT_GRPC_PORT:-56334}:6334"
+    volumes:
+      - ${BRIGADE_SERVICE_DATA_ROOT:-/srv/openbrigade/services}/qdrant:/qdrant/storage
+    networks: [brigade_dedicated_net]
+
+  brigade_neo4j:
+    image: neo4j:5-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${BRIGADE_NEO4J_AUTH:?set BRIGADE_NEO4J_AUTH in .env}
+      NEO4J_server_memory_heap_initial__size: ${BRIGADE_NEO4J_HEAP_INITIAL:-512m}
+      NEO4J_server_memory_heap_max__size: ${BRIGADE_NEO4J_HEAP_MAX:-1G}
+    ports:
+      - "${BRIGADE_SUPPORT_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_NEO4J_HTTP_PORT:-57474}:7474"
+      - "${BRIGADE_SUPPORT_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_NEO4J_BOLT_PORT:-57687}:7687"
+    volumes:
+      - ${BRIGADE_SERVICE_DATA_ROOT:-/srv/openbrigade/services}/neo4j-data:/data
+      - ${BRIGADE_SERVICE_DATA_ROOT:-/srv/openbrigade/services}/neo4j-logs:/logs
+    networks: [brigade_dedicated_net]
+
+  brigade_searxng:
+    image: searxng/searxng:2026.7.28-c01178d03
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: ${BRIGADE_SEARXNG_PUBLIC_URL:-http://127.0.0.1:8888/}
+    ports:
+      - "${BRIGADE_SUPPORT_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_SEARXNG_PORT:-58888}:8080"
+    volumes:
+      - ./ops/searxng-settings.yml:/etc/searxng/settings.yml:ro
+    networks: [brigade_dedicated_net]
+
+  brigade_browser:
+    build:
+      context: .
+      dockerfile: ops/browser-worker.Dockerfile
+    image: openbrigade/browser-worker:local
+    restart: unless-stopped
+    command: ["python3", "/app/ops/browser_worker.py", "--host", "0.0.0.0", "--port", "8765", "--profile-root", "/data/browser_profiles"]
+    ports:
+      - "${BRIGADE_SUPPORT_BIND_ADDRESS:-127.0.0.1}:${BRIGADE_BROWSER_WORKER_PORT:-58765}:8765"
+    volumes:
+      - ${BRIGADE_SERVICE_DATA_ROOT:-/srv/openbrigade/services}/browser-profiles:/data/browser_profiles
+    networks: [brigade_dedicated_net]
+
+networks:
+  brigade_dedicated_net:
+    name: brigade_dedicated_net

@@ -34,13 +34,64 @@ rate limits, and queue state.
 
 ## Telegram
 
+Choose exactly one inbound mode. Polling is recommended for a local OpenBrigade
+stack because it does not require public HTTPS ingress. Both modes preserve the
+same identity approval, audit, rate-limit, Executive-routing, and outbound
+reply behavior.
+
+### Long polling (recommended)
+
+1. Put `BRIGADE_TELEGRAM_BOT_TOKEN` and `BRIGADE_TELEGRAM_DEFAULT_AGENT` in
+   `.env`.
+2. Set `BRIGADE_TELEGRAM_POLLING_ENABLED=true` and
+   `BRIGADE_TELEGRAM_WEBHOOK_ENABLED=false`.
+3. To route approved identities to their owner Executive, set
+   `BRIGADE_CONNECTOR_EXECUTIVE_CHAT_ENABLED=true`.
+4. Rebuild the app services:
+
+   ```bash
+   docker compose --env-file .env --profile app up -d --build brigade_orchestrator brigade_web
+   ```
+
+The orchestrator polls Telegram's `getUpdates` endpoint independently of its
+normal cycle cadence. It stores the highest processed update ID in Redis and
+calls `deleteWebhook` on startup, retaining pending Telegram updates. Only one
+process may poll a bot token; do not leave an OpenClaw or other Telegram
+polling process running with the same token.
+
+### Webhook (public HTTPS alternative)
+
 Setup:
 
 1. Create a bot with BotFather.
 2. Put `BRIGADE_TELEGRAM_BOT_TOKEN`, `BRIGADE_TELEGRAM_WEBHOOK_SECRET`, and
    `BRIGADE_TELEGRAM_DEFAULT_AGENT` in `.env`.
 3. Set `BRIGADE_TELEGRAM_WEBHOOK_ENABLED=true`.
-4. Register the HTTPS webhook with Telegram using the shared secret.
+4. Keep `BRIGADE_BIND_ADDRESS=127.0.0.1`. Configure an operator-managed,
+   stable public HTTPS reverse proxy or tunnel that forwards only
+   `POST /api/connectors/telegram/webhook` to
+   `http://127.0.0.1:${BRIGADE_WEB_PORT:-58080}/api/connectors/telegram/webhook`.
+   It must preserve `X-Telegram-Bot-Api-Secret-Token`; do not log request
+   bodies or that header.
+5. Rebuild the app services so Compose forwards the connector settings into
+   `brigade_web`:
+
+   ```bash
+   docker compose --env-file .env --profile app up -d --build brigade_web brigade_orchestrator
+   ```
+
+6. Register the public HTTPS route with Telegram using the shared secret:
+
+   ```bash
+   curl --fail-with-body "https://api.telegram.org/bot${BRIGADE_TELEGRAM_BOT_TOKEN}/setWebhook" \
+     --data-urlencode "url=https://<public-host>/api/connectors/telegram/webhook" \
+     --data-urlencode "secret_token=${BRIGADE_TELEGRAM_WEBHOOK_SECRET}" \
+     --data-urlencode 'allowed_updates=["message"]'
+   curl --fail-with-body "https://api.telegram.org/bot${BRIGADE_TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+   ```
+
+The app profile intentionally publishes the web service on loopback only.
+Telegram cannot connect until the public HTTPS ingress in step 4 is active.
 
 Bounded live smoke:
 
@@ -54,8 +105,10 @@ Outbound behavior: replies are sent only through the configured Telegram bot tok
 missing, the route rejects live outbound behavior and records the failure path instead of silently
 sending.
 
-Rollback: set `BRIGADE_TELEGRAM_WEBHOOK_ENABLED=false`, remove the public webhook at Telegram, and
-remove the bot token from `.env`.
+Rollback: set `BRIGADE_TELEGRAM_POLLING_ENABLED=false` or
+`BRIGADE_TELEGRAM_WEBHOOK_ENABLED=false`, as applicable. For webhook mode,
+remove the public webhook at Telegram; then remove the bot token from `.env`
+when the connector is no longer needed.
 
 ## Google Chat
 

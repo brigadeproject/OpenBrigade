@@ -45,7 +45,12 @@ from brigade.executive import (
 )
 from brigade.export import export_training_data
 from brigade.finance import build_model_routing_decision
-from brigade.governance import ensure_policy_projections_current
+from brigade.governance import (
+    accept_policy_projections,
+    ensure_policy_projections_current,
+    policy_projection_diff,
+    workspace_governing_paths,
+)
 from brigade.health import HealthCheck, check_configured_datastores
 from brigade.knowledge import ingest_local_document, store_ingest_result
 from brigade.logging import configure_json_logging
@@ -121,6 +126,7 @@ from brigade.services import (
     build_settings_payload,
     cancel_assignment,
     cancel_assignments_where,
+    create_scheduled_task,
     decide_proposal,
     delegate_from_crew_chief,
     reissue_assignment,
@@ -129,6 +135,7 @@ from brigade.services import (
     set_runtime_overrides,
 )
 from brigade.store import RedisRuntimeClient, StateStore, open_state_store
+from brigade.telegram_polling import TelegramPollingWorker
 from brigade.time import utc_now_iso
 from brigade.tui import (
     VIEWS,
@@ -372,6 +379,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Create any missing default workspace files before validating.",
     )
+    agent_policy = agent_sub.add_parser(
+        "policy", help="Inspect or explicitly accept governed workspace-file projections."
+    )
+    agent_policy_sub = agent_policy.add_subparsers(dest="agent_policy_command", required=True)
+    agent_policy_diff = agent_policy_sub.add_parser("diff")
+    agent_policy_diff.add_argument("id")
+    agent_policy_accept = agent_policy_sub.add_parser("accept")
+    agent_policy_accept.add_argument("id")
+    agent_policy_accept.add_argument("--path", action="append", default=[])
+    agent_policy_accept.add_argument("--all", action="store_true")
     agent_run = agent_sub.add_parser("run")
     agent_run.add_argument("--id", required=True)
     _add_provider_args(agent_run)
@@ -694,6 +711,49 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List what would be cancelled without changing anything.",
     )
+
+    schedule = subcommands.add_parser(
+        "schedule",
+        help="Create and manage durable UTC timed tasks for agents and Executives.",
+    )
+    schedule_sub = schedule.add_subparsers(
+        dest="schedule_command", required=True, metavar="command"
+    )
+    schedule_create = schedule_sub.add_parser("create", help="Create one timed task.")
+    schedule_create.add_argument("--agent", required=True, help="Worker or Executive agent id.")
+    schedule_create.add_argument("--assignment", required=True, help="Task text to run when due.")
+    cadence = schedule_create.add_mutually_exclusive_group(required=True)
+    cadence.add_argument(
+        "--cron", help="Five-field UTC cron, e.g. '0 9 * * 1-5' or @daily."
+    )
+    cadence.add_argument(
+        "--every-seconds",
+        type=int,
+        dest="interval_seconds",
+        help="Fixed recurrence interval. Minimum: 300.",
+    )
+    schedule_create.add_argument(
+        "--start-at",
+        dest="next_due_at",
+        default=None,
+        help="Optional first due time as UTC ISO timestamp.",
+    )
+    schedule_create.add_argument(
+        "--label",
+        default=None,
+        help="Optional human-readable schedule label.",
+    )
+    schedule_create.add_argument(
+        "--priority", choices=[item.value for item in Priority], default=Priority.NORMAL.value
+    )
+    schedule_sub.add_parser("list", help="List durable schedules.")
+    for command, enabled, help_text in (
+        ("pause", False, "Pause a timed task."),
+        ("resume", True, "Resume a timed task."),
+    ):
+        item = schedule_sub.add_parser(command, help=help_text)
+        item.add_argument("--id", required=True, help="Schedule/recurrence id.")
+        item.set_defaults(schedule_enabled=enabled)
 
     status = subcommands.add_parser("status")
     status.add_argument("--json", action="store_true")
@@ -1179,7 +1239,13 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="command",
     )
-    orchestrator_sub.add_parser("cycle", help="Run one orchestrator cycle.")
+    cycle = orchestrator_sub.add_parser("cycle", help="Run one orchestrator cycle.")
+    cycle.add_argument(
+        "--run-scheduled",
+        action="store_true",
+        help="Execute due Executive schedules with the configured model provider.",
+    )
+    _add_provider_args(cycle)
     stalled = orchestrator_sub.add_parser(
         "propose-stalled-goals",
         help="Create queued assignments for goals that have no active work.",
@@ -1684,6 +1750,38 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "agent" and args.agent_command == "policy":
+        agent = _find_agent(store, args.id)
+        if agent is None:
+            print(f"unknown agent: {args.id}", file=sys.stderr)
+            return 1
+        if args.agent_policy_command == "diff":
+            _require_permission(store, settings, actor, "status:read")
+            print(json.dumps(policy_projection_diff(store, agent), indent=2, sort_keys=True))
+            return 0
+        _require_permission(store, settings, actor, "agent:write")
+        if args.all and args.path:
+            print("use either --all or --path, not both", file=sys.stderr)
+            return 1
+        if not args.all and not args.path:
+            print("policy accept requires --path or --all", file=sys.stderr)
+            return 1
+        workspace = settings.data_dir / agent.workspace_path
+        paths = workspace_governing_paths(agent, workspace) if args.all else args.path
+        try:
+            accepted = accept_policy_projections(
+                store,
+                agent,
+                paths=paths,
+                actor=actor.user.username if actor.user else "cli",
+                source="operator:cli-policy-accept",
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(accepted, indent=2, sort_keys=True))
         return 0
 
     if args.command == "agent" and args.agent_command == "list":
@@ -2512,10 +2610,48 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(graph, indent=2, sort_keys=True))
         return 0
 
+    if args.command == "schedule":
+        if args.schedule_command == "list":
+            _require_permission(store, settings, actor, "task:read")
+            print(json.dumps(store.recurrences(), indent=2, sort_keys=True))
+            return 0
+        user = _require_permission(store, settings, actor, "task:write")
+        if args.schedule_command == "create":
+            schedule = create_scheduled_task(
+                store,
+                agent_id=args.agent,
+                assignment=args.assignment,
+                owner_username=user.username if user else None,
+                cron=args.cron,
+                interval_seconds=args.interval_seconds,
+                next_due_at=args.next_due_at,
+                priority=args.priority,
+                label=args.label,
+            )
+            print(json.dumps(schedule, indent=2, sort_keys=True))
+            return 0
+        recurrence = next(
+            (item for item in store.recurrences() if item.get("recurrence_id") == args.id),
+            None,
+        )
+        if recurrence is None:
+            raise ValueError(f"unknown schedule: {args.id}")
+        target = str((recurrence.get("template") or {}).get("assigned_to") or "")
+        agent = next((item for item in store.agents() if item.agent_id == target), None)
+        if agent is not None and agent.role == AGENT_ROLE_EXECUTIVE:
+            if user is None or agent.owner_username != user.username:
+                raise PermissionError("only the owning user may change an Executive schedule")
+        recurrence["enabled"] = bool(args.schedule_enabled)
+        recurrence["updated_at"] = utc_now_iso()
+        store.update_recurrence(recurrence)
+        print(json.dumps(recurrence, indent=2, sort_keys=True))
+        return 0
+
     if args.command == "orchestrator" and args.orchestrator_command == "cycle":
         _require_permission(store, settings, actor, "orchestrator:write")
         result = run_full_cycle(
             store,
+            provider=_provider_from_args(args, settings) if args.run_scheduled else None,
             config=OrchestrationConfig.from_settings(settings).with_overrides(
                 store.runtime_overrides()
             ),
@@ -2569,35 +2705,46 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 signal.signal(signum, _request_drain)
             except ValueError:  # not the main thread (tests)
                 break
-        while (max_cycles is None or completed < max_cycles) and not shutdown.is_set():
-            cycle_config = OrchestrationConfig.from_settings(settings).with_overrides(
-                store.runtime_overrides()
-            )
-            run_full_cycle(
-                store,
-                provider=provider,
-                config=cycle_config,
-            )
-            if not args.no_run_agents and not shutdown.is_set():
-                agent_results.extend(
-                    run_managed_agents(
-                        store,
-                        provider,
-                        provider_factory=provider_factory,
-                        fallback_provider=provider if provider_factory else None,
-                    )
+        telegram_poller = (
+            TelegramPollingWorker(settings, store, stop_event=shutdown)
+            if settings.telegram_polling_enabled
+            else None
+        )
+        if telegram_poller:
+            telegram_poller.start()
+        try:
+            while (max_cycles is None or completed < max_cycles) and not shutdown.is_set():
+                cycle_config = OrchestrationConfig.from_settings(settings).with_overrides(
+                    store.runtime_overrides()
                 )
-            completed += 1
-            if max_cycles is not None and completed >= max_cycles:
-                break
-            # Event.wait wakes immediately on SIGTERM, unlike time.sleep.
-            # Re-read the cadence each cycle so a runtime override from the
-            # GUI takes effect without a restart (explicit --sleep-seconds
-            # still wins).
-            if args.sleep_seconds is None:
-                sleep_seconds = cycle_config.cadence_seconds
-            if shutdown.wait(sleep_seconds):
-                break
+                run_full_cycle(
+                    store,
+                    provider=provider,
+                    config=cycle_config,
+                )
+                if not args.no_run_agents and not shutdown.is_set():
+                    agent_results.extend(
+                        run_managed_agents(
+                            store,
+                            provider,
+                            provider_factory=provider_factory,
+                            fallback_provider=provider if provider_factory else None,
+                        )
+                    )
+                completed += 1
+                if max_cycles is not None and completed >= max_cycles:
+                    break
+                # Event.wait wakes immediately on SIGTERM, unlike time.sleep.
+                # Re-read the cadence each cycle so a runtime override from the
+                # GUI takes effect without a restart (explicit --sleep-seconds
+                # still wins).
+                if args.sleep_seconds is None:
+                    sleep_seconds = cycle_config.cadence_seconds
+                if shutdown.wait(sleep_seconds):
+                    break
+        finally:
+            if telegram_poller:
+                telegram_poller.stop()
         print(
             json.dumps(
                 {

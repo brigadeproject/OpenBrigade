@@ -30,6 +30,7 @@ from brigade.prompt_floors import (
 from brigade.providers import ModelProvider
 from brigade.runner import _acquire_local_inference_lock
 from brigade.schemas import (
+    AGENT_ROLE_EXECUTIVE,
     TERMINAL_STATUSES,
     Assignment,
     AssignmentKind,
@@ -43,7 +44,7 @@ from brigade.schemas import (
     extract_json_object,
 )
 from brigade.store import StateStore
-from brigade.time import parse_utc_iso, utc_now_iso
+from brigade.time import parse_utc_iso, utc_now, utc_now_iso
 from brigade.workspace import write_heartbeat_assignment
 
 LOGGER = logging.getLogger("brigade.services")
@@ -1478,7 +1479,8 @@ def reissue_assignment(
     """Reset a blocked assignment's failure state and re-dispatch it.
 
     Clears ``consecutive_failures``/blockers/``awaiting_human`` and transitions
-    ``BLOCKED -> ASSIGNED`` (re-queued for its owner) with a fresh heartbeat.
+    ``BLOCKED -> ASSIGNED`` when the agent is idle.  A busy agent receives the
+    work as queued instead, preserving its active heartbeat.
     """
     target = store.find_assignment(assignment_id)
     if target is None:
@@ -1494,9 +1496,22 @@ def reissue_assignment(
     target.awaiting_human = False
     target.checkpoint_at = None
     target.progress_summary = f"reissued by {by}"
-    target.transition_to(AssignmentStatus.ASSIGNED)
+    active = next(
+        (
+            item
+            for item in store.assignments()
+            if item.assignment_id != target.assignment_id
+            and item.assigned_to == target.assigned_to
+            and item.status in {AssignmentStatus.ASSIGNED, AssignmentStatus.WORKING}
+        ),
+        None,
+    )
+    target.transition_to(AssignmentStatus.QUEUED if active else AssignmentStatus.ASSIGNED)
+    if active:
+        target.progress_summary = f"reissued by {by}; queued behind {active.assignment_id}"
     store.update_assignment(target)
-    _rewrite_assignment_heartbeat(store, target)
+    if not active:
+        _rewrite_assignment_heartbeat(store, target)
     LOGGER.info(
         "assignment_reissued",
         extra={
@@ -1513,7 +1528,11 @@ def reissue_assignment(
         agent_id=target.assigned_to,
         by=by,
     )
-    return {"assignment_id": assignment_id, "status": target.status.value}
+    return {
+        "assignment_id": assignment_id,
+        "status": target.status.value,
+        "queued_behind": active.assignment_id if active else None,
+    }
 
 
 def cancel_assignments_where(
@@ -1915,6 +1934,81 @@ def _apply_chief_create_assignment(
 MIN_RECURRENCE_INTERVAL_SECONDS = 300
 
 
+def create_scheduled_task(
+    store: StateStore,
+    *,
+    agent_id: str,
+    assignment: str,
+    owner_username: str | None,
+    cron: str | None = None,
+    interval_seconds: int | None = None,
+    next_due_at: str | None = None,
+    priority: str = Priority.NORMAL.value,
+    label: str | None = None,
+) -> dict[str, Any]:
+    """Create a durable UTC schedule for a worker or its owning Executive.
+
+    An Executive is intentionally not converted into a mission assignment.
+    Its recurrence is later executed as a private turn in the owner's existing
+    Executive thread, with the same confirmation boundary as normal chat.
+    """
+    from brigade.scheduling import next_cron_due
+    from brigade.schemas import build_recurrence
+    from brigade.time import add_seconds_iso
+
+    text = str(assignment or "").strip()
+    if not text:
+        raise ValueError("scheduled task assignment is required")
+    target = next((item for item in store.agents() if item.agent_id == agent_id), None)
+    if target is None:
+        raise ValueError(f"unknown agent: {agent_id}")
+    try:
+        resolved_priority = Priority(str(priority).lower()).value
+    except ValueError as exc:
+        raise ValueError(f"invalid scheduled task priority: {priority}") from exc
+    if interval_seconds is not None:
+        try:
+            interval_seconds = int(interval_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("scheduled interval_seconds must be an integer") from exc
+        if interval_seconds < MIN_RECURRENCE_INTERVAL_SECONDS:
+            raise ValueError(
+                f"scheduled interval_seconds must be at least {MIN_RECURRENCE_INTERVAL_SECONDS}"
+            )
+    if next_due_at:
+        try:
+            due = parse_utc_iso(next_due_at)
+        except ValueError as exc:
+            raise ValueError("scheduled next_due_at is not a UTC ISO timestamp") from exc
+        due_at = due.isoformat()
+    elif cron:
+        due_at = next_cron_due(cron, utc_now()).isoformat()
+    else:
+        due_at = add_seconds_iso(utc_now_iso(), int(interval_seconds or 0))
+    template: dict[str, Any] = {
+        "assignment": text,
+        "assigned_to": target.agent_id,
+        "priority": resolved_priority,
+    }
+    if label:
+        template["label"] = str(label).strip()
+    if target.role == AGENT_ROLE_EXECUTIVE:
+        if not owner_username or target.owner_username != owner_username:
+            raise ValueError(
+                "scheduled Executive tasks may only be created by that Executive's owner"
+            )
+        template["target_kind"] = "executive"
+        template["owner_username"] = owner_username
+    recurrence = build_recurrence(
+        template=template,
+        interval_seconds=interval_seconds,
+        cron=cron,
+        next_due_at=due_at,
+    )
+    persisted = store.add_recurrence(recurrence)
+    return dict(persisted)
+
+
 def _apply_chief_create_recurrence(
     store: StateStore,
     action: dict[str, Any],
@@ -1927,6 +2021,7 @@ def _apply_chief_create_recurrence(
     """Operator-confirmed scheduled job. The recurrence engine (efficiency.py)
     materializes the template each due slot; when ``deliver_briefing`` is set
     the finished output is posted back into this conversation's thread."""
+    from brigade.scheduling import next_cron_due
     from brigade.schemas import build_recurrence
     from brigade.time import add_seconds_iso
 
@@ -1939,15 +2034,21 @@ def _apply_chief_create_recurrence(
         raise ValueError(f"create_recurrence targets unknown agent {agent_id}")
     if managed is not None and resolved not in managed:
         raise ValueError(f"create_recurrence targets {resolved}, who is not on your team")
-    try:
-        interval_seconds = int(action.get("interval_seconds") or 0)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("create_recurrence interval_seconds must be an integer") from exc
-    if interval_seconds < MIN_RECURRENCE_INTERVAL_SECONDS:
-        raise ValueError(
-            "create_recurrence interval_seconds must be at least "
-            f"{MIN_RECURRENCE_INTERVAL_SECONDS} (got {interval_seconds})"
-        )
+    cron = str(action.get("cron") or "").strip() or None
+    raw_interval = action.get("interval_seconds")
+    if cron and raw_interval not in (None, "", 0, "0"):
+        raise ValueError("create_recurrence accepts cron or interval_seconds, not both")
+    interval_seconds: int | None = None
+    if not cron:
+        try:
+            interval_seconds = int(raw_interval or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("create_recurrence interval_seconds must be an integer") from exc
+        if interval_seconds < MIN_RECURRENCE_INTERVAL_SECONDS:
+            raise ValueError(
+                "create_recurrence interval_seconds must be at least "
+                f"{MIN_RECURRENCE_INTERVAL_SECONDS} (got {interval_seconds})"
+            )
     next_due_at = str(action.get("next_due_at") or "").strip()
     if next_due_at:
         try:
@@ -1957,7 +2058,11 @@ def _apply_chief_create_recurrence(
                 f"create_recurrence next_due_at is not a UTC ISO timestamp: {next_due_at}"
             ) from exc
     else:
-        next_due_at = add_seconds_iso(utc_now_iso(), interval_seconds)
+        next_due_at = (
+            next_cron_due(cron, utc_now()).isoformat()
+            if cron
+            else add_seconds_iso(utc_now_iso(), int(interval_seconds or 0))
+        )
     template: dict[str, Any] = {
         "assignment": assignment_text,
         "assigned_to": resolved,
@@ -1972,6 +2077,7 @@ def _apply_chief_create_recurrence(
     recurrence = build_recurrence(
         template=template,
         interval_seconds=interval_seconds,
+        cron=cron,
         next_due_at=next_due_at,
     )
     persisted = store.add_recurrence(recurrence)
@@ -1980,6 +2086,7 @@ def _apply_chief_create_recurrence(
         "recurrence_id": persisted.get("recurrence_id"),
         "agent_id": resolved,
         "interval_seconds": interval_seconds,
+        "cron": cron,
         "next_due_at": next_due_at,
         "delivers_briefing": "deliver_to" in template,
     }
@@ -2504,6 +2611,8 @@ def build_settings_payload(
         "gemini_configured": bool(settings.gemini_api_key),
         "gemini_api_key": _redacted(settings.gemini_api_key),
         "telegram_webhook_enabled": settings.telegram_webhook_enabled,
+        "telegram_polling_enabled": settings.telegram_polling_enabled,
+        "telegram_polling_timeout_seconds": settings.telegram_polling_timeout_seconds,
         "telegram_configured": bool(settings.telegram_bot_token),
         "telegram_bot_token": _redacted(settings.telegram_bot_token),
         "telegram_webhook_secret": _redacted(settings.telegram_webhook_secret),

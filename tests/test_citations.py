@@ -38,12 +38,21 @@ def test_plain_prose_is_not_a_citation_bearing_request():
     )
 
 
+def test_incidental_legal_or_source_language_is_not_citation_bearing():
+    for message in (
+        "Draft a legal-risk plan without citations.",
+        "Explain the source of this deployment error.",
+        "Search for a law and summarize the options.",
+    ):
+        assert not citation_required(message, [])
+
+
 def test_citation_bearing_retrieval_retains_the_original_source():
     assert citation_retrieval_arguments(
-        "Give a legal answer", [], "web_fetch", {"url": "https://example.com"}
+        "Provide sources for this answer", [], "web_fetch", {"url": "https://example.com"}
     ) == {"url": "https://example.com", "save_to_knowledge": True}
     assert citation_retrieval_arguments(
-        "Give a legal answer", [], "web_search", {"query": "statute"}
+        "Provide sources for this answer", [], "web_search", {"query": "statute"}
     ) == {"query": "statute"}
 
 
@@ -55,14 +64,14 @@ def test_citation_bearing_answers_reject_missing_or_invented_sources():
     assert "unsupplied" in invented[-1]
 
 
-def test_failed_repair_returns_transparent_insufficient_evidence_not_uncited_draft():
+def test_failed_citation_format_returns_labelled_draft_and_retrieved_sources():
     class Store:
         def knowledge_documents(self):
             return []
 
     result, context, citations, errors, repaired = enforce_citation_answer(
         Store(),
-        "Give a legal citation",
+        "Provide sources for this answer",
         [
             {
                 "tool": "web_fetch",
@@ -73,14 +82,15 @@ def test_failed_repair_returns_transparent_insufficient_evidence_not_uncited_dra
             }
         ],
         "An uncited answer",
-        repair=lambda prompt: "Still uncited",
     )
 
     assert context.required and context.citations
     assert citations == []
     assert errors == ["citation-bearing answer has no citation markers"]
-    assert repaired is True
-    assert result.startswith("I cannot substantiate")
+    assert repaired is False
+    assert "Citation validation warning" in result
+    assert "An uncited answer" in result
+    assert "Retrieved sources" in result
 
 
 def test_citation_bearing_answer_renders_stable_footnote():

@@ -271,6 +271,20 @@ The orchestrator watches for repetitive work and proposes converting it into sch
 - **Materialization**: cycle step 5 turns due recurrences into queued assignments, exactly once per
   due slot (`recurrence:v1:<id>:<next_due_at>`), then advances the due time.
 
+### Timed tasks
+
+Operators can create durable timed tasks directly with `brigade schedule create`.
+Use either a fixed `--every-seconds` interval or a five-field UTC `--cron`
+expression (for example, `0 9 * * 1-5`; macros such as `@daily` are accepted).
+`brigade schedule list`, `pause`, and `resume` expose the persisted schedule
+state. The orchestrator is the scheduler: a due task is picked up on the next
+cycle, including after a restart; missed slots are intentionally skipped rather
+than replayed in a burst.
+
+An Executive schedule is owner-scoped. Its due task runs as a private turn in
+that owner's Executive conversation, not as a mission assignment. Any mutation
+the Executive proposes still follows the normal explicit-confirmation boundary.
+
 Rest-cycle `[efficiency]` proposals enter the same proposal queue, so agents' own observations
 about repetitive work flow through the identical approval path.
 

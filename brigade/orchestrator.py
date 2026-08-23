@@ -139,6 +139,9 @@ class OrchestrationConfig:
     auto_recover_enabled: bool = True
     max_auto_reissue: int = 2
     duplicate_reconciliation_enabled: bool = True
+    executive_enabled: bool = True
+    executive_max_iterations: int = 6
+    executive_web_fetch_enabled: bool = True
     telegram_bot_token: str | None = None
     operator_telegram_chat_id: str | None = None
 
@@ -168,6 +171,9 @@ class OrchestrationConfig:
             auto_recover_enabled=settings.auto_recover_enabled,
             max_auto_reissue=settings.max_auto_reissue,
             duplicate_reconciliation_enabled=settings.duplicate_reconciliation_enabled,
+            executive_enabled=settings.executive_enabled,
+            executive_max_iterations=settings.executive_max_iterations,
+            executive_web_fetch_enabled=settings.executive_web_fetch_enabled,
             telegram_bot_token=settings.telegram_bot_token,
             operator_telegram_chat_id=settings.operator_telegram_chat_id,
         )
@@ -250,6 +256,7 @@ class OrchestrationConfig:
             "auto_recover_enabled": self.auto_recover_enabled,
             "max_auto_reissue": self.max_auto_reissue,
             "duplicate_reconciliation_enabled": self.duplicate_reconciliation_enabled,
+            "executive_enabled": self.executive_enabled,
             "operator_notify_configured": bool(
                 self.telegram_bot_token and self.operator_telegram_chat_id
             ),
@@ -1109,30 +1116,11 @@ def deterministic_cycle(
         ),
     )
 
-    now = utc_now()
     busy_agents: set[str] = {
         item.assigned_to
         for item in assignments
         if item.status in {AssignmentStatus.ASSIGNED, AssignmentStatus.WORKING}
     }
-    # Blocked work counts as occupancy only while the blocker-resolution ladder is
-    # actively working it. Once a blocked task is parked for a human
-    # (``awaiting_human``) or backed off (a future ``checkpoint_at``), it must no
-    # longer pin the agent — otherwise a single stuck/escalated task wedges every
-    # other queued item for that agent indefinitely (the "all agents stuck" case).
-    blocked_agents: set[str] = {
-        item.assigned_to
-        for item in assignments
-        if item.status == AssignmentStatus.BLOCKED
-        and not item.awaiting_human
-        and not _has_future_checkpoint(item, now)
-    }
-    blocked_ids_by_agent: dict[str, set[str]] = {}
-    for item in assignments:
-        if item.status == AssignmentStatus.BLOCKED:
-            blocked_ids_by_agent.setdefault(item.assigned_to, set()).add(
-                item.assignment_id
-            )
     queued_non_rest_agents: set[str] = {
         item.assigned_to for item in queued if item.kind != AssignmentKind.REST
     }
@@ -1151,19 +1139,6 @@ def deterministic_cycle(
         if item.assigned_to in busy_agents:
             skip(item, SKIP_AGENT_BUSY)
             continue
-        if item.assigned_to in blocked_agents:
-            # A blocked task must not starve its own diagnosis: the ladder's
-            # failure-analysis child may target the same agent (no separate
-            # chief), and the blocked task itself is inert until the analysis
-            # completes — so let that one assignment through.
-            diagnoses_own_blocker = (
-                item.kind == AssignmentKind.FAILURE_ANALYSIS
-                and item.parent_assignment_id
-                in blocked_ids_by_agent.get(item.assigned_to, set())
-            )
-            if not diagnoses_own_blocker:
-                skip(item, SKIP_AGENT_BLOCKED)
-                continue
         if item.kind == AssignmentKind.REST and item.assigned_to in queued_non_rest_agents:
             item.progress_summary = "rest deferred until queued mission work is dispatched"
             skip(item, SKIP_REST_DEFERRED)
@@ -2626,6 +2601,14 @@ def run_full_cycle(
         previous_reasoning[-1].get("reasoning_id") if previous_reasoning else None
     )
     if mission is None:
+        # Timed Executive work is user-owned rather than mission-owned.  It
+        # must still run when no mission is active (for example a daily
+        # personal briefing), while ordinary recurrence assignments simply
+        # wait in the durable queue for the next mission cycle.
+        recurrence_result = _run_recurrence_step(store, config, provider=provider)
+        sub_results["recurrence"] = {
+            key: value for key, value in recurrence_result.items() if key != "events"
+        }
         outcome = classify_cycle_outcome(mission_present=False, assignments=[])
         record = build_cycle_reasoning_record(
             None,
@@ -2636,6 +2619,7 @@ def run_full_cycle(
             cycle_outcome=outcome,
             sub_results=sub_results,
             config_snapshot=config.snapshot(),
+            extra_events=recurrence_result.get("events") or [],
         )
         store.add_orchestrator_reasoning(record)
         return FullCycleResult(
@@ -2685,7 +2669,7 @@ def run_full_cycle(
     collect("intake", intake_result)
 
     # Step 5: recurrence materialization.
-    recurrence_result = _run_recurrence_step(store, config)
+    recurrence_result = _run_recurrence_step(store, config, provider=provider)
     collect("recurrence", recurrence_result)
 
     # Step 6: mission continuation and idle synthesis (chief-first, on-call aware).
@@ -2871,7 +2855,9 @@ def _run_intake_step(store: StateStore, config: OrchestrationConfig) -> dict[str
     )
 
 
-def _run_recurrence_step(store: StateStore, config: OrchestrationConfig) -> dict[str, Any]:
+def _run_recurrence_step(
+    store: StateStore, config: OrchestrationConfig, *, provider: ModelProvider | None = None
+) -> dict[str, Any]:
     # Imported here: brigade.efficiency imports orchestrator helpers at module level.
     from brigade.efficiency import run_recurrence_step
 
@@ -2881,6 +2867,9 @@ def _run_recurrence_step(store: StateStore, config: OrchestrationConfig) -> dict
         lookback_days=config.recurrence_lookback_days,
         telegram_bot_token=config.telegram_bot_token,
         operator_telegram_chat_id=config.operator_telegram_chat_id,
+        provider=provider if config.executive_enabled else None,
+        executive_max_iterations=config.executive_max_iterations,
+        executive_web_fetch_enabled=config.executive_web_fetch_enabled,
     )
 
 

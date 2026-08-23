@@ -43,7 +43,7 @@ from brigade.executive import (
     run_connector_executive_chat,
     run_executive_chat_turn,
 )
-from brigade.governance import ensure_policy_projections_current
+from brigade.governance import accept_policy_projections, ensure_policy_projections_current
 from brigade.health import check_configured_datastores, check_embedding_surface
 from brigade.knowledge_web import register_knowledge_routes
 from brigade.markdown import render_markdown_html
@@ -94,6 +94,7 @@ from brigade.services import (
     build_orchestration_payload,
     build_settings_payload,
     cancel_assignment,
+    create_scheduled_task,
     decide_proposal,
     delegate_from_crew_chief,
     get_runtime_overrides,
@@ -252,6 +253,11 @@ def create_app(
     ) -> dict[str, object]:
         if not settings.telegram_webhook_enabled:
             return {"ok": False, "status": "disabled", "provider": "telegram"}
+        if settings.telegram_polling_enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="telegram polling is enabled; webhook ingress is disabled",
+            )
         _require_live_connector_store(settings)
         if not settings.telegram_webhook_secret:
             raise HTTPException(status_code=503, detail="telegram webhook secret is not configured")
@@ -840,7 +846,20 @@ def create_app(
             )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        return {"status": "saved", "agent_id": agent_id, "filename": filename}
+        agent = next(item for item in store.agents() if item.agent_id == agent_id)
+        accepted = accept_policy_projections(
+            store,
+            agent,
+            paths=[filename],
+            actor=current.user.username if current.user else "web",
+            source="operator:web-file-update",
+        )
+        return {
+            "status": "saved",
+            "agent_id": agent_id,
+            "filename": filename,
+            "content_hash": accepted[0]["content_hash"],
+        }
 
     @app.get("/api/teams")
     async def teams(current: AuthResult = auth_dependency) -> dict[str, object]:
@@ -938,6 +957,65 @@ def create_app(
     async def tasks(current: AuthResult = auth_dependency) -> list[dict[str, object]]:
         require("task:read", current)
         return [assignment.to_dict() for assignment in store.assignments()]
+
+    @app.get("/api/schedules")
+    async def schedules(current: AuthResult = auth_dependency) -> list[dict[str, object]]:
+        user = require("task:read", current)
+        visible: list[dict[str, object]] = []
+        for recurrence in store.recurrences():
+            template = recurrence.get("template") or {}
+            if template.get("target_kind") != "executive":
+                visible.append(recurrence)
+                continue
+            if user is not None and template.get("owner_username") == user.username:
+                visible.append(recurrence)
+        return visible
+
+    @app.post("/api/schedules")
+    async def create_schedule(
+        payload: dict[str, Any], current: AuthResult = auth_dependency
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        try:
+            return create_scheduled_task(
+                store,
+                agent_id=str(payload.get("agent_id") or ""),
+                assignment=str(payload.get("assignment") or ""),
+                owner_username=user.username if user else None,
+                cron=payload.get("cron"),
+                interval_seconds=payload.get("interval_seconds"),
+                next_due_at=payload.get("next_due_at"),
+                priority=str(payload.get("priority") or "normal"),
+                label=payload.get("label"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/schedules/{recurrence_id}/enabled")
+    async def set_schedule_enabled(
+        recurrence_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("task:write", current)
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise HTTPException(status_code=400, detail="enabled must be true or false")
+        recurrence = next(
+            (item for item in store.recurrences() if item.get("recurrence_id") == recurrence_id),
+            None,
+        )
+        if recurrence is None:
+            raise HTTPException(status_code=404, detail="unknown schedule")
+        template = recurrence.get("template") or {}
+        if template.get("target_kind") == "executive" and (
+            user is None or template.get("owner_username") != user.username
+        ):
+            raise HTTPException(status_code=403, detail="not your Executive schedule")
+        recurrence["enabled"] = enabled
+        recurrence["updated_at"] = utc_now_iso()
+        store.update_recurrence(recurrence)
+        return recurrence
 
     @app.delete("/api/alerts")
     async def clear_alerts(current: AuthResult = auth_dependency) -> dict[str, object]:

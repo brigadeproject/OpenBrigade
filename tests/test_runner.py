@@ -169,11 +169,11 @@ def test_completion_claiming_existing_file_passes(tmp_path):
     assert len(provider.prompts) == 1
 
 
-def test_citation_bearing_assignment_retries_once_and_renders_evidence(tmp_path):
+def test_citation_bearing_assignment_renders_explicitly_requested_evidence(tmp_path):
     store = JsonStateStore(tmp_path / "state.json")
     _make_agent_with_assignment(tmp_path, store)
     assignment = store.assignments()[0]
-    assignment.assignment = "Prepare a legal research answer about the statute"
+    assignment.assignment = "Prepare an answer with sources about the statute"
     store.update_assignment(assignment)
     source_url = "https://uscode.house.gov/view.xhtml?section=1030"
     import hashlib
@@ -197,10 +197,7 @@ def test_citation_bearing_assignment_retries_once_and_renders_evidence(tmp_path)
             json.dumps(
                 {"status": "tool_call", "tool": "web_fetch", "arguments": {"url": source_url}}
             ),
-            json.dumps(
-                {"status": "complete", "summary": "Uncited legal conclusion", "blockers": []}
-            ),
-            json.dumps(
+                json.dumps(
                 {
                     "status": "complete",
                     "summary": f"Supported legal conclusion [[cite:{source_id}]]",
@@ -215,7 +212,6 @@ def test_citation_bearing_assignment_retries_once_and_renders_evidence(tmp_path)
     assert result.status == "complete"
     assert received == [{"url": source_url, "save_to_knowledge": True}]
     assert "[^1]: [18 USC 1030]" in result.summary
-    assert "citation-bearing summary rejected" in provider.prompts[2]
     assert store.transcripts()[-1]["citations"][0]["source_id"] == source_id
     assert store.transcripts()[-1]["claim_classes"] == [
         {"kind": "source_fact", "citation_ids": [source_id]}
@@ -427,13 +423,29 @@ def test_exhausted_cycle_ends_with_wrap_up_progress_report(tmp_path):
 
     result = run_agent_once("sage", store, provider)
 
-    assert result.status == "working"
+    assert result.status == "queued"
     assert "drafting the outline" in result.summary
     assert "budget exhausted" not in result.summary
     assert len(provider.prompts) == MAX_AGENT_ITERATIONS + 1
     assert "TOOL BUDGET EXHAUSTED" in provider.prompts[-1]
     # the model's report becomes the durable progress summary for the next cycle
-    assert "drafting the outline" in store.assignments()[0].progress_summary
+    queued = store.assignments()[0]
+    assert "drafting the outline" in queued.progress_summary
+    assert queued.continuation_reason == "tool_budget_exhausted"
+
+    queued.transition_to(queued.status.ASSIGNED)
+    store.update_assignment(queued)
+    write_heartbeat_assignment(
+        next(item for item in store.agents() if item.agent_id == "sage"),
+        queued,
+        tmp_path,
+    )
+    resumed = _SequencedProvider(
+        [json.dumps({"status": "complete", "summary": "Finished the outline", "blockers": []})]
+    )
+    resumed_result = run_agent_once("sage", store, resumed)
+    assert resumed_result.status == "complete"
+    assert "CONTINUATION CHECKPOINT" in resumed.prompts[0]
 
 
 def test_wrap_up_tool_call_falls_back_to_observation_summary(tmp_path):
@@ -444,7 +456,7 @@ def test_wrap_up_tool_call_falls_back_to_observation_summary(tmp_path):
 
     result = run_agent_once("sage", store, provider)
 
-    assert result.status == "working"
+    assert result.status == "queued"
     assert "tool iteration budget exhausted" in result.summary
     assert f"list_files x{MAX_AGENT_ITERATIONS}" in result.summary
 
@@ -453,7 +465,7 @@ def test_citation_bearing_wrap_up_cannot_bypass_validation(tmp_path):
     store = JsonStateStore(tmp_path / "state.json")
     _make_agent_with_assignment(tmp_path, store)
     assignment = store.assignments()[0]
-    assignment.assignment = "Prepare a legal research answer"
+    assignment.assignment = "Prepare a research answer with sources"
     store.update_assignment(assignment)
     registry = ToolRegistry()
     registry.register(
@@ -476,7 +488,7 @@ def test_citation_bearing_wrap_up_cannot_bypass_validation(tmp_path):
     result = run_agent_once("sage", store, provider, tool_registry=registry)
 
     assert result.status == "blocked"
-    assert "unable to substantiate" in result.summary
+    assert "Citation validation warning" in result.summary
     control_alert = store.alerts()
     assert control_alert
     assert "citation validation failed" in control_alert[0]
@@ -493,7 +505,7 @@ def test_wrap_up_completion_with_missing_files_is_downgraded(tmp_path):
 
     result = run_agent_once("sage", store, provider)
 
-    assert result.status == "working"
+    assert result.status == "queued"
     assert "completion claimed at wrap-up" in result.summary
     assert "final_report.md" in result.summary
     assert store.assignments() != []

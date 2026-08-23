@@ -76,6 +76,8 @@ class Settings:
     telegram_bot_token: str | None = None
     telegram_webhook_enabled: bool = False
     telegram_webhook_secret: str | None = None
+    telegram_polling_enabled: bool = False
+    telegram_polling_timeout_seconds: int = 30
     telegram_default_agent: str = "sage"
     telegram_allowlist: str | None = None
     operator_telegram_chat_id: str | None = None
@@ -515,6 +517,16 @@ def load_settings(
             "BRIGADE_TELEGRAM_WEBHOOK_SECRET",
             dotenv,
             config.get("telegram_webhook_secret"),
+        ),
+        telegram_polling_enabled=_env_bool(
+            "BRIGADE_TELEGRAM_POLLING_ENABLED",
+            dotenv,
+            config.get("telegram_polling_enabled", False),
+        ),
+        telegram_polling_timeout_seconds=_env_int(
+            "BRIGADE_TELEGRAM_POLLING_TIMEOUT_SECONDS",
+            dotenv,
+            config.get("telegram_polling_timeout_seconds", 30),
         ),
         telegram_default_agent=_env(
             "BRIGADE_TELEGRAM_DEFAULT_AGENT",

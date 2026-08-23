@@ -23,6 +23,7 @@ from brigade.schemas import (
     Priority,
 )
 from brigade.state import JsonStateStore
+from brigade.time import utc_now_iso
 from brigade.workspace import REQUIRED_AGENT_FILES, ensure_agent_workspace
 
 IN_WINDOW = datetime(2026, 6, 12, 3, 30, tzinfo=timezone.utc)
@@ -283,6 +284,51 @@ def test_finalizer_without_report_still_curates(tmp_path):
     assert result["report"] is None
     assert store.proposals() == []
     assert len((workspace / "MEMORY.md").read_bytes()) <= MAX_MEMORY_BYTES
+
+
+def test_empty_ponder_records_daily_task_failure_and_candidate_remedy(tmp_path):
+    store, agent, workspace, assignment = _finalizer_fixture(tmp_path)
+    date_key = utc_now_iso()[:10].replace("-", "")
+    assignment.idempotency_key = rest_idempotency_key(agent.agent_id, date_key, "window")
+    completed = Assignment(
+        assignment="Completed daily deployment check",
+        assigned_to=agent.agent_id,
+        created_by="human",
+        source="direct_command",
+    )
+    completed.transition_to(AssignmentStatus.ASSIGNED)
+    completed.mark_complete("done")
+    store.archive_assignment(completed, executive_summary="done")
+    failed = Assignment(
+        assignment="Repair unavailable reporting tool",
+        assigned_to=agent.agent_id,
+        created_by="human",
+        source="direct_command",
+    )
+    failed.transition_to(AssignmentStatus.ASSIGNED)
+    failed.register_failure("required tool capability is unavailable")
+    store.archive_assignment(failed, executive_summary="blocked")
+
+    result = finalize_rest_assignment(store, agent, assignment)
+
+    daily_note = workspace / "memory" / f"{date_key}-MEMORY.md"
+    content = daily_note.read_text(encoding="utf-8")
+    assert result["daily_review"]["status"] == "recorded"
+    assert "Completed daily deployment check" in content
+    assert "Repair unavailable reporting tool" in content
+    assert "propose the missing tool" in content
+    # Finalization is idempotent; it must not write the nightly review twice.
+    finalize_rest_assignment(store, agent, assignment)
+    assert content == daily_note.read_text(encoding="utf-8")
+
+
+def test_ponder_question_leaves_daily_review_to_the_agent(tmp_path):
+    store, agent, workspace, assignment = _finalizer_fixture(tmp_path)
+    (workspace / "PONDER.md").write_text("# Ponder\n\n- How should retries back off?\n")
+
+    result = finalize_rest_assignment(store, agent, assignment)
+
+    assert result["daily_review"] is None
 
 
 # --- Ops Room projection ------------------------------------------------------------

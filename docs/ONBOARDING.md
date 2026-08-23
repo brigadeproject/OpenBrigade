@@ -2,7 +2,10 @@
 
 This runbook is for a fresh local/prototype OpenBrigade setup using the `brigade_`
 Docker stack. Run stateful commands through `./ops/brigade-live.sh` so writes land in
-the running container, Postgres, Redis, Qdrant, and Neo4j.
+the running container, Postgres, Redis, Qdrant, and Neo4j. For a host-native
+application with containerized support services, use
+[the Dedicated Server runbook](ONBOARDING-DEDICATED-SERVER.md) instead; do not mix
+the two command paths.
 
 ## 1. Prepare The Environment
 

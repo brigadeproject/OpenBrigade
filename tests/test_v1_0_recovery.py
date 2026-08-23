@@ -21,7 +21,6 @@ from brigade.schemas import (
     Agent,
     Assignment,
     AssignmentStatus,
-    Priority,
     extract_json_object,
 )
 from brigade.services import (
@@ -33,7 +32,6 @@ from brigade.services import (
 from brigade.state import JsonStateStore
 from brigade.tools import ToolContext, default_tool_registry
 
-
 # --- helpers ---------------------------------------------------------------------
 
 
@@ -41,7 +39,7 @@ class _FakeResp:
     def __init__(self, payload: dict) -> None:
         self._data = json.dumps(payload).encode("utf-8")
 
-    def __enter__(self) -> "_FakeResp":
+    def __enter__(self) -> _FakeResp:
         return self
 
     def __exit__(self, *exc: object) -> bool:
@@ -180,6 +178,21 @@ def test_reissue_rejects_non_blocked(tmp_path):
         reissue_assignment(store, queued.assignment_id)
 
 
+def test_reissue_queues_behind_existing_active_work(tmp_path):
+    store = _store(tmp_path)
+    blocked = _blocked(store, awaiting_human=True)
+    active = _assignment(store, agent=blocked.assigned_to)
+    active.transition_to(AssignmentStatus.ASSIGNED)
+    store.update_assignment(active)
+
+    result = reissue_assignment(store, blocked.assignment_id, by="op")
+
+    refreshed = store.find_assignment(blocked.assignment_id)
+    assert result["status"] == AssignmentStatus.QUEUED.value
+    assert result["queued_behind"] == active.assignment_id
+    assert refreshed.status == AssignmentStatus.QUEUED
+
+
 def test_assignment_relations_finds_children_and_dependents(tmp_path):
     store = _store(tmp_path)
     target = _assignment(store)
@@ -253,7 +266,7 @@ def test_awaiting_human_blocked_task_frees_agent(tmp_path):
     assert queued.assignment_id in assigned_ids
 
 
-def test_active_ladder_blocked_task_still_occupies_agent(tmp_path):
+def test_blocked_task_is_inert_for_agent_occupancy(tmp_path):
     store = _store(tmp_path)
     _blocked(store, agent="ada", awaiting_human=False)
     queued = _assignment(store, agent="ada", text="fresh work")
@@ -261,7 +274,7 @@ def test_active_ladder_blocked_task_still_occupies_agent(tmp_path):
     result = deterministic_cycle(store.assignments(), agents=store.agents())
 
     assigned_ids = {a.assignment_id for a in result.assigned}
-    assert queued.assignment_id not in assigned_ids
+    assert queued.assignment_id in assigned_ids
 
 
 # --- operator escalation (outbound + de-dupe) ------------------------------------
@@ -504,20 +517,20 @@ def test_ollama_provider_context_size_env_override(monkeypatch):
     assert captured["body"]["options"]["num_ctx"] == 8192
 
 
-def test_starvation_alert_reaches_orchestrator_chat(tmp_path):
+def test_inert_blocked_work_does_not_emit_a_false_starvation_alert(tmp_path):
     from brigade.orchestrator import run_full_cycle
     from brigade.schemas import Mission
 
     store = _store(tmp_path)
     store.set_mission(Mission("Run the prototype", [], []))
-    # ada pinned by a blocked (non-awaiting-human) assignment, with queued
-    # work behind it: the starved-dispatch shape of the Jul 4-6 deadlock.
+    # A blocked assignment no longer makes the entire agent look starved.
     _blocked(store, awaiting_human=False)
     queued = Assignment(
         assignment="Follow-up work stuck behind the blocked task",
         assigned_to="ada",
         created_by="human",
         source="direct_command",
+        dependency_ids=["missing-assignment"],
     )
     store.add_assignment(queued)
 
@@ -532,17 +545,10 @@ def test_starvation_alert_reaches_orchestrator_chat(tmp_path):
     result = run_full_cycle(store, None, config)
 
     starvation = result.sub_results["starvation"]
-    assert starvation["starved"] is True
-    assert starvation["alert"] is not None
-    assert starvation["delivery"]["channels"][0]["channel"] == "chat"
-    assert starvation["delivery"]["channels"][0]["status"] == "sent"
+    assert starvation["starved"] is False
+    assert starvation["alert"] is None
     chat = store.messages("orchestrator")
-    assert any(
-        "dispatch starvation" in message.content
-        and message.metadata.get("kind") == "operator_notification"
-        for message in chat
-    )
-    assert any("dispatch starvation" in alert for alert in store.alerts())
+    assert not any("dispatch starvation" in message.content for message in chat)
 
 
 def test_notify_operator_retries_when_no_channel_delivered(tmp_path, monkeypatch):

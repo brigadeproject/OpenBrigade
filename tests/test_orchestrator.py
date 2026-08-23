@@ -731,7 +731,7 @@ def test_parent_completion_records_synthesis_event(tmp_path):
     assert child.assignment_id in telemetry["latest_event"]["child_assignment_ids"]
 
 
-def test_blocked_agent_still_receives_its_own_failure_analysis():
+def test_blocked_agent_does_not_pin_unrelated_queued_work():
     blocked = Assignment(
         assignment="Original stuck work",
         assigned_to="abacus",
@@ -757,8 +757,32 @@ def test_blocked_agent_still_receives_its_own_failure_analysis():
 
     result = deterministic_cycle([blocked, analysis, unrelated])
 
-    assert [item.assignment_id for item in result.assigned] == [analysis.assignment_id]
-    assert unrelated in result.skipped
+    assert [item.assignment_id for item in result.assigned] == [unrelated.assignment_id]
+    assert analysis in result.skipped
+
+
+def test_urgent_work_preempts_a_tool_budget_continuation_for_one_cycle():
+    continuation = Assignment(
+        assignment="Resume long report",
+        assigned_to="abacus",
+        created_by="human",
+        source="direct_command",
+        priority=Priority.NORMAL,
+        continuation_reason="tool_budget_exhausted",
+    )
+    urgent = Assignment(
+        assignment="Handle urgent operator request",
+        assigned_to="abacus",
+        created_by="human",
+        source="direct_command",
+        priority=Priority.URGENT,
+    )
+
+    result = deterministic_cycle([continuation, urgent])
+
+    assert [item.assignment_id for item in result.assigned] == [urgent.assignment_id]
+    assert continuation in result.skipped
+    assert result.skip_reasons[continuation.assignment_id] == "agent_busy"
 
 
 # --- Dispatch starvation watchdog (Jul 4-6: 44h stall with no signal) -------------

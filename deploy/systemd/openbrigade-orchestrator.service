@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenBrigade orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=brigade
+Group=brigade
+WorkingDirectory=/opt/openbrigade
+EnvironmentFile=/opt/openbrigade/.env
+ExecStart=/opt/openbrigade/.venv/bin/brigade orchestrator daemon
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=180
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

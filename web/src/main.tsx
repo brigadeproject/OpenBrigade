@@ -4283,7 +4283,14 @@ function TeamBoard({
     setChiefId(selected?.crew_chief_id || "");
     setAddMemberId("");
     setDTarget("");
-  }, [selected]);
+  }, [
+    selected?.team_id,
+    selected?.display_name,
+    selected?.delegation_policy,
+    selected?.parent_team_id,
+    selected?.escalation_team_id,
+    selected?.crew_chief_id,
+  ]);
 
   useEffect(() => {
     if (!agModelKey && defaultModelKey) {

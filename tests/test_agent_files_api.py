@@ -29,7 +29,7 @@ def _app(tmp_path):
 def test_get_returns_scaffolded_identity(tmp_path):
     from fastapi.testclient import TestClient
 
-    app, _ = _app(tmp_path)
+    app, store = _app(tmp_path)
     resp = TestClient(app).get("/api/agents/ada/files/IDENTITY.md")
     assert resp.status_code == 200
     payload = resp.json()
@@ -41,13 +41,20 @@ def test_get_returns_scaffolded_identity(tmp_path):
 def test_put_then_get_round_trip(tmp_path):
     from fastapi.testclient import TestClient
 
-    app, _ = _app(tmp_path)
+    app, store = _app(tmp_path)
     client = TestClient(app)
     body = "# ADA\nMeticulous systems archivist.\n"
     resp = client.put("/api/agents/ada/files/IDENTITY.md", json={"content": body})
     assert resp.status_code == 200
     assert resp.json()["status"] == "saved"
+    assert resp.json()["content_hash"]
     assert (tmp_path / "workspace-ada" / "IDENTITY.md").read_text(encoding="utf-8") == body
+    projection = store.policy_projection("ada", "IDENTITY.md")
+    assert projection["content_hash"] == resp.json()["content_hash"]
+    assert any(
+        item.get("event") == "policy_projection_accepted"
+        for item in store.provenance_records()
+    )
     assert client.get("/api/agents/ada/files/IDENTITY.md").json()["content"] == body
 
 

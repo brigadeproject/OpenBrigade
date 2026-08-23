@@ -175,6 +175,78 @@ def ensure_policy_projections_current(
     return projections
 
 
+def policy_projection_diff(store: Any, agent: Agent) -> list[dict[str, object]]:
+    """Compare current governed files with their accepted projections."""
+    workspace = store.data_dir / agent.workspace_path
+    changes: list[dict[str, object]] = []
+    for relative_path in workspace_governing_paths(agent, workspace):
+        current = build_policy_projection(
+            agent, workspace, relative_path, actor="policy_diff", source="validation"
+        )
+        existing = store.policy_projection(agent.agent_id, relative_path)
+        changed = existing is None or any(
+            existing.get(key) != current.get(key)
+            for key in ("content_hash", "parsed_version", "status")
+        )
+        if changed:
+            changes.append(
+                {
+                    "path": relative_path,
+                    "old_content_hash": existing.get("content_hash") if existing else None,
+                    "new_content_hash": current["content_hash"],
+                    "old_status": existing.get("status") if existing else None,
+                    "new_status": current["status"],
+                }
+            )
+    return changes
+
+
+def accept_policy_projections(
+    store: Any,
+    agent: Agent,
+    *,
+    paths: list[str],
+    actor: str,
+    source: str,
+) -> list[dict[str, object]]:
+    """Accept explicit current files as policy baselines without rewriting them."""
+    if not paths:
+        raise ValueError("at least one policy path must be selected")
+    workspace = store.data_dir / agent.workspace_path
+    accepted: list[dict[str, object]] = []
+    for raw_path in dict.fromkeys(paths):
+        relative_path = normalize_workspace_relative_path(raw_path)
+        if not is_governing_workspace_path(relative_path):
+            raise ValueError(f"{relative_path} is not a governed workspace policy file")
+        path = workspace / relative_path
+        if not path.is_file():
+            raise ValueError(f"{relative_path} does not exist")
+        existing = store.policy_projection(agent.agent_id, relative_path)
+        projection = upsert_policy_projection(
+            store, agent, relative_path, actor=actor, source=source
+        )
+        store.add_provenance_record(
+            {
+                "record_id": (
+                    "policy_projection_accepted:"
+                    f"{agent.agent_id}:{relative_path}:{uuid4()}"
+                ),
+                "node_id": agent.agent_id,
+                "node_type": "agent_policy_projection",
+                "event": "policy_projection_accepted",
+                "agent_id": agent.agent_id,
+                "path": relative_path,
+                "actor": actor,
+                "source": source,
+                "old_content_hash": existing.get("content_hash") if existing else None,
+                "new_content_hash": projection["content_hash"],
+                "created_at": utc_now_iso(),
+            }
+        )
+        accepted.append(projection)
+    return accepted
+
+
 def build_policy_change_proposal(
     store: Any,
     agent: Agent,

@@ -20,9 +20,11 @@ from brigade.chief_chat import (
     search_episode_summaries,
 )
 from brigade.citations import (
+    available_citations,
     citation_context,
     citation_instructions,
     citation_retrieval_arguments,
+    citation_validation_status,
     classify_rendered_claims,
     enforce_citation_answer,
 )
@@ -730,13 +732,7 @@ def run_executive_chat_turn(
     claim_classes: list[dict[str, object]] = []
     citation_repaired = False
 
-    def repair_citations(repair_prompt: str) -> str:
-        repair_response = _complete_model_call(
-            store, provider, repair_prompt, tools=[], holder=agent_label
-        )
-        _record_executive_usage(store, repair_response, channel=channel, agent_id=agent_label)
-        return parse_chief_chat_reply(repair_response.text).text
-
+    citation_draft = final_text
     (
         final_text,
         citation_state,
@@ -748,9 +744,13 @@ def run_executive_chat_turn(
         content,
         observations,
         final_text,
-        repair=repair_citations,
     )
-    claim_classes = classify_rendered_claims(final_text, citations)
+    citation_status = citation_validation_status(citation_state, citation_errors)
+    claim_classes = (
+        [{"kind": "unverified_draft", "citation_ids": []}]
+        if citation_status == "unvalidated_draft"
+        else classify_rendered_claims(final_text, citations)
+    )
     if citation_state.required:
         record_citation_validation(
             store,
@@ -775,6 +775,9 @@ def run_executive_chat_turn(
             "citation_required": citation_state.required,
             "citations": citations,
             "citation_validation_errors": citation_errors,
+            "citation_validation_status": citation_status,
+            "available_citations": available_citations(citation_state),
+            "citation_draft": citation_draft if citation_status == "unvalidated_draft" else None,
             "citation_repaired": citation_repaired,
             "claim_classes": claim_classes,
         },

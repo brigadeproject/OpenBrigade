@@ -16,9 +16,11 @@ from typing import Any
 from uuid import uuid4
 
 from brigade.citations import (
+    available_citations,
     citation_context,
     citation_instructions,
     citation_retrieval_arguments,
+    citation_validation_status,
     classify_rendered_claims,
     enforce_citation_answer,
 )
@@ -434,6 +436,8 @@ def _tool_list_recurrences(
                 "assigned_to": target,
                 "assignment": str(template.get("assignment") or "")[:160],
                 "interval_seconds": recurrence.get("interval_seconds"),
+                "cron": recurrence.get("cron"),
+                "label": template.get("label"),
                 "next_due_at": recurrence.get("next_due_at"),
                 "delivers_briefing": isinstance(template.get("deliver_to"), dict),
                 "last_materialized_at": recurrence.get("last_materialized_at"),
@@ -789,6 +793,9 @@ CHIEF_CHAT_ACTION_DOCS = [
     '"deliver_briefing":true}'
     " — a scheduled job; interval_seconds 86400 = daily; deliver_briefing "
     "posts each run's finished summary back into this conversation.",
+    '{"type":"create_recurrence","agent_id":"...","assignment":"...",'
+    '"cron":"0 9 * * 1-5"}'
+    " — a five-field UTC cron schedule. Use cron or interval_seconds, never both.",
     '{"type":"set_recurrence_enabled","recurrence_id":"...","enabled":false}',
 ]
 
@@ -1156,23 +1163,21 @@ def run_chief_chat_turn(
     claim_classes: list[dict[str, object]] = []
     citation_repaired = False
     if final_text:
-        def repair_citations(repair_prompt: str) -> str:
-            repair_response = _complete_model_call(
-                store, provider, repair_prompt, tools=[], holder=agent_label
-            )
-            _record_chief_usage(store, repair_response, channel=channel, agent_id=agent_label)
-            return parse_chief_chat_reply(repair_response.text).text
-
+        citation_draft = final_text
         final_text, citation_state, citations, citation_errors, citation_repaired = (
             enforce_citation_answer(
                 store,
                 content,
                 observations,
                 final_text,
-                repair=repair_citations,
             )
         )
-        claim_classes = classify_rendered_claims(final_text, citations)
+        citation_status = citation_validation_status(citation_state, citation_errors)
+        claim_classes = (
+            [{"kind": "unverified_draft", "citation_ids": []}]
+            if citation_status == "unvalidated_draft"
+            else classify_rendered_claims(final_text, citations)
+        )
         if citation_state.required:
             record_citation_validation(
                 store,
@@ -1182,6 +1187,8 @@ def run_chief_chat_turn(
             )
     else:  # pragma: no cover - retained for type narrowing
         citation_state = citation_context(store, content, observations)
+        citation_status = citation_validation_status(citation_state, citation_errors)
+        citation_draft = None
     response_message = ChatMessage(
         channel=channel,
         sender=agent_label,
@@ -1199,6 +1206,9 @@ def run_chief_chat_turn(
             "citation_required": citation_state.required,
             "citations": citations,
             "citation_validation_errors": citation_errors,
+            "citation_validation_status": citation_status,
+            "available_citations": available_citations(citation_state),
+            "citation_draft": citation_draft if citation_status == "unvalidated_draft" else None,
             "citation_repaired": citation_repaired,
             "claim_classes": claim_classes,
         },

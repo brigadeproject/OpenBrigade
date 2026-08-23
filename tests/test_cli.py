@@ -23,6 +23,23 @@ def test_cli_config_show(tmp_path, monkeypatch, capsys):
     assert payload["data_dir"] == ".brigade"
 
 
+def test_cli_agent_policy_diff_and_accept(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    assert main(["agent", "onboard", "--id", "ada", "--name", "ADA"]) == 0
+    capsys.readouterr()
+    workspace = tmp_path / ".brigade" / "workspace-ada"
+    identity = workspace / "IDENTITY.md"
+    identity.write_text(
+        identity.read_text(encoding="utf-8") + "\nApproved change\n",
+        encoding="utf-8",
+    )
+
+    assert main(["agent", "policy", "diff", "ada"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["path"] == "IDENTITY.md"
+    assert main(["agent", "policy", "accept", "ada", "--path", "IDENTITY.md"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["path"] == "IDENTITY.md"
+
+
 def test_cli_research_status_and_staged_policy(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
 

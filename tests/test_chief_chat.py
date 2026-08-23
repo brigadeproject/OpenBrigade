@@ -122,7 +122,7 @@ def test_tool_call_then_answer(tmp_path):
     assert store.episodes()[-1]["source"] == "chief_chat"
 
 
-def test_legal_chief_answer_repairs_and_renders_only_supplied_citation(tmp_path, monkeypatch):
+def test_chief_answer_renders_only_explicitly_requested_supplied_citation(tmp_path, monkeypatch):
     store = _fleet(tmp_path)
     source_url = "https://uscode.house.gov/view.xhtml?section=1030"
     source_id = f"external:{sha256(source_url.encode('utf-8')).hexdigest()[:16]}"
@@ -138,16 +138,15 @@ def test_legal_chief_answer_repairs_and_renders_only_supplied_citation(tmp_path,
     provider = SequencedTestProvider(
         [
             _tool_call("web_fetch", url=source_url),
-            "The statute prohibits the described conduct.",
             f"The statute prohibits the described conduct. [[cite:{source_id}]]",
         ]
     )
 
-    result = _turn(store, provider, content="Give me a legal answer about this statute.")
+    result = _turn(store, provider, content="Give me an answer with sources about this statute.")
 
     message = store.messages(result["conversation_id"])[-1]
     assert message.metadata["citation_required"] is True
-    assert message.metadata["citation_repaired"] is True
+    assert message.metadata["citation_repaired"] is False
     assert message.metadata["citations"][0]["source_id"] == source_id
     assert "[^1]: [18 USC 1030]" in message.content
 
@@ -158,7 +157,7 @@ def test_legal_chief_answer_without_retrieval_is_transparent(tmp_path):
     result = _turn(
         store,
         SequencedTestProvider(["The model should not answer this from memory."]),
-        content="Give a legal analysis of this statute.",
+            content="Give a legal analysis with sources for this statute.",
     )
 
     message = store.messages(result["conversation_id"])[-1]
@@ -647,7 +646,7 @@ def test_thread_api_preserves_rendered_citation_metadata(tmp_path, monkeypatch):
             "POST",
             f"/api/chat/threads/{thread_id}/messages",
             headers=headers,
-            json_payload={"content": "Give me a legal answer."},
+                json_payload={"content": "Give me a legal answer with sources."},
         )
     )
     assert sent.status_code == 200, sent.text
