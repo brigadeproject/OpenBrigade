@@ -49,6 +49,7 @@ from brigade.governance import (
     accept_policy_projections,
     ensure_policy_projections_current,
     policy_projection_diff,
+    reconcile_policy_projection_after_trusted_write,
     workspace_governing_paths,
 )
 from brigade.health import HealthCheck, check_configured_datastores
@@ -2520,8 +2521,18 @@ def _main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "memory" and args.memory_command == "curate":
         _require_permission(store, settings, actor, "memory:write")
-        workspace = _workspace_for_agent(store, settings.data_dir, args.agent)
+        agent = _find_agent(store, args.agent)
+        if agent is None:
+            raise ValueError(f"unknown agent: {args.agent}")
+        workspace = ensure_agent_workspace(agent, settings.data_dir)
         path = curate_workspace_memory(workspace)
+        reconcile_policy_projection_after_trusted_write(
+            store,
+            agent,
+            "MEMORY.md",
+            actor=actor.user.username if actor.user else "cli",
+            source="operator:cli-memory-curate",
+        )
         print(
             json.dumps(
                 {"path": str(path), "bytes": len(path.read_bytes())}, indent=2, sort_keys=True
@@ -2687,6 +2698,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
         )
         completed = 0
         agent_results = []
+        staff_meeting_progress: list[dict[str, Any]] = []
         provider = _provider_from_args(args, settings)
         provider_factory = _managed_agent_provider_factory(args, settings, store)
         model_inventory = probe_model_inventory(settings)
@@ -2731,9 +2743,21 @@ def _main(argv: Sequence[str] | None = None) -> int:
                             fallback_provider=provider if provider_factory else None,
                         )
                     )
+                    from brigade.staff_meeting import advance_staff_meetings
+
+                    staff_meeting_progress.append(advance_staff_meetings(store))
                 completed += 1
                 if max_cycles is not None and completed >= max_cycles:
                     break
+                # Meeting work is interactive and bounded. When a completed
+                # wave queued the next durable wave, dispatch it immediately
+                # instead of waiting for the ordinary mission cadence.
+                if any(
+                    item.kind == AssignmentKind.STAFF_MEETING
+                    and item.status == AssignmentStatus.QUEUED
+                    for item in store.assignments()
+                ):
+                    continue
                 # Event.wait wakes immediately on SIGTERM, unlike time.sleep.
                 # Re-read the cadence each cycle so a runtime override from the
                 # GUI takes effect without a restart (explicit --sleep-seconds
@@ -2751,6 +2775,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     "cycles": completed,
                     "drained": shutdown.is_set(),
                     "agent_runs": [item.to_dict() for item in agent_results],
+                    "staff_meetings": staff_meeting_progress,
                     "model_inventory": model_inventory,
                 },
                 indent=2,

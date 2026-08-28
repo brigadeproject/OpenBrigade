@@ -1165,7 +1165,11 @@ def deterministic_cycle(
             )
             skip(item, SKIP_UNKNOWN_AGENT)
             continue
-        if goals_by_agent is not None and item.assigned_to in goals_by_agent:
+        if (
+            item.kind != AssignmentKind.STAFF_MEETING
+            and goals_by_agent is not None
+            and item.assigned_to in goals_by_agent
+        ):
             decision = evaluate_assignment_alignment(item, goals_by_agent.get(item.assigned_to, []))
             if decision.action == "interrupt":
                 item.transition_to(AssignmentStatus.BLOCKED)
@@ -2591,8 +2595,13 @@ def run_full_cycle(
     rest, dispatch, escalation, then a reasoning record that cannot be persisted
     without a CycleOutcome."""
     config = config or OrchestrationConfig()
-    empty_dispatch = CycleResult(assigned=[], skipped=[], alerts=[])
     sub_results: dict[str, Any] = {}
+
+    # Staff Meetings are durable orchestration workflows of their own. They
+    # advance before queue dispatch and do not require an active mission.
+    from brigade.staff_meeting import advance_staff_meetings
+
+    sub_results["staff_meetings"] = advance_staff_meetings(store)
 
     # Step 1: mission and previous reasoning. No mission stops the cycle.
     mission = store.mission()
@@ -2609,11 +2618,40 @@ def run_full_cycle(
         sub_results["recurrence"] = {
             key: value for key, value in recurrence_result.items() if key != "events"
         }
-        outcome = classify_cycle_outcome(mission_present=False, assignments=[])
+        meeting_assignments = [
+            item
+            for item in store.assignments()
+            if item.kind == AssignmentKind.STAFF_MEETING
+        ]
+        meeting_originals = {
+            item.assignment_id: {
+                "status": item.status.value,
+                "updated_at": item.updated_at,
+            }
+            for item in meeting_assignments
+        }
+        meeting_dispatch = deterministic_cycle(
+            meeting_assignments,
+            agents=store.agents(),
+            goals_by_agent=None,
+            workspace_root=store.data_dir,
+            assignment_history=store.assignment_history(),
+        )
+        _persist_dispatch_mutations(
+            store,
+            meeting_assignments,
+            meeting_dispatch,
+            meeting_originals,
+        )
+        outcome = classify_cycle_outcome(
+            mission_present=False,
+            assignments=meeting_assignments,
+            dispatch=meeting_dispatch,
+        )
         record = build_cycle_reasoning_record(
             None,
-            [],
-            empty_dispatch,
+            meeting_assignments,
+            meeting_dispatch,
             {},
             previous_reasoning_id=previous_reasoning_id,
             cycle_outcome=outcome,
@@ -2624,7 +2662,7 @@ def run_full_cycle(
         store.add_orchestrator_reasoning(record)
         return FullCycleResult(
             outcome=outcome,
-            dispatch=empty_dispatch,
+            dispatch=meeting_dispatch,
             reasoning_record=record,
             sub_results=sub_results,
         )

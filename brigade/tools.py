@@ -107,6 +107,8 @@ def _research_storage_root(store: StateStore) -> Path:
 
 def _research_component_enabled(context: ToolContext, component: str) -> bool:
     """Live policy switches default to enabled until an operator changes them."""
+    if context is None:
+        return True
     key = f"research_{component}_enabled"
     try:
         return bool((context.store.runtime_overrides() or {}).get(key, True))
@@ -126,6 +128,13 @@ class ToolRegistry:
 
     def specs(self) -> list[ToolSpec]:
         return [item[0] for item in self._tools.values()]
+
+    def restricted(self, allowed_names: set[str]) -> ToolRegistry:
+        restricted = ToolRegistry()
+        for name, (spec, handler) in self._tools.items():
+            if name in allowed_names:
+                restricted.register(spec, handler)
+        return restricted
 
     def execute(self, name: str, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         item = self._tools.get(name)
@@ -309,6 +318,22 @@ def default_tool_registry() -> ToolRegistry:
     )
     registry.register(
         ToolSpec(
+            name="request_staff_meeting",
+            description=(
+                "Request that your Crew Chief consider convening a Staff Meeting for a "
+                "large cross-domain decision or unresolved problem. This records a request; "
+                "ordinary agents cannot convene the meeting themselves."
+            ),
+            argument_schema={
+                "request": "the decision or unresolved problem",
+                "reason": "why ordinary recovery or analysis is insufficient",
+                "acceptance_criteria": "optional array of suggested criteria for the chair",
+            },
+        ),
+        _request_staff_meeting,
+    )
+    registry.register(
+        ToolSpec(
             name="propose_policy_change",
             description=(
                 "Propose a governed change to AGENTS.md, USER.md, IDENTITY.md, "
@@ -348,6 +373,22 @@ def default_tool_registry() -> ToolRegistry:
         _run_workspace_tool,
     )
     return registry
+
+
+STAFF_MEETING_READ_ONLY_TOOLS = {
+    "list_files",
+    "read_file",
+    "web_fetch",
+    "web_search",
+    "browser_open",
+    "browser_extract",
+    "browser_screenshot",
+}
+
+
+def staff_meeting_tool_registry() -> ToolRegistry:
+    """Evidence-gathering tools that cannot mutate Brigade or external state."""
+    return default_tool_registry().restricted(STAFF_MEETING_READ_ONLY_TOOLS)
 
 
 def _register_browser_tools(registry: ToolRegistry) -> None:
@@ -2052,6 +2093,53 @@ def _request_tool(context: ToolContext, arguments: dict[str, Any]) -> ToolResult
         f"tool request '{name}' recorded as proposal {proposal['proposal_id']}; "
         "it will be built after approval",
         {"proposal_id": proposal["proposal_id"], "status": "proposed"},
+    )
+
+
+def _request_staff_meeting(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    from brigade.orchestrator import route_to_chief
+    from brigade.schemas import build_proposal
+
+    request = _required_text(arguments, "request")
+    reason = _required_text(arguments, "reason")
+    chief = route_to_chief(context.store, agent_id=context.agent.agent_id)
+    if chief is None:
+        return ToolResult(False, "no Crew Chief is available to receive the request")
+    criteria = [
+        str(item).strip()
+        for item in arguments.get("acceptance_criteria") or []
+        if str(item).strip()
+    ]
+    proposal = build_proposal(
+        kind="staff_meeting_request",
+        title=f"Staff Meeting request from {context.agent.agent_id}",
+        agent_id=context.agent.agent_id,
+        team_id=context.agent.team_id,
+        details={
+            "request": request,
+            "reason": reason,
+            "suggested_acceptance_criteria": criteria,
+            "requested_in_assignment": context.assignment.assignment_id,
+            "requested_chief_agent_id": chief.agent_id,
+        },
+        idempotency_key=(
+            f"staff-meeting-request:v1:{context.assignment.assignment_id}:"
+            f"{context.agent.agent_id}"
+        ),
+    )
+    persisted = context.store.add_proposal(proposal)
+    context.store.add_alert(
+        f"Staff Meeting requested by {context.agent.agent_id} for Crew Chief "
+        f"{chief.agent_id}: {request[:160]}"
+    )
+    return ToolResult(
+        True,
+        f"Staff Meeting request sent to Crew Chief {chief.agent_id}",
+        {
+            "proposal_id": persisted["proposal_id"],
+            "chief_agent_id": chief.agent_id,
+            "status": persisted["status"],
+        },
     )
 
 

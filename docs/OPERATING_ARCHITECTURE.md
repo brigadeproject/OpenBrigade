@@ -54,6 +54,34 @@ then:
 The orchestrator must not silently mutate agent identity, memory, or tools. Any future
 self-improvement cycle should produce explicit decisions, proposed tasks, or human-review items.
 
+### Staff Meeting workflow
+
+A Staff Meeting is an orchestration workflow with its own `meeting_id` and durable conversation.
+Postgres stores the meeting plus append-only seats, packet versions, transitions, assignments,
+responses, excerpts, vetoes, ballots, syntheses, and reports. A migration-backed, versioned role
+catalog supplies the only eligible role definitions. Catalog changes are data migrations or
+explicit administrative policy work; meeting callers cannot invent roles incidentally.
+
+The orchestrator advances at most one persisted boundary per pass. Each dispatch is a normal
+`STAFF_MEETING` assignment, so it uses existing assignment identity, leases, heartbeat validation,
+provider routing, transcripts, and usage accounting. A persisted wave identity and assignment
+idempotency key prevent crash replay from fanning out duplicate work. Failed or timed-out seats are
+recorded as absent, and the workflow continues only while rounded-up 70-percent seat quorum and
+three distinct participating agents remain possible.
+
+Meeting agents receive a read-only intersection of inspection, web research, and browser tools.
+They cannot mutate Brigade or external systems. Default ceilings are three full-panel discussion
+rounds, one targeted follow-up discussion of at most three rounds, two elapsed hours, 100,000 total
+tokens, and 60 tool calls. Callers may reduce but not increase these ceilings. An evidence-only
+unfreeze permits one additional discussion; request, scope, criteria, constraint, assumption, or
+roster changes restart independent review. Only the chair may amend the frozen packet, and the
+normal unfreeze allowance is one per meeting.
+
+The final canonical write precedes Qdrant episodic indexing and Neo4j provenance projection. The
+authenticated `/api/staff-meetings` collection, detail, and event-stream routes use `status:read`;
+the Cockpit viewer is intentionally read-only. Administrative pause, cancellation, mitigation, and
+revote controls are not exposed through that first viewer.
+
 The full v1.0 orchestration design — the cycle contract, work-or-reason outcome taxonomy,
 chief-first dispatch, blocker-resolution ladder, intake triggers, rest cycles, and training-data
 export — is specified in `ORCHESTRATION.md`.

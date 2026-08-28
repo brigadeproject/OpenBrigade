@@ -22,6 +22,15 @@ research are operated through the [research operations runbook](docs/RESEARCH_OP
 Legal citations distinguish primary authority from secondary interpretation (including Cornell LII);
 ordinary non-citation work remains plain prose.
 
+Staff Meeting is a first-class, agent-internal deliberation workflow for consequential cross-domain
+decisions. A user can ask the Executive to convene one, a Crew Chief can convene one and alert the
+operator, and ordinary agents can only request one from their Chief. The harness—not a single
+prompt—enforces independent role reviews, deterministic attributed excerpts, bounded discussion,
+secret role-seat ballots, 70-percent rounded-up quorum, veto handling, resource ceilings, durable
+replay, and final provenance. The Cockpit **Staff Meetings** tab provides a read-only searchable live
+and historical view. See [the Staff Meeting skill](skills/staff-meeting.md) for invocation and result
+interpretation.
+
 The PR-candidate path uses the `brigade_` Docker stack with Postgres, Redis, Qdrant, and Neo4j.
 Operator workflows require the containerized stores. Live commands should run through
 `./ops/brigade-live.sh ...` so state lands in Postgres and the runtime services.

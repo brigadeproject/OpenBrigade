@@ -16,6 +16,7 @@ import re
 from datetime import datetime, time
 from typing import Any
 
+from brigade.governance import reconcile_policy_projection_after_trusted_write
 from brigade.memory import (
     append_daily_memory,
     archive_stale_daily_memories,
@@ -214,6 +215,13 @@ def finalize_rest_assignment(
     ``## Proposals`` bullet, and emit ``rest_completed``."""
     workspace = ensure_agent_workspace(agent, store.data_dir)
     curate_workspace_memory(workspace)
+    reconcile_policy_projection_after_trusted_write(
+        store,
+        agent,
+        "MEMORY.md",
+        actor="orchestrator",
+        source="rest_cycle",
+    )
     archived = archive_stale_daily_memories(workspace, agent.agent_id)
     for episode in archived:
         store.add_episode(episode)

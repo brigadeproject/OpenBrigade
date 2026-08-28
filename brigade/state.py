@@ -42,6 +42,9 @@ EMPTY_STATE: dict[str, Any] = {
     "knowledge_chunks": [],
     "messages": [],
     "conversations": [],
+    "staff_meeting_role_catalogs": [],
+    "staff_meetings": [],
+    "staff_meeting_records": [],
     "orchestrator_reasoning": [],
     "proposals": [],
     "policy_projections": [],
@@ -437,6 +440,113 @@ class JsonStateStore:
         conversation.rolling_summary = summary
         conversation.updated_at = utc_now_iso()
         self.upsert_conversation(conversation)
+
+    def upsert_staff_meeting_role_catalog(self, catalog: dict[str, Any]) -> None:
+        state = self.load()
+        catalogs = state.setdefault("staff_meeting_role_catalogs", [])
+        for item in catalogs:
+            if catalog.get("active"):
+                item["active"] = False
+        for index, item in enumerate(catalogs):
+            if item.get("version") == catalog.get("version"):
+                catalogs[index] = dict(catalog)
+                break
+        else:
+            catalogs.append(dict(catalog))
+        self.save(state)
+
+    def staff_meeting_role_catalogs(self) -> list[dict[str, Any]]:
+        return [
+            dict(item)
+            for item in self.load().get("staff_meeting_role_catalogs", [])
+        ]
+
+    def upsert_staff_meeting(self, meeting: dict[str, Any]) -> None:
+        state = self.load()
+        meetings = state.setdefault("staff_meetings", [])
+        for index, item in enumerate(meetings):
+            if item.get("meeting_id") == meeting.get("meeting_id"):
+                meetings[index] = dict(meeting)
+                break
+        else:
+            meetings.append(dict(meeting))
+        self.save(state)
+
+    def find_staff_meeting(self, meeting_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                dict(item)
+                for item in self.load().get("staff_meetings", [])
+                if item.get("meeting_id") == meeting_id
+            ),
+            None,
+        )
+
+    def staff_meetings(
+        self,
+        *,
+        owner_username: str | None = None,
+        team_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        records = [dict(item) for item in self.load().get("staff_meetings", [])]
+        if owner_username is not None:
+            records = [item for item in records if item.get("owner_username") == owner_username]
+        if team_id is not None:
+            records = [item for item in records if item.get("team_id") == team_id]
+        if status is not None:
+            records = [item for item in records if item.get("status") == status]
+        return sorted(
+            records,
+            key=lambda item: (str(item.get("updated_at") or ""), str(item.get("meeting_id"))),
+            reverse=True,
+        )
+
+    def add_staff_meeting_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        state = self.load()
+        records = state.setdefault("staff_meeting_records", [])
+        idempotency_key = record.get("idempotency_key")
+        if idempotency_key:
+            existing = next(
+                (
+                    item
+                    for item in records
+                    if item.get("meeting_id") == record.get("meeting_id")
+                    and item.get("idempotency_key") == idempotency_key
+                ),
+                None,
+            )
+            if existing is not None:
+                return dict(existing)
+        if any(item.get("record_id") == record.get("record_id") for item in records):
+            return dict(
+                next(
+                    item
+                    for item in records
+                    if item.get("record_id") == record.get("record_id")
+                )
+            )
+        records.append(dict(record))
+        self.save(state)
+        return record
+
+    def staff_meeting_records(
+        self,
+        meeting_id: str,
+        *,
+        record_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        records = [
+            dict(item)
+            for item in self.load().get("staff_meeting_records", [])
+            if item.get("meeting_id") == meeting_id
+        ]
+        if record_kind is not None:
+            records = [item for item in records if item.get("record_kind") == record_kind]
+        return sorted(
+            records,
+            key=lambda item: (str(item.get("created_at") or ""), str(item.get("record_id"))),
+        )
 
     def add_orchestrator_reasoning(self, record: dict[str, Any]) -> None:
         state = self.load()

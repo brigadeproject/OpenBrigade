@@ -177,6 +177,31 @@ class StateStore(Protocol):
 
     def set_conversation_summary(self, thread_id: str, summary: str) -> None: ...
 
+    def upsert_staff_meeting_role_catalog(self, catalog: dict[str, Any]) -> None: ...
+
+    def staff_meeting_role_catalogs(self) -> list[dict[str, Any]]: ...
+
+    def upsert_staff_meeting(self, meeting: dict[str, Any]) -> None: ...
+
+    def find_staff_meeting(self, meeting_id: str) -> dict[str, Any] | None: ...
+
+    def staff_meetings(
+        self,
+        *,
+        owner_username: str | None = None,
+        team_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def add_staff_meeting_record(self, record: dict[str, Any]) -> dict[str, Any]: ...
+
+    def staff_meeting_records(
+        self,
+        meeting_id: str,
+        *,
+        record_kind: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
     def add_orchestrator_reasoning(self, record: dict[str, Any]) -> None: ...
 
     def orchestrator_reasoning(self) -> list[dict[str, Any]]: ...
@@ -1242,7 +1267,7 @@ class PostgresStateStore:
               id, channel, sender, recipient, content, created_at, metadata
             )
             values (%s, %s, %s, %s, %s, %s, %s::jsonb)
-            on conflict (id) do nothing
+            on conflict do nothing
             """,
             (
                 message.message_id,
@@ -1404,6 +1429,176 @@ class PostgresStateStore:
         conversation.rolling_summary = summary
         conversation.updated_at = utc_now_iso()
         self.upsert_conversation(conversation)
+
+    def upsert_staff_meeting_role_catalog(self, catalog: dict[str, Any]) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                if catalog.get("active"):
+                    cursor.execute(
+                        "update brigade_staff_meeting_role_catalogs set active = false "
+                        "where active = true and version <> %s",
+                        (catalog["version"],),
+                    )
+                cursor.execute(
+                    """
+                    insert into brigade_staff_meeting_role_catalogs (
+                      version, active, created_at, record
+                    )
+                    values (%s, %s, %s, %s::jsonb)
+                    on conflict (version) do update set
+                      active = excluded.active,
+                      record = excluded.record
+                    """,
+                    (
+                        catalog["version"],
+                        bool(catalog.get("active")),
+                        catalog.get("created_at") or utc_now_iso(),
+                        json.dumps(catalog, sort_keys=True),
+                    ),
+                )
+
+    def staff_meeting_role_catalogs(self) -> list[dict[str, Any]]:
+        return list(
+            self._records(
+                "select record from brigade_staff_meeting_role_catalogs "
+                "order by created_at, version"
+            )
+        )
+
+    def upsert_staff_meeting(self, meeting: dict[str, Any]) -> None:
+        self._execute(
+            """
+            insert into brigade_staff_meetings (
+              id, conversation_id, owner_username, team_id, chair_agent_id,
+              status, created_at, updated_at, completed_at, record
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            on conflict (id) do update set
+              conversation_id = excluded.conversation_id,
+              owner_username = excluded.owner_username,
+              team_id = excluded.team_id,
+              chair_agent_id = excluded.chair_agent_id,
+              status = excluded.status,
+              updated_at = excluded.updated_at,
+              completed_at = excluded.completed_at,
+              record = excluded.record
+            """,
+            (
+                meeting["meeting_id"],
+                meeting["conversation_id"],
+                meeting.get("owner_username"),
+                meeting.get("team_id"),
+                meeting["chair_agent_id"],
+                meeting["status"],
+                meeting["created_at"],
+                meeting.get("updated_at") or meeting["created_at"],
+                meeting.get("completed_at"),
+                json.dumps(meeting, sort_keys=True),
+            ),
+        )
+
+    def find_staff_meeting(self, meeting_id: str) -> dict[str, Any] | None:
+        return self._record_or_none(
+            "select record from brigade_staff_meetings where id = %s",
+            (meeting_id,),
+        )
+
+    def staff_meetings(
+        self,
+        *,
+        owner_username: str | None = None,
+        team_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "select record from brigade_staff_meetings"
+        clauses: list[str] = []
+        params: list[object] = []
+        if owner_username is not None:
+            clauses.append("owner_username = %s")
+            params.append(owner_username)
+        if team_id is not None:
+            clauses.append("team_id = %s")
+            params.append(team_id)
+        if status is not None:
+            clauses.append("status = %s")
+            params.append(status)
+        if clauses:
+            sql += " where " + " and ".join(clauses)
+        sql += " order by updated_at desc, id"
+        return list(self._records(sql, tuple(params)))
+
+    def add_staff_meeting_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        idempotency_key = record.get("idempotency_key")
+        if idempotency_key:
+            existing = self._record_or_none(
+                """
+                select record from brigade_staff_meeting_records
+                where meeting_id = %s and idempotency_key = %s
+                """,
+                (record["meeting_id"], idempotency_key),
+            )
+            if existing is not None:
+                return existing
+        inserted = self._query_one(
+            """
+            insert into brigade_staff_meeting_records (
+              id, meeting_id, conversation_id, record_kind, role_seat_id,
+              role_key, round_number, phase, assignment_id, agent_id,
+              supersedes_record_id, idempotency_key, created_at, record
+            )
+            values (
+              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+            )
+            on conflict (id) do nothing
+            returning record
+            """,
+            (
+                record["record_id"],
+                record["meeting_id"],
+                record["conversation_id"],
+                record["record_kind"],
+                record.get("role_seat_id"),
+                record.get("role_key"),
+                record.get("round_number"),
+                record.get("phase"),
+                record.get("assignment_id"),
+                record.get("agent_id"),
+                record.get("supersedes_record_id"),
+                idempotency_key,
+                record["created_at"],
+                json.dumps(record, sort_keys=True),
+            ),
+        )
+        if inserted is not None:
+            return _decode_json(inserted[0])
+        if idempotency_key:
+            existing = self._record_or_none(
+                """
+                select record from brigade_staff_meeting_records
+                where meeting_id = %s and idempotency_key = %s
+                """,
+                (record["meeting_id"], idempotency_key),
+            )
+        else:
+            existing = self._record_or_none(
+                "select record from brigade_staff_meeting_records where id = %s",
+                (record["record_id"],),
+            )
+        return existing or record
+
+    def staff_meeting_records(
+        self,
+        meeting_id: str,
+        *,
+        record_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "select record from brigade_staff_meeting_records where meeting_id = %s"
+        params: tuple[object, ...] = (meeting_id,)
+        if record_kind is not None:
+            sql += " and record_kind = %s"
+            params = (*params, record_kind)
+        sql += " order by created_at, id"
+        return list(self._records(sql, params))
 
     def add_orchestrator_reasoning(self, record: dict[str, Any]) -> None:
         self._execute(

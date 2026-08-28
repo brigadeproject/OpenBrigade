@@ -76,6 +76,7 @@ class AssignmentKind(str, Enum):
     MAINTENANCE = "maintenance"
     FAILURE_ANALYSIS = "failure_analysis"
     TOOL_BUILD = "tool_build"
+    STAFF_MEETING = "staff_meeting"
 
 
 class GoalEngagementMode(str, Enum):
@@ -104,6 +105,7 @@ AGENT_ROLES = frozenset(
         AGENT_ROLE_CREW_CHIEF,
         AGENT_ROLE_EXECUTIVE,
         "financial",
+        "engineer",
         "infrastructure",
         "planner",
         "prototype",
@@ -112,7 +114,13 @@ AGENT_ROLES = frozenset(
 )
 
 PROPOSAL_KINDS = frozenset(
-    {"efficiency", "tool_request", "rest_insight", "policy_change"}
+    {
+        "efficiency",
+        "tool_request",
+        "rest_insight",
+        "policy_change",
+        "staff_meeting_request",
+    }
 )
 PROPOSAL_STATUSES = frozenset({"proposed", "approved", "rejected", "implemented", "expired"})
 

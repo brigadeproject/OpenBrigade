@@ -87,3 +87,12 @@ def test_policy_projections_migration_exists():
     assert "create table if not exists brigade_policy_projections" in sql
     assert "content_hash text not null" in sql
     assert "unique (agent_id, path)" in sql
+
+
+def test_staff_meeting_migration_exists():
+    sql = Path("migrations/0016_staff_meetings.sql").read_text(encoding="utf-8")
+
+    assert "create table if not exists brigade_staff_meetings" in sql
+    assert "create table if not exists brigade_staff_meeting_role_catalogs" in sql
+    assert "create table if not exists brigade_staff_meeting_records" in sql
+    assert "brigade_staff_meeting_records_idempotency_idx" in sql

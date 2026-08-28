@@ -29,6 +29,7 @@ from brigade.citations import (
     enforce_citation_answer,
 )
 from brigade.connectors import ConnectorChatReply, IncomingConnectorMessage
+from brigade.governance import reconcile_policy_projection_after_trusted_write
 from brigade.knowledge import ingest_text, store_ingest_result
 from brigade.memory import (
     build_memory_entry,
@@ -58,6 +59,7 @@ from brigade.services import (
     attach_operator_guidance,
     lookup_assignment,
 )
+from brigade.staff_meeting import approve_freeze_and_dispatch, create_staff_meeting
 from brigade.store import StateStore
 from brigade.time import utc_now_iso
 from brigade.tools import (
@@ -287,6 +289,13 @@ def _tool_remember(context: ExecutiveToolContext, arguments: dict[str, Any]) -> 
         note=note,
         metadata=metadata,
     )
+    reconcile_policy_projection_after_trusted_write(
+        context.store,
+        context.agent,
+        "MEMORY.md",
+        actor=context.operator,
+        source="executive:explicit-memory",
+    )
     return ToolResult(
         True,
         "remembered explicit operator memory",
@@ -294,8 +303,104 @@ def _tool_remember(context: ExecutiveToolContext, arguments: dict[str, Any]) -> 
     )
 
 
+def _tool_convene_staff_meeting(
+    context: ExecutiveToolContext,
+    arguments: dict[str, Any],
+) -> ToolResult:
+    request = str(arguments.get("request") or "").strip()
+    criteria = [
+        str(item).strip()
+        for item in arguments.get("acceptance_criteria") or []
+        if str(item).strip()
+    ]
+    if not request:
+        return ToolResult(False, "convene_staff_meeting needs a request")
+    if not criteria:
+        return ToolResult(False, "convene_staff_meeting needs acceptance_criteria")
+    eligible_agents = [
+        item
+        for item in context.store.agents()
+        if item.role != AGENT_ROLE_EXECUTIVE or item.agent_id == context.persona.agent_id
+    ]
+    limit_names = {
+        "max_deliberation_rounds",
+        "max_follow_up_discussions",
+        "max_follow_up_rounds",
+        "max_elapsed_seconds",
+        "max_total_tokens",
+        "max_tool_calls",
+    }
+    limits = {key: arguments[key] for key in limit_names if arguments.get(key) is not None}
+    try:
+        meeting = create_staff_meeting(
+            context.store,
+            original_request=request,
+            acceptance_criteria=criteria,
+            chair_agent_id=context.persona.agent_id,
+            owner_username=context.operator,
+            caller_kind="executive",
+            eligible_agents=eligible_agents,
+            desired_deliverable=str(arguments.get("desired_deliverable") or "Decision report"),
+            known_constraints=arguments.get("known_constraints") or [],
+            declared_assumptions=arguments.get("declared_assumptions") or [],
+            evidence_refs=arguments.get("evidence_refs") or [],
+            seat_count=max(5, int(arguments.get("seat_count") or 5)),
+            resource_limits=limits,
+            idempotency_key=str(
+                arguments.get("idempotency_key")
+                or f"executive-chat:{context.request_message_id}:staff-meeting"
+            ),
+        )
+        meeting = approve_freeze_and_dispatch(
+            context.store,
+            meeting["meeting_id"],
+            actor_id=context.persona.agent_id,
+        )
+    except (PermissionError, TypeError, ValueError) as exc:
+        return ToolResult(False, str(exc))
+    return ToolResult(
+        True,
+        (
+            f"Staff Meeting {meeting['meeting_id']} was convened on the user's behalf; "
+            "independent review is queued"
+        ),
+        {
+            "meeting_id": meeting["meeting_id"],
+            "status": "INDEPENDENT_REVIEW",
+            "conversation_id": meeting["conversation_id"],
+            "roster": meeting["approved_roster"],
+            "roster_warnings": meeting["roster_warnings"],
+        },
+    )
+
+
 def executive_query_registry(*, include_web_fetch: bool = True) -> ToolRegistry:
     registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="convene_staff_meeting",
+            description=(
+                "Convene a durable Staff Meeting on the user's behalf for a large "
+                "cross-domain project, consequential decision, or unresolved problem."
+            ),
+            argument_schema={
+                "request": "the decision or problem the panel must address",
+                "acceptance_criteria": "array of criteria defined by the Executive chair",
+                "desired_deliverable": "optional desired decision-report form",
+                "known_constraints": "optional array of constraints",
+                "declared_assumptions": "optional array of assumptions",
+                "evidence_refs": "optional array of evidence references",
+                "seat_count": "optional integer from 5 through 12; default 5",
+                "max_deliberation_rounds": "optional integer at most 3",
+                "max_follow_up_rounds": "optional integer at most 3",
+                "max_elapsed_seconds": "optional integer at most 7200",
+                "max_total_tokens": "optional integer at most 100000",
+                "max_tool_calls": "optional integer at most 60",
+                "idempotency_key": "optional stable caller key",
+            },
+        ),
+        _tool_convene_staff_meeting,
+    )
     registry.register(
         ToolSpec(
             name="brigade_status",

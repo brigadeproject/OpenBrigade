@@ -49,6 +49,28 @@ Team delegation and escalation prompts should include:
 
 This keeps team movement auditable and prevents implicit cross-team authority.
 
+## Staff Meeting Prompts
+
+Staff Meeting prompts are phase-specific contracts generated from a frozen packet and immutable
+meeting records. They do not implement meeting policy. The harness owns authorization, transitions,
+quorum, voting, veto clearance, limits, and persistence.
+
+- Independent-review prompts contain equivalent packet material plus one role lens and do not
+  expose other panel responses.
+- Synthesis prompts go only to the chair and include the structured panel responses required for
+  synthesis.
+- Deliberation and targeted follow-up prompts contain the current synthesis and deterministic,
+  attributed excerpts. Mandatory veto, dissent, contradiction, risk, and objection spans cannot be
+  suppressed by chair wording.
+- Ballot prompts produce one secret role-seat ballot. A discussion after reveal opens a new secret
+  ballot round; it does not rewrite an earlier ballot.
+- Final-report prompts supply current-round ballots and vetoes. The harness renders the required
+  fifteen-section report around the chair's conclusion and independently computed arithmetic.
+
+Every model response still uses the ordinary OpenBrigade outer completion envelope. Its `summary`
+is a JSON-encoded phase object that the harness validates before accepting the seat as responsive.
+Malformed output becomes an absence; the harness never fabricates a response or vote for that seat.
+
 ## Proactive Mission Continuation
 
 Mission continuation is bounded and observable. The default mode is propose-only:

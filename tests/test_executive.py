@@ -16,6 +16,7 @@ from brigade.executive import (
     resolve_executive_persona,
     run_executive_chat_turn,
 )
+from brigade.governance import ensure_policy_projections_current, policy_projection_diff
 from brigade.runner import run_managed_agents
 from brigade.schemas import Agent, Assignment, Role, User
 from brigade.state import JsonStateStore
@@ -126,6 +127,46 @@ def test_executive_can_stage_and_apply_task_action(tmp_path):
     assert assignment.source == "executive_chat"
     assert assignment.assigned_to == "ada"
     assert assignment.created_by_role == "executive"
+
+
+def test_executive_explicit_memory_reconciles_policy_projection(tmp_path):
+    store = _store(tmp_path)
+    persona = resolve_executive_persona(store, "owner")
+    agent = next(item for item in store.agents() if item.agent_id == persona.agent_id)
+    ensure_agent_workspace(agent, tmp_path)
+    ensure_policy_projections_current(store, agent)
+    thread = store.resolve_active_conversation("owner", persona.persona_id)
+    provider = SequencedTestProvider(
+        [
+            json.dumps(
+                {
+                    "status": "tool_call",
+                    "tool": "remember",
+                    "arguments": {"note": "Operator prefers Friday demos."},
+                }
+            ),
+            "Remembered.",
+        ]
+    )
+
+    result = run_executive_chat_turn(
+        store,
+        thread=thread,
+        persona=persona,
+        operator="owner",
+        content="remember that I prefer Friday demos",
+        provider=provider,
+    )
+
+    assert result["status"] == "complete"
+    assert policy_projection_diff(store, agent) == []
+    reconciliations = [
+        item
+        for item in store.provenance_records()
+        if item.get("event") == "policy_projection_reconciled"
+    ]
+    assert reconciliations[-1]["path"] == "MEMORY.md"
+    assert reconciliations[-1]["source"] == "executive:explicit-memory"
 
 
 def test_legal_executive_answer_requires_a_valid_retrieved_citation(tmp_path, monkeypatch):

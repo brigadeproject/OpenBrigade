@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from brigade.governance import ensure_policy_projections_current, policy_projection_diff
 from brigade.memory import MAX_MEMORY_BYTES
 from brigade.orchestrator import OrchestrationConfig, run_full_cycle
 from brigade.rest import (
@@ -238,10 +239,19 @@ def _finalizer_fixture(tmp_path):
 
 def test_finalizer_enforces_memory_cap_and_persists_outputs(tmp_path):
     store, agent, workspace, assignment = _finalizer_fixture(tmp_path)
+    ensure_policy_projections_current(store, agent)
 
     result = finalize_rest_assignment(store, agent, assignment)
 
     assert len((workspace / "MEMORY.md").read_bytes()) <= MAX_MEMORY_BYTES
+    assert policy_projection_diff(store, agent) == []
+    reconciliations = [
+        item
+        for item in store.provenance_records()
+        if item.get("event") == "policy_projection_reconciled"
+    ]
+    assert reconciliations[-1]["path"] == "MEMORY.md"
+    assert reconciliations[-1]["source"] == "rest_cycle"
     # One proposal row per ## Proposals bullet, kinds from the tags.
     proposals = store.proposals()
     assert len(proposals) == 3

@@ -25,6 +25,7 @@ const OPS_ROOM_FALLBACK_ROOMS: OpsRoomRoom[] = [
 const TAB_VIEWS = [
   { id: "cockpit", label: "Cockpit" },
   { id: "chat", label: "Chat" },
+  { id: "staff_meetings", label: "Staff Meetings" },
   { id: "brigade", label: "Brigade" },
   { id: "agents", label: "Agents & Teams" },
   { id: "proposals", label: "Proposals" },
@@ -186,6 +187,52 @@ type Message = {
   content: string;
   metadata?: Record<string, unknown>;
   created_at: string;
+};
+
+type StaffMeetingRecord = {
+  record_id: string;
+  record_kind: string;
+  role_key?: string | null;
+  agent_id?: string | null;
+  phase?: string | null;
+  round_number?: number | null;
+  created_at: string;
+  payload: Record<string, unknown>;
+};
+
+type StaffMeeting = {
+  meeting_id: string;
+  conversation_id: string;
+  owner_username?: string | null;
+  team_id?: string | null;
+  chair_agent_id: string;
+  status: string;
+  original_request: string;
+  original_request_hash: string;
+  acceptance_criteria: string[];
+  approved_roster: Array<{
+    role_seat_id: string;
+    role_key: string;
+    role_family: string;
+    agent_id: string;
+    veto_domain?: string | null;
+  }>;
+  quorum_required: number;
+  current_round: number;
+  packet_version: number;
+  ballots_revealed?: boolean;
+  vote_result?: Record<string, unknown> | null;
+  termination_reason?: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+  record_counts?: Record<string, number>;
+  records?: StaffMeetingRecord[];
+};
+
+type StaffMeetingList = {
+  meetings: StaffMeeting[];
+  count: number;
 };
 
 type AlertRecord = {
@@ -904,6 +951,8 @@ function App() {
             onRefresh={refreshAll}
             setStatus={setStatus}
           />
+        ) : view === "staff_meetings" ? (
+          <StaffMeetingsView api={api} setStatus={setStatus} />
         ) : view === "agents" ? (
           <AgentManagementView
             agents={agents}
@@ -1212,6 +1261,218 @@ function MetricCard({
         <span>{pending ? "pending host collector" : sublabel || ""}</span>
       </div>
     </div>
+  );
+}
+
+function StaffMeetingsView({
+  api,
+  setStatus,
+}: {
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  setStatus: (message: string) => void;
+}) {
+  const [meetings, setMeetings] = useState<StaffMeeting[]>([]);
+  const [total, setTotal] = useState(0);
+  const [selectedId, setSelectedId] = useState("");
+  const [detail, setDetail] = useState<StaffMeeting | null>(null);
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [teamFilter, setTeamFilter] = useState("");
+  const [ownerFilter, setOwnerFilter] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  const listPath = useMemo(() => {
+    const params = new URLSearchParams();
+    if (query.trim()) params.set("query", query.trim());
+    if (statusFilter) params.set("status", statusFilter);
+    if (teamFilter.trim()) params.set("team_id", teamFilter.trim());
+    if (ownerFilter.trim()) params.set("owner_username", ownerFilter.trim());
+    params.set("limit", "200");
+    return `/api/staff-meetings?${params.toString()}`;
+  }, [ownerFilter, query, statusFilter, teamFilter]);
+
+  const load = useCallback(async (quiet = false) => {
+    if (!quiet) setLoading(true);
+    try {
+      const payload = await api<StaffMeetingList>(listPath);
+      setMeetings(payload.meetings);
+      setTotal(payload.count);
+      setSelectedId((current) => current || payload.meetings[0]?.meeting_id || "");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    } finally {
+      if (!quiet) setLoading(false);
+    }
+  }, [api, listPath, setStatus]);
+
+  const loadDetail = useCallback(async (meetingId: string, quiet = false) => {
+    if (!meetingId) {
+      setDetail(null);
+      return;
+    }
+    try {
+      setDetail(await api<StaffMeeting>(`/api/staff-meetings/${meetingId}`));
+    } catch (error) {
+      if (!quiet) setStatus(errorMessage(error));
+    }
+  }, [api, setStatus]);
+
+  useEffect(() => {
+    load().catch(() => undefined);
+  }, [load]);
+
+  useEffect(() => {
+    loadDetail(selectedId).catch(() => undefined);
+  }, [loadDetail, selectedId]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      load(true).catch(() => undefined);
+      if (selectedId) loadDetail(selectedId, true).catch(() => undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [load, loadDetail, selectedId]);
+
+  return (
+    <section className="staff-meetings-view">
+      <div className="staff-meeting-browser panel">
+        <header className="panel-header">
+          <div>
+            <strong>Staff Meeting Recall</strong>
+            <span>{total} durable meeting{total === 1 ? "" : "s"}</span>
+          </div>
+          <span className="health-dot good">live</span>
+        </header>
+        <div className="staff-meeting-filters">
+          <input
+            aria-label="Search Staff Meetings"
+            placeholder="Request, role, chair, date, outcome, veto, or ID"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <select
+            aria-label="Staff Meeting status"
+            value={statusFilter}
+            onChange={(event) => setStatusFilter(event.target.value)}
+          >
+            <option value="">All statuses</option>
+            {[
+              "INDEPENDENT_REVIEW", "SYNTHESIS", "DELIBERATION", "TARGETED_FOLLOW_UP",
+              "FINAL_VOTE", "FINAL_REPORT", "COMPLETED", "COMPLETED_WITH_DISSENT",
+              "COMPLETED_NO_CONSENSUS", "MOTION_NOT_ADOPTED", "BLOCKED_BY_VETO",
+              "FAILED_NO_QUORUM", "RESOURCE_LIMIT_REACHED",
+            ].map((value) => <option key={value}>{value}</option>)}
+          </select>
+          <input
+            aria-label="Filter by team"
+            placeholder="Team"
+            value={teamFilter}
+            onChange={(event) => setTeamFilter(event.target.value)}
+          />
+          <input
+            aria-label="Filter by owner"
+            placeholder="Owner"
+            value={ownerFilter}
+            onChange={(event) => setOwnerFilter(event.target.value)}
+          />
+        </div>
+        <div className="staff-meeting-list">
+          {loading && meetings.length === 0 ? (
+            <div className="empty-state">Loading Staff Meetings…</div>
+          ) : meetings.length === 0 ? (
+            <div className="empty-state">No Staff Meetings match these fields.</div>
+          ) : meetings.map((meeting) => (
+            <button
+              type="button"
+              key={meeting.meeting_id}
+              className={`staff-meeting-row ${selectedId === meeting.meeting_id ? "selected" : ""}`}
+              onClick={() => setSelectedId(meeting.meeting_id)}
+            >
+              <span className="staff-meeting-row-head">
+                <strong>{meeting.original_request}</strong>
+                <span className={`status-pill status-${meeting.status.toLowerCase()}`}>
+                  {meeting.status}
+                </span>
+              </span>
+              <span>
+                {formatTime(meeting.updated_at)} · chair {meeting.chair_agent_id}
+                {meeting.team_id ? ` · team ${meeting.team_id}` : ""}
+              </span>
+              <span>
+                {meeting.approved_roster.map((seat) => seat.role_key).join(" · ")}
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="staff-meeting-detail panel">
+        <header className="panel-header">
+          <div>
+            <strong>Conversation / Workflow</strong>
+            <span>{detail ? detail.meeting_id : "Select a meeting"}</span>
+          </div>
+        </header>
+        {!detail ? (
+          <div className="empty-state">Select a Staff Meeting to inspect its provenance.</div>
+        ) : (
+          <div className="staff-meeting-detail-scroll">
+            <div className="staff-meeting-summary-grid">
+              <span>Status<strong>{detail.status}</strong></span>
+              <span>Packet<strong>v{detail.packet_version}</strong></span>
+              <span>Round<strong>{detail.current_round || 0}</strong></span>
+              <span>Quorum<strong>{detail.quorum_required}/{detail.approved_roster.length}</strong></span>
+              <span>Owner<strong>{detail.owner_username || "team-owned"}</strong></span>
+              <span>Team<strong>{detail.team_id || "—"}</strong></span>
+            </div>
+            <section className="staff-meeting-block">
+              <h3>Original request</h3>
+              <p>{detail.original_request}</p>
+              <code>{detail.original_request_hash}</code>
+            </section>
+            <section className="staff-meeting-block">
+              <h3>Acceptance criteria</h3>
+              <ul>{detail.acceptance_criteria.map((item) => <li key={item}>{item}</li>)}</ul>
+            </section>
+            <section className="staff-meeting-block">
+              <h3>Roster</h3>
+              <div className="staff-meeting-roster">
+                {detail.approved_roster.map((seat) => (
+                  <span key={seat.role_seat_id}>
+                    <strong>{seat.role_key}</strong>
+                    {seat.agent_id}{seat.veto_domain ? ` · ${seat.veto_domain} veto` : ""}
+                  </span>
+                ))}
+              </div>
+            </section>
+            {detail.vote_result && (
+              <section className="staff-meeting-block">
+                <h3>Vote arithmetic</h3>
+                <pre>{JSON.stringify(detail.vote_result, null, 2)}</pre>
+              </section>
+            )}
+            <section className="staff-meeting-block">
+              <h3>Audit timeline</h3>
+              <div className="staff-meeting-timeline">
+                {(detail.records || []).map((record) => (
+                  <article key={record.record_id}>
+                    <span>{formatTime(record.created_at)}</span>
+                    <strong>{record.record_kind}</strong>
+                    <span>
+                      {[record.phase, record.role_key, record.agent_id].filter(Boolean).join(" · ")}
+                    </span>
+                    <pre>{JSON.stringify(record.payload, null, 2)}</pre>
+                  </article>
+                ))}
+              </div>
+              {!detail.ballots_revealed && detail.status === "FINAL_VOTE" && (
+                <p className="inline-warning">Formal ballots remain secret until voting closes.</p>
+              )}
+            </section>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 

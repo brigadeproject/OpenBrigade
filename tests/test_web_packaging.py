@@ -93,8 +93,23 @@ def test_v092_frontend_wires_cockpit_auth_and_ops_room_workflows() -> None:
         "PermissionNotice",
         'permission="task:write"',
         "Read-only role",
+        "Staff Meetings",
+        "/api/staff-meetings",
+        "Staff Meeting Recall",
     ):
         assert expected in source
+
+
+def test_staff_meeting_viewer_is_read_only_and_live() -> None:
+    source = (ROOT / "web" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert 'id: "staff_meetings"' in source
+    assert "/api/staff-meetings" in source
+    assert "setInterval" in source
+    assert "ballots remain secret" in source.lower()
+    start = source.index("function StaffMeetingsView")
+    end = source.index("\nfunction ", start + 1)
+    assert 'method: "POST"' not in source[start:end]
 
 
 def test_v092_browser_smoke_script_captures_main_views() -> None:

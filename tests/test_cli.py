@@ -40,6 +40,33 @@ def test_cli_agent_policy_diff_and_accept(tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)[0]["path"] == "IDENTITY.md"
 
 
+def test_cli_memory_curate_reconciles_policy_projection(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    assert main(["agent", "onboard", "--id", "ada", "--name", "ADA"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "memory",
+                "append",
+                "--agent",
+                "ada",
+                "--date",
+                "20260828",
+                "--note",
+                "Durable release fact.",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert main(["memory", "curate", "--agent", "ada"]) == 0
+    capsys.readouterr()
+    assert main(["agent", "policy", "diff", "ada"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
 def test_cli_research_status_and_staged_policy(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
 

@@ -65,6 +65,7 @@ from brigade.services import (
     apply_chief_chat_actions,
     lookup_assignment,
 )
+from brigade.staff_meeting import approve_freeze_and_dispatch, create_staff_meeting
 from brigade.store import StateStore
 from brigade.time import parse_utc_iso, utc_now, utc_now_iso
 from brigade.tools import (
@@ -237,6 +238,87 @@ def _int_arg(arguments: dict[str, Any], name: str, default: int) -> int:
         return max(1, int(arguments.get(name) or default))
     except (TypeError, ValueError):
         return default
+
+
+def _tool_convene_staff_meeting(
+    context: ChatToolContext,
+    arguments: dict[str, Any],
+) -> ToolResult:
+    if context.persona.is_front_desk or not context.persona.chief_agent_id:
+        return ToolResult(False, "only a Crew Chief persona may convene a Staff Meeting")
+    request = str(arguments.get("request") or "").strip()
+    criteria = [
+        str(item).strip()
+        for item in arguments.get("acceptance_criteria") or []
+        if str(item).strip()
+    ]
+    if not request:
+        return ToolResult(False, "convene_staff_meeting needs a request")
+    if not criteria:
+        return ToolResult(False, "convene_staff_meeting needs acceptance_criteria")
+    eligible_ids = {
+        context.persona.chief_agent_id,
+        *context.persona.managed_agent_ids,
+    }
+    eligible_agents = [
+        item for item in context.store.agents() if item.agent_id in eligible_ids
+    ]
+    limit_names = {
+        "max_deliberation_rounds",
+        "max_follow_up_discussions",
+        "max_follow_up_rounds",
+        "max_elapsed_seconds",
+        "max_total_tokens",
+        "max_tool_calls",
+    }
+    limits = {key: arguments[key] for key in limit_names if arguments.get(key) is not None}
+    try:
+        meeting = create_staff_meeting(
+            context.store,
+            original_request=request,
+            acceptance_criteria=criteria,
+            chair_agent_id=context.persona.chief_agent_id,
+            owner_username=context.operator,
+            caller_kind="crew_chief",
+            eligible_agents=eligible_agents,
+            team_id=context.persona.team_id,
+            scope={"team_id": context.persona.team_id},
+            desired_deliverable=str(arguments.get("desired_deliverable") or "Decision report"),
+            known_constraints=arguments.get("known_constraints") or [],
+            declared_assumptions=arguments.get("declared_assumptions") or [],
+            evidence_refs=arguments.get("evidence_refs") or [],
+            seat_count=_int_arg(arguments, "seat_count", 5),
+            resource_limits=limits,
+            idempotency_key=str(
+                arguments.get("idempotency_key")
+                or f"chief-chat:{context.request_message_id}:staff-meeting"
+            ),
+        )
+        meeting = approve_freeze_and_dispatch(
+            context.store,
+            meeting["meeting_id"],
+            actor_id=context.persona.chief_agent_id,
+        )
+    except (PermissionError, ValueError) as exc:
+        return ToolResult(False, str(exc))
+    context.store.add_alert(
+        f"Crew Chief {context.persona.chief_agent_id} convened Staff Meeting "
+        f"{meeting['meeting_id']} for {context.operator}."
+    )
+    return ToolResult(
+        True,
+        (
+            f"Staff Meeting {meeting['meeting_id']} was convened; "
+            "the roster is approved and independent review is queued"
+        ),
+        {
+            "meeting_id": meeting["meeting_id"],
+            "status": "INDEPENDENT_REVIEW",
+            "conversation_id": meeting["conversation_id"],
+            "roster": meeting["approved_roster"],
+            "roster_warnings": meeting["roster_warnings"],
+        },
+    )
 
 
 def _tool_list_tasks(context: ChatToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -557,6 +639,32 @@ def chief_query_registry(*, include_web_fetch: bool = True) -> ToolRegistry:
     ``native_tool_specs`` marks an argument required unless its description
     contains the word "optional"."""
     registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="convene_staff_meeting",
+            description=(
+                "Convene a durable Staff Meeting for a large cross-domain project, "
+                "consequential decision, or unresolved operational problem. Crew Chiefs "
+                "approve the deterministic roster and the operator is alerted."
+            ),
+            argument_schema={
+                "request": "the decision or problem the panel must address",
+                "acceptance_criteria": "array of criteria defined by the chair",
+                "desired_deliverable": "optional desired decision-report form",
+                "known_constraints": "optional array of constraints",
+                "declared_assumptions": "optional array of assumptions",
+                "evidence_refs": "optional array of evidence references",
+                "seat_count": "optional integer from 5 through 12; default 5",
+                "max_deliberation_rounds": "optional integer at most 3",
+                "max_follow_up_rounds": "optional integer at most 3",
+                "max_elapsed_seconds": "optional integer at most 7200",
+                "max_total_tokens": "optional integer at most 100000",
+                "max_tool_calls": "optional integer at most 60",
+                "idempotency_key": "optional stable caller key",
+            },
+        ),
+        _tool_convene_staff_meeting,
+    )
     registry.register(
         ToolSpec(
             name="list_tasks",

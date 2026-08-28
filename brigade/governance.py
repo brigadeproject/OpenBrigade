@@ -138,6 +138,61 @@ def upsert_policy_projection(
     return projection
 
 
+def reconcile_policy_projection_after_trusted_write(
+    store: Any,
+    agent: Agent,
+    relative_path: str | Path,
+    *,
+    actor: str,
+    source: str,
+) -> dict[str, Any]:
+    """Reconcile a governed file changed by an authorized runtime workflow.
+
+    Operator acceptance remains an explicit ``agent:write`` action. This path is
+    for trusted mutations that are already authorized by their owning workflow,
+    such as rest-cycle curation or an explicit owner memory request.
+    """
+    normalized = normalize_workspace_relative_path(relative_path)
+    if not is_governing_workspace_path(normalized):
+        raise ValueError(f"{normalized} is not a governed workspace policy file")
+    workspace = store.data_dir / agent.workspace_path
+    current = build_policy_projection(
+        agent,
+        workspace,
+        normalized,
+        actor=actor,
+        source=source,
+    )
+    existing = store.policy_projection(agent.agent_id, normalized)
+    changed = existing is None or any(
+        existing.get(key) != current.get(key)
+        for key in ("content_hash", "parsed_version", "status")
+    )
+    if not changed:
+        return existing
+
+    store.upsert_policy_projection(current)
+    store.add_provenance_record(
+        {
+            "record_id": (
+                "policy_projection_reconciled:"
+                f"{agent.agent_id}:{normalized}:{uuid4()}"
+            ),
+            "node_id": agent.agent_id,
+            "node_type": "agent_policy_projection",
+            "event": "policy_projection_reconciled",
+            "agent_id": agent.agent_id,
+            "path": normalized,
+            "actor": actor,
+            "source": source,
+            "old_content_hash": existing.get("content_hash") if existing else None,
+            "new_content_hash": current["content_hash"],
+            "created_at": utc_now_iso(),
+        }
+    )
+    return current
+
+
 def ensure_policy_projections_current(
     store: Any,
     agent: Agent,

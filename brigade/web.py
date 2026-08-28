@@ -107,6 +107,7 @@ from brigade.services import (
     set_runtime_overrides,
     update_assignment_fields,
 )
+from brigade.staff_meeting import meeting_public_view
 from brigade.store import RedisRuntimeClient, StateStore, open_state_store
 from brigade.time import utc_now_iso
 from brigade.tui import build_dashboard_payload
@@ -568,6 +569,100 @@ def create_app(
             while True:
                 payload = build_ops_room_payload(store)
                 yield f"event: snapshot\ndata: {json.dumps(payload, sort_keys=True)}\n\n"
+                await asyncio.sleep(2.0)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/staff-meetings")
+    async def staff_meetings(
+        status: str | None = None,
+        team_id: str | None = None,
+        owner_username: str | None = None,
+        query: str | None = None,
+        limit: int = 100,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        require("status:read", current)
+        meetings = store.staff_meetings(
+            status=status or None,
+            team_id=team_id or None,
+            owner_username=owner_username or None,
+        )
+        if query and query.strip():
+            needle = query.strip().lower()
+            meetings = [
+                item
+                for item in meetings
+                if needle
+                in " ".join(
+                    [
+                        str(item.get("meeting_id") or ""),
+                        str(item.get("original_request") or ""),
+                        str(item.get("chair_agent_id") or ""),
+                        str(item.get("team_id") or ""),
+                        str(item.get("owner_username") or ""),
+                        str(item.get("status") or ""),
+                        str(item.get("created_at") or ""),
+                        str(item.get("completed_at") or ""),
+                        str(item.get("termination_reason") or ""),
+                        str(item.get("veto_status") or ""),
+                        str(item.get("vote_result", {}).get("outcome") or ""),
+                        " ".join(
+                            str(seat.get("role_key") or "")
+                            for seat in item.get("approved_roster", [])
+                        ),
+                    ]
+                ).lower()
+            ]
+        selected = meetings[: max(1, min(int(limit), 500))]
+        return {
+            "meetings": [meeting_public_view(store, item) for item in selected],
+            "count": len(meetings),
+        }
+
+    @app.get("/api/staff-meetings/{meeting_id}")
+    async def staff_meeting_detail(
+        meeting_id: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        require("status:read", current)
+        meeting = store.find_staff_meeting(meeting_id)
+        if meeting is None:
+            raise HTTPException(status_code=404, detail="unknown Staff Meeting")
+        return meeting_public_view(store, meeting, include_records=True)
+
+    @app.get("/api/staff-meetings/{meeting_id}/events")
+    async def staff_meeting_events(
+        meeting_id: str,
+        current: AuthResult = auth_dependency,
+    ):
+        require("status:read", current)
+        if store.find_staff_meeting(meeting_id) is None:
+            raise HTTPException(status_code=404, detail="unknown Staff Meeting")
+
+        async def events():
+            while True:
+                meeting = store.find_staff_meeting(meeting_id)
+                if meeting is None:
+                    yield "event: deleted\ndata: {}\n\n"
+                    return
+                payload = meeting_public_view(store, meeting, include_records=True)
+                yield f"event: snapshot\ndata: {json.dumps(payload, sort_keys=True)}\n\n"
+                if meeting.get("status") in {
+                    "COMPLETED",
+                    "COMPLETED_WITH_DISSENT",
+                    "COMPLETED_NO_CONSENSUS",
+                    "MOTION_NOT_ADOPTED",
+                    "BLOCKED_BY_VETO",
+                    "FAILED_NO_QUORUM",
+                    "CANCELLED",
+                    "RESOURCE_LIMIT_REACHED",
+                }:
+                    return
                 await asyncio.sleep(2.0)
 
         return StreamingResponse(

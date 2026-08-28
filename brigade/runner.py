@@ -54,6 +54,7 @@ from brigade.tools import (
     ToolRegistry,
     default_tool_registry,
     native_tool_specs,
+    staff_meeting_tool_registry,
 )
 from brigade.workspace import (
     HeartbeatValidationError,
@@ -162,6 +163,11 @@ def run_managed_agents(
                 item.agent_id
                 for item in store.agents()
                 if item.role != AGENT_ROLE_EXECUTIVE
+                or (
+                    (assignment := store.active_assignment_for_agent(item.agent_id))
+                    is not None
+                    and assignment.kind == AssignmentKind.STAFF_MEETING
+                )
             ),
             key=lambda item: _LAST_SERVED_AT.get(item, 0.0),
         )
@@ -277,6 +283,8 @@ def run_agent_once(
     if assignment is None:
         raise ValueError(f"no active assignment for agent: {agent_id}")
     registry = tool_registry or default_tool_registry()
+    if assignment.kind == AssignmentKind.STAFF_MEETING:
+        registry = staff_meeting_tool_registry()
 
     try:
         heartbeat_assignment = parse_heartbeat_assignment_block(
@@ -427,6 +435,7 @@ def run_agent_once(
                 "citation_validation_errors": parsed.citation_validation_errors,
                 "available_citations": parsed.available_citations,
                 "citation_draft": parsed.citation_draft,
+                "tool_calls": len(observations),
             }
         )
         for index, response_item in enumerate(responses, start=1):
