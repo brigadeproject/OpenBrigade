@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ from brigade.config import Settings
 from brigade.time import add_seconds_iso, utc_now_iso
 
 MODEL_AUTH_PROVIDERS = {"openai", "openai-codex", "gemini"}
+TELEGRAM_ACCOUNT_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 
 
 def write_oauth_credential(
@@ -115,6 +117,50 @@ def oauth_credential_expired(credential: dict[str, Any]) -> bool:
 def oauth_credential_path(settings: Settings, provider: str) -> Path:
     root = settings.secret_store_path or (settings.data_dir / "secrets")
     return root / "model-auth" / f"{_normalize_provider(provider)}.oauth.json"
+
+
+def write_telegram_bot_token(settings: Settings, account_id: str, token: str) -> Path:
+    normalized = _normalize_telegram_account_id(account_id)
+    value = token.strip()
+    if not value:
+        raise ValueError("Telegram bot token is required")
+    path = telegram_bot_token_path(settings, normalized)
+    _ensure_secret_dir(path.parent)
+    path.write_text(value + "\n", encoding="utf-8")
+    _chmod_secret(path)
+    return path
+
+
+def read_telegram_bot_token(settings: Settings, account_id: str) -> str | None:
+    path = telegram_bot_token_path(settings, account_id)
+    if not path.exists():
+        return None
+    value = path.read_text(encoding="utf-8").strip()
+    return value or None
+
+
+def delete_telegram_bot_token(settings: Settings, account_id: str) -> bool:
+    path = telegram_bot_token_path(settings, account_id)
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
+def telegram_bot_token_path(settings: Settings, account_id: str) -> Path:
+    normalized = _normalize_telegram_account_id(account_id)
+    root = settings.secret_store_path or (settings.data_dir / "secrets")
+    return root / "connectors" / "telegram" / f"{normalized}.token"
+
+
+def _normalize_telegram_account_id(account_id: str) -> str:
+    normalized = account_id.strip().lower()
+    if not TELEGRAM_ACCOUNT_ID_RE.fullmatch(normalized):
+        raise ValueError(
+            "Telegram account id must start with a letter and contain only "
+            "lowercase letters, digits, underscores, or hyphens"
+        )
+    return normalized
 
 
 def _normalize_provider(provider: str) -> str:

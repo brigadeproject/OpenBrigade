@@ -136,6 +136,9 @@ class ToolRegistry:
                 restricted.register(spec, handler)
         return restricted
 
+    def extend(self, other: ToolRegistry) -> None:
+        self._tools.update(other._tools)
+
     def execute(self, name: str, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         item = self._tools.get(name)
         if item is None:
@@ -821,6 +824,13 @@ def _shell(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         or not all(isinstance(item, str) for item in command)
     ):
         return ToolResult(False, "command must be a non-empty array of strings")
+    if getattr(context, "direct_chief_turn", False):
+        executable = Path(command[0]).name.lower()
+        if executable in {"sudo", "su", "doas"}:
+            return ToolResult(
+                False,
+                "privilege brokers are unavailable through shell; use a named maintenance action",
+            )
     timeout = min(int(arguments.get("timeout_seconds") or 30), 30)
     completed = subprocess.run(
         command,

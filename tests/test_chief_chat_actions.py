@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from brigade.chief_chat import resolve_persona, run_chief_chat_turn
-from brigade.schemas import Agent, Assignment, AssignmentStatus, Priority, Team
+from brigade.schemas import Agent, Assignment, AssignmentStatus, Priority, Role, Team, User
 from brigade.services import apply_chief_chat_actions
 from brigade.state import JsonStateStore
 from tests.helpers import SequencedTestProvider
@@ -106,7 +106,7 @@ def test_decline_discards_without_applying(tmp_path):
     assert store.find_assignment(task.assignment_id) is not None
 
 
-def test_confirm_creates_assignment_for_managed_agent(tmp_path):
+def test_explicit_task_creation_applies_immediately_for_owner(tmp_path):
     store = _fleet(tmp_path)
     provider = SequencedTestProvider(
         [
@@ -122,9 +122,7 @@ def test_confirm_creates_assignment_for_managed_agent(tmp_path):
             )
         ]
     )
-    _turn(store, provider, content="have worker0 write the migration")
-    provider = SequencedTestProvider([])
-    applied = _turn(store, provider, content="confirm")
+    applied = _turn(store, provider, content="have worker0 write the migration")
 
     assert applied["status"] == "applied"
     created = applied["actions_applied"][0]
@@ -134,6 +132,52 @@ def test_confirm_creates_assignment_for_managed_agent(tmp_path):
     assert persisted is not None
     assert persisted.priority == Priority.HIGH
     assert persisted.source == "chief_chat"
+    response = store.messages(applied["conversation_id"])[-1]
+    assert 'Created task "Write the migration" for worker0' in response.content
+    assert "{" not in response.content
+
+
+def test_non_owner_task_creation_still_requires_confirmation(tmp_path):
+    store = _fleet(tmp_path)
+    store.add_user(User("owner", Role.OWNER))
+    store.add_user(User("operator", Role.OPERATOR))
+    provider = SequencedTestProvider(
+        [
+            _propose(
+                [
+                    {
+                        "type": "create_assignment",
+                        "agent_id": "worker0",
+                        "assignment": "Write the migration",
+                    }
+                ]
+            )
+        ]
+    )
+
+    staged = _turn(store, provider, operator="operator", content="create the task")
+
+    assert staged["status"] == "proposed"
+    assert store.assignments() == []
+
+
+def test_hypothetical_task_json_is_not_applied(tmp_path):
+    store = _fleet(tmp_path)
+    provider = SequencedTestProvider(
+        [
+            '{"title":"Write the migration","assigned_to":"worker0",'
+            '"priority":"normal"}'
+        ]
+    )
+
+    staged = _turn(
+        store,
+        provider,
+        content="What would a task for the migration look like?",
+    )
+
+    assert staged["status"] == "proposed"
+    assert store.assignments() == []
 
 
 def test_out_of_scope_actions_are_rejected(tmp_path):

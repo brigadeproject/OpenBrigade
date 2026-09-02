@@ -54,6 +54,29 @@ persistence under `/srv/openbrigade/app`. Restart the support stack, then reboot
 once before accepting the server. Re-check services, migrations, health, model
 generation, embeddings, and authentication after boot.
 
+## Optional direct Crew Chief bots and maintenance
+
+Dedicated Server mode supports opt-in one-to-one Telegram bots for Crew Chiefs.
+Create and test each bot while disabled, enable its explicit direct-chat policy,
+then enable polling. The protected token files live below
+`/srv/openbrigade/app/secrets/connectors/telegram` by default and must be part of
+the protected backup. Postgres and Redis must both be healthy.
+
+Infrastructure maintenance remains an operator-defined allowlist, not an open
+privileged shell. Copy `docs/maintenance-actions.example.json` to a root-owned
+path outside the checkout, for example
+`/etc/openbrigade/maintenance-actions.json`, set `root:brigade` ownership and
+mode `0640`, then configure `BRIGADE_MAINTENANCE_ACTIONS_PATH` in the protected
+environment file. Entries contain exact argv and allowed Chief IDs. If an entry
+uses `sudo`, the existing host sudoers policy must already authorize that exact
+non-interactive command; OpenBrigade never writes or bypasses sudoers.
+
+After changing the environment, restart both host services. Account and policy
+changes made through the UI or CLI are reconciled by the running orchestrator
+without a restart. During an OpenClaw migration, stop its poller only after the
+new account tests successfully, retain the old service intact for rollback, and
+never allow both systems to poll the same bot token.
+
 ## Recovery and backup
 
 Back up `/srv/openbrigade` and the protected `.env` through the host's approved

@@ -59,6 +59,77 @@ calls `deleteWebhook` on startup, retaining pending Telegram updates. Only one
 process may poll a bot token; do not leave an OpenClaw or other Telegram
 polling process running with the same token.
 
+### Optional named Crew Chief bots
+
+Named bots are an opt-in polling surface in addition to the default Telegram
+bot. Each account is permanently bound to one active Crew Chief and routes to
+the same owner/persona conversation shown in the Chat tab. A named bot cannot
+switch to the Front Desk, Executive, or another Chief. Its token is stored as a
+mode-0600 file under the configured secret store; the durable database record
+contains only a fingerprint and status metadata.
+
+This surface requires Postgres and Redis in live operation. The JSON store is
+supported only for offline tests. Configure it from **Proposals -> Connector
+Approvals -> Named Crew Chief Bots**, or with the CLI:
+
+```bash
+printf '%s' "$TELEGRAM_CHIEF_BOT_TOKEN" | brigade connector telegram-account add \
+  --id infra-chief --chief infrastructure-chief --label "Infrastructure Chief" \
+  --token-stdin
+brigade connector telegram-account test --id infra-chief
+brigade connector telegram-account enable --id infra-chief
+# After the owner's first message creates a pending identity:
+brigade connector approvals approve --provider telegram:infra-chief \
+  --external-user 123456789 --username owner
+```
+
+Creating an account leaves it disabled. Test it, then enable it. The
+orchestrator notices account changes without a restart. Disable an account
+before removing it; pass `--delete-secret` only when the token file should also
+be removed. During a migration from an older poller, leave that service stopped
+but intact until the rollback window closes. Never run two pollers for the same
+token.
+
+Normal Chief conversation remains the default. Owner-only direct execution is
+enabled separately per Chief with explicit tool groups:
+
+```bash
+brigade connector chief-policy set --chief infrastructure-chief --direct on \
+  --tool-group workspace_read --tool-group shell --tool-group maintenance
+```
+
+Direct turns use a 60-call and 30-minute default budget. The Chief may request
+a one-shot exact action or removal of the count ceiling; only the owner can
+confirm it, and the two-hour active-time hard stop remains. `/status` and
+`/cancel` work from the named bot. Long turns keep Telegram's typing indicator
+active and send meaningful milestones to both Telegram and the canonical Chat
+thread.
+
+On startup, each polling bot publishes its applicable Telegram command menu.
+Shared chat commands are `/help`, `/who`, `/model`, `/new`, `/clear`, and
+`/status`. Named Chief bots also expose `/cancel` and `/confirm`; the default
+Chief-routing bot exposes `/chief` and `/frontdesk`. `/model` reports the
+thread's effective route and numbered configured options. Use `/model <number>`
+or `/model <provider>/<model>` to persist a choice on the canonical thread, and
+`/model default` to return to the persona's assigned route. The same selection
+is reflected in the Chat tab and used by queued direct-Chief work.
+
+For an owner-bound Chief chat, an explicit request to create or assign a task
+creates the durable assignment immediately and returns a plain-language receipt
+with the target, priority, and task ID. A second `confirm` is still required for
+other state changes, including cancellation, reprioritization, recurrence
+changes, and guidance mutations. This behavior is shared by Telegram and the
+canonical Chat thread; model-emitted task JSON is protocol data and is never the
+outbound Telegram response.
+
+Maintenance actions are never free-form privileged shell commands. Copy
+`docs/maintenance-actions.example.json` to an operator-controlled path, edit it
+as root, set `root:<service-group>` ownership and mode 0640, and point
+`BRIGADE_MAINTENANCE_ACTIONS_PATH` at it. Each
+entry supplies exact argv, an allowed-Chief list, and a timeout. OpenBrigade
+does not edit or bypass sudoers; an argv containing `sudo` can only succeed if
+the host already authorizes that exact command non-interactively.
+
 ### Webhook (public HTTPS alternative)
 
 Setup:

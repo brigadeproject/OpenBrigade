@@ -2862,6 +2862,17 @@ button.danger:disabled {
   flex-direction: column;
 }
 
+.direct-turn-status {
+  flex: none;
+  display: grid;
+  gap: 5px;
+  margin: 0 12px 8px;
+}
+
+.direct-turn-status .chat-actions {
+  justify-content: flex-start;
+}
+
 .executive-chat-head {
   flex: none;
   display: grid;
@@ -3503,6 +3514,15 @@ button.danger:disabled {
 
 .ob-proposals-switch {
   flex: none;
+}
+
+.named-chief-bots {
+  flex: none;
+}
+
+.named-chief-bots-body {
+  max-height: 56vh;
+  overflow: auto;
 }
 
 .ob-proposals-grid {

@@ -307,6 +307,41 @@ class StateStore(Protocol):
         status: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
+    def upsert_telegram_account(self, account: dict[str, Any]) -> None: ...
+
+    def telegram_accounts(self, enabled: bool | None = None) -> list[dict[str, Any]]: ...
+
+    def find_telegram_account(self, account_id: str) -> dict[str, Any] | None: ...
+
+    def delete_telegram_account(self, account_id: str) -> bool: ...
+
+    def upsert_chief_chat_policy(self, policy: dict[str, Any]) -> None: ...
+
+    def chief_chat_policy(self, chief_agent_id: str) -> dict[str, Any] | None: ...
+
+    def chief_chat_policies(self) -> list[dict[str, Any]]: ...
+
+    def upsert_chief_interactive_turn(self, turn: dict[str, Any]) -> None: ...
+
+    def find_chief_interactive_turn(self, turn_id: str) -> dict[str, Any] | None: ...
+
+    def chief_interactive_turns(
+        self,
+        *,
+        status: str | None = None,
+        thread_id: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def try_claim_chief_interactive_turn(
+        self,
+        turn_id: str,
+        owner: str,
+        *,
+        lease_seconds: int,
+    ) -> bool: ...
+
+    def delete_chief_interactive_turn(self, turn_id: str) -> bool: ...
+
 
 class RedisRuntimeClient:
     PENDING_ASSIGNMENTS_KEY = "brigade:runtime:assignments:pending"
@@ -2306,6 +2341,182 @@ class PostgresStateStore:
             sql += " where " + " and ".join(clauses)
         sql += " order by updated_at, provider, external_user_id"
         return list(self._records(sql, params))
+
+    def upsert_telegram_account(self, account: dict[str, Any]) -> None:
+        self._execute(
+            """
+            insert into brigade_telegram_accounts (
+              id, chief_agent_id, enabled, token_fingerprint, created_at, updated_at, record
+            )
+            values (%s, %s, %s, %s, %s, %s, %s::jsonb)
+            on conflict (id) do update set
+              chief_agent_id = excluded.chief_agent_id,
+              enabled = excluded.enabled,
+              token_fingerprint = excluded.token_fingerprint,
+              updated_at = excluded.updated_at,
+              record = excluded.record
+            """,
+            (
+                account["account_id"],
+                account["chief_agent_id"],
+                bool(account.get("enabled")),
+                account.get("token_fingerprint"),
+                account["created_at"],
+                account["updated_at"],
+                json.dumps(account, sort_keys=True),
+            ),
+        )
+
+    def telegram_accounts(self, enabled: bool | None = None) -> list[dict[str, Any]]:
+        sql = "select record from brigade_telegram_accounts"
+        params: tuple[object, ...] = ()
+        if enabled is not None:
+            sql += " where enabled = %s"
+            params = (enabled,)
+        sql += " order by id"
+        return list(self._records(sql, params))
+
+    def find_telegram_account(self, account_id: str) -> dict[str, Any] | None:
+        return self._record_or_none(
+            "select record from brigade_telegram_accounts where id = %s",
+            (account_id,),
+        )
+
+    def delete_telegram_account(self, account_id: str) -> bool:
+        existed = self.find_telegram_account(account_id) is not None
+        if existed:
+            self._execute("delete from brigade_telegram_accounts where id = %s", (account_id,))
+        return existed
+
+    def upsert_chief_chat_policy(self, policy: dict[str, Any]) -> None:
+        self._execute(
+            """
+            insert into brigade_chief_chat_policies (
+              chief_agent_id, direct_enabled, updated_at, record
+            )
+            values (%s, %s, %s, %s::jsonb)
+            on conflict (chief_agent_id) do update set
+              direct_enabled = excluded.direct_enabled,
+              updated_at = excluded.updated_at,
+              record = excluded.record
+            """,
+            (
+                policy["chief_agent_id"],
+                bool(policy.get("direct_enabled")),
+                policy["updated_at"],
+                json.dumps(policy, sort_keys=True),
+            ),
+        )
+
+    def chief_chat_policy(self, chief_agent_id: str) -> dict[str, Any] | None:
+        return self._record_or_none(
+            "select record from brigade_chief_chat_policies where chief_agent_id = %s",
+            (chief_agent_id,),
+        )
+
+    def chief_chat_policies(self) -> list[dict[str, Any]]:
+        return list(
+            self._records("select record from brigade_chief_chat_policies order by chief_agent_id")
+        )
+
+    def upsert_chief_interactive_turn(self, turn: dict[str, Any]) -> None:
+        self._execute(
+            """
+            insert into brigade_chief_interactive_turns (
+              id, thread_id, chief_agent_id, operator_username, status,
+              idempotency_key, claim_owner, claim_expires_at, created_at, updated_at, record
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            on conflict (id) do update set
+              status = excluded.status,
+              claim_owner = excluded.claim_owner,
+              claim_expires_at = excluded.claim_expires_at,
+              updated_at = excluded.updated_at,
+              record = excluded.record
+            """,
+            (
+                turn["turn_id"],
+                turn["thread_id"],
+                turn["chief_agent_id"],
+                turn["operator_username"],
+                turn["status"],
+                turn.get("idempotency_key"),
+                turn.get("claim_owner"),
+                turn.get("claim_expires_at"),
+                turn["created_at"],
+                turn["updated_at"],
+                json.dumps(turn, sort_keys=True),
+            ),
+        )
+
+    def find_chief_interactive_turn(self, turn_id: str) -> dict[str, Any] | None:
+        return self._record_or_none(
+            "select record from brigade_chief_interactive_turns where id = %s",
+            (turn_id,),
+        )
+
+    def chief_interactive_turns(
+        self,
+        *,
+        status: str | None = None,
+        thread_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "select record from brigade_chief_interactive_turns"
+        clauses: list[str] = []
+        params: tuple[object, ...] = ()
+        if status is not None:
+            clauses.append("status = %s")
+            params = (*params, status)
+        if thread_id is not None:
+            clauses.append("thread_id = %s")
+            params = (*params, thread_id)
+        if clauses:
+            sql += " where " + " and ".join(clauses)
+        sql += " order by updated_at, id"
+        return list(self._records(sql, params))
+
+    def try_claim_chief_interactive_turn(
+        self,
+        turn_id: str,
+        owner: str,
+        *,
+        lease_seconds: int,
+    ) -> bool:
+        claimed_at = utc_now_iso()
+        expires_at = add_seconds_iso(claimed_at, lease_seconds)
+        rows = self._query(
+            """
+            update brigade_chief_interactive_turns
+            set claim_owner = %s,
+                claim_expires_at = %s,
+                updated_at = %s,
+                record = record || jsonb_build_object(
+                  'claim_owner', %s::text,
+                  'claim_expires_at', %s::text,
+                  'updated_at', %s::text
+                )
+            where id = %s
+              and status = 'queued'
+              and (claim_owner is null or claim_expires_at < current_timestamp)
+            returning id
+            """,
+            (
+                owner,
+                expires_at,
+                claimed_at,
+                owner,
+                expires_at,
+                claimed_at,
+                turn_id,
+            ),
+        )
+        return bool(rows)
+
+    def delete_chief_interactive_turn(self, turn_id: str) -> bool:
+        existed = self.find_chief_interactive_turn(turn_id) is not None
+        if existed:
+            self._execute("delete from brigade_chief_interactive_turns where id = %s", (turn_id,))
+        return existed
 
     def runtime_overrides(self) -> dict[str, Any]:
         if not self._redis.available():

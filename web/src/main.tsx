@@ -432,6 +432,12 @@ type ChatThread = {
   channel?: string;
   chief_agent_id?: string | null;
   team_id?: string | null;
+  model_provider?: string | null;
+  model_name?: string | null;
+  model_base_url?: string | null;
+  effective_model_provider?: string | null;
+  effective_model_name?: string | null;
+  effective_model_base_url?: string | null;
 };
 
 type ThreadsPayload = {
@@ -446,6 +452,8 @@ type ThreadMessagesPayload = {
 
 type ThreadTurnResult = {
   status: string;
+  turn_id?: string;
+  thread_id?: string;
   conversation_id?: string;
   request_message_id?: string;
   response_message_id?: string;
@@ -456,6 +464,19 @@ type ThreadTurnResult = {
   route_type?: string;
   iterations?: number;
   tools_used?: string[];
+};
+
+type ChiefDirectTurn = ThreadTurnResult & {
+  thread_id: string;
+  chief_agent_id: string;
+  progress_summary?: string;
+  pending_permission?: {
+    kind?: string;
+    reason?: string;
+    tool_call?: { tool?: string; arguments?: Record<string, unknown> };
+  } | null;
+  tool_count?: number;
+  active_elapsed_seconds?: number;
 };
 
 type ProposalRecord = {
@@ -484,6 +505,25 @@ type ConnectorApprovalRecord = {
   updated_at?: string;
   decided_at?: string | null;
   decided_by?: string | null;
+};
+
+type TelegramChiefAccount = {
+  account_id: string;
+  chief_agent_id: string;
+  label: string;
+  enabled: boolean;
+  mode: string;
+  token_configured: boolean;
+  bot_username?: string | null;
+};
+
+type ChiefChatPolicy = {
+  chief_agent_id: string;
+  direct_enabled: boolean;
+  tool_groups: string[];
+  max_tool_calls: number;
+  max_elapsed_seconds: number;
+  hard_elapsed_seconds?: number;
 };
 
 type OrchestratorMarkdownResult = {
@@ -974,6 +1014,8 @@ function App() {
           <ProposalsView
             proposals={proposals}
             connectorApprovals={connectorApprovals}
+            agents={agents}
+            teams={snapshot?.teams || cockpit?.teams || []}
             canDecideProposals={can("proposal:write")}
             canManageConnectors={can("admin")}
             api={api}
@@ -2353,6 +2395,8 @@ function filterOptions(known: string[], seen: (string | null | undefined)[]) {
 function ProposalsView({
   proposals,
   connectorApprovals,
+  agents,
+  teams,
   canDecideProposals,
   canManageConnectors,
   api,
@@ -2361,6 +2405,8 @@ function ProposalsView({
 }: {
   proposals: ProposalRecord[];
   connectorApprovals: ConnectorApprovalRecord[];
+  agents: VisualAgent[];
+  teams: Team[];
   canDecideProposals: boolean;
   canManageConnectors: boolean;
   api: <T>(path: string, options?: ApiOptions) => Promise<T>;
@@ -2594,7 +2640,15 @@ function ProposalsView({
           }
         />
       ) : (
-        <ApprovalSection
+        <>
+          <NamedChiefBotsPanel
+            agents={agents}
+            teams={teams}
+            canManage={canManageConnectors}
+            api={api}
+            setStatus={setStatus}
+          />
+          <ApprovalSection
           listTitle="Connector Identities"
           detailTitle="Identity Detail"
           emptyList="No matching connector identities."
@@ -2672,9 +2726,265 @@ function ProposalsView({
               </div>
             )
           }
-        />
+          />
+        </>
       )}
     </section>
+  );
+}
+
+const CHIEF_DIRECT_TOOL_GROUPS = [
+  "workspace_read",
+  "workspace_write",
+  "shell",
+  "workspace_tools",
+  "maintenance",
+];
+
+function NamedChiefBotsPanel({
+  agents,
+  teams,
+  canManage,
+  api,
+  setStatus,
+}: {
+  agents: VisualAgent[];
+  teams: Team[];
+  canManage: boolean;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  setStatus: (status: string) => void;
+}) {
+  const [accounts, setAccounts] = useState<TelegramChiefAccount[]>([]);
+  const [policies, setPolicies] = useState<ChiefChatPolicy[]>([]);
+  const [accountId, setAccountId] = useState("");
+  const [label, setLabel] = useState("");
+  const [chiefId, setChiefId] = useState("");
+  const [token, setToken] = useState("");
+  const [replacementToken, setReplacementToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const chiefs = useMemo(() => {
+    const chiefIds = Array.from(
+      new Set(
+        teams
+          .map((team) => team.crew_chief_id)
+          .filter((value): value is string => Boolean(value)),
+      ),
+    );
+    return chiefIds
+      .map((id) => agents.find((agent) => agent.agent_id === id))
+      .filter(Boolean) as VisualAgent[];
+  }, [agents, teams]);
+
+  const load = useCallback(async () => {
+    if (!canManage) {
+      return;
+    }
+    const [nextAccounts, nextPolicies] = await Promise.all([
+      api<TelegramChiefAccount[]>("/api/connectors/telegram/accounts"),
+      api<ChiefChatPolicy[]>("/api/chief-chat/policies"),
+    ]);
+    setAccounts(nextAccounts);
+    setPolicies(nextPolicies);
+    setChiefId((current) => current || chiefs[0]?.agent_id || "");
+  }, [api, canManage, chiefs]);
+
+  useEffect(() => {
+    load().catch((error) => setStatus(errorMessage(error)));
+  }, [load, setStatus]);
+
+  async function createAccount() {
+    if (!accountId.trim() || !chiefId || !token.trim()) {
+      setStatus("Account id, Crew Chief, and bot token are required");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api<TelegramChiefAccount>("/api/connectors/telegram/accounts", {
+        method: "POST",
+        json: {
+          account_id: accountId.trim(),
+          chief_agent_id: chiefId,
+          label: label.trim() || undefined,
+          token: token.trim(),
+          enabled: false,
+        },
+      });
+      setAccountId("");
+      setLabel("");
+      setToken("");
+      setStatus("Named Chief bot saved disabled; test it before enabling");
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function accountAction(
+    account: TelegramChiefAccount,
+    action: "toggle" | "test" | "rotate" | "remove",
+  ) {
+    setBusy(true);
+    try {
+      if (action === "test") {
+        await api(`/api/connectors/telegram/accounts/${encodeURIComponent(account.account_id)}/test`, {
+          method: "POST",
+        });
+      } else if (action === "remove") {
+        await api(
+          `/api/connectors/telegram/accounts/${encodeURIComponent(account.account_id)}?delete_secret=true`,
+          { method: "DELETE" },
+        );
+      } else {
+        if (action === "rotate" && !replacementToken.trim()) {
+          throw new Error("Enter a replacement token first");
+        }
+        await api(`/api/connectors/telegram/accounts/${encodeURIComponent(account.account_id)}`, {
+          method: "PATCH",
+          json:
+            action === "rotate"
+              ? { token: replacementToken.trim() }
+              : { enabled: !account.enabled },
+        });
+      }
+      setReplacementToken("");
+      setStatus(`Telegram account ${account.account_id} updated`);
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <details className="ob-panel ob-manage named-chief-bots">
+      <summary>Named Crew Chief Bots <span className="ob-badge">opt in</span></summary>
+      <div className="ob-panel-pad named-chief-bots-body">
+        <p className="muted">
+          Each account is permanently bound to one Crew Chief and uses that Chief&apos;s canonical Chat thread.
+          Tokens are stored separately from the account records.
+        </p>
+        {!canManage ? (
+          <PermissionNotice allowed={false} permission="admin" action="named bot management is hidden" />
+        ) : (
+          <>
+          <div className="settings-grid">
+            <input value={accountId} onChange={(event) => setAccountId(event.target.value)} placeholder="account id" />
+            <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="display label" />
+            <select value={chiefId} onChange={(event) => setChiefId(event.target.value)}>
+              <option value="">Choose Crew Chief</option>
+              {chiefs.map((chief) => <option key={chief.agent_id} value={chief.agent_id}>{chief.display_name}</option>)}
+            </select>
+            <input type="password" autoComplete="new-password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="Telegram bot token" />
+            <button disabled={busy} onClick={() => createAccount().catch((error) => setStatus(errorMessage(error)))}>Save disabled</button>
+          </div>
+          <div className="stack-list">
+            {accounts.map((account) => (
+              <article key={account.account_id} className="record-card">
+                <strong>{account.label} · {account.bot_username ? `@${account.bot_username}` : account.account_id}</strong>
+                <span>{account.chief_agent_id} · {account.enabled ? "polling enabled" : "disabled"}</span>
+                <div className="chat-actions">
+                  <button disabled={busy} onClick={() => accountAction(account, "test").catch((error) => setStatus(errorMessage(error)))}>Test</button>
+                  <button disabled={busy} onClick={() => accountAction(account, "toggle").catch((error) => setStatus(errorMessage(error)))}>{account.enabled ? "Disable" : "Enable"}</button>
+                  <button disabled={busy || !replacementToken.trim()} onClick={() => accountAction(account, "rotate").catch((error) => setStatus(errorMessage(error)))}>Rotate token</button>
+                  <button disabled={busy || account.enabled} onClick={() => accountAction(account, "remove").catch((error) => setStatus(errorMessage(error)))}>Remove</button>
+                </div>
+              </article>
+            ))}
+            {accounts.length === 0 && <p className="muted">No named Telegram bots configured.</p>}
+          </div>
+          {accounts.length > 0 && (
+            <input type="password" autoComplete="new-password" value={replacementToken} onChange={(event) => setReplacementToken(event.target.value)} placeholder="Replacement token for Rotate token" />
+          )}
+          <div className="stack-list">
+            {chiefs.map((chief) => (
+              <ChiefDirectPolicyEditor
+                key={chief.agent_id}
+                chief={chief}
+                policy={policies.find((item) => item.chief_agent_id === chief.agent_id)}
+                api={api}
+                busy={busy}
+                setBusy={setBusy}
+                onSaved={load}
+                setStatus={setStatus}
+              />
+            ))}
+          </div>
+          </>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function ChiefDirectPolicyEditor({
+  chief,
+  policy,
+  api,
+  busy,
+  setBusy,
+  onSaved,
+  setStatus,
+}: {
+  chief: VisualAgent;
+  policy?: ChiefChatPolicy;
+  api: <T>(path: string, options?: ApiOptions) => Promise<T>;
+  busy: boolean;
+  setBusy: (value: boolean) => void;
+  onSaved: () => Promise<void>;
+  setStatus: (status: string) => void;
+}) {
+  const [enabled, setEnabled] = useState(policy?.direct_enabled || false);
+  const [groups, setGroups] = useState<string[]>(policy?.tool_groups || []);
+  const [maxCalls, setMaxCalls] = useState(policy?.max_tool_calls || 60);
+  const [maxSeconds, setMaxSeconds] = useState(policy?.max_elapsed_seconds || 1800);
+
+  useEffect(() => {
+    setEnabled(policy?.direct_enabled || false);
+    setGroups(policy?.tool_groups || []);
+    setMaxCalls(policy?.max_tool_calls || 60);
+    setMaxSeconds(policy?.max_elapsed_seconds || 1800);
+  }, [policy]);
+
+  async function save() {
+    if (enabled && groups.length === 0) {
+      throw new Error("Select at least one explicit tool group before enabling direct execution");
+    }
+    setBusy(true);
+    try {
+      await api(`/api/chief-chat/policies/${encodeURIComponent(chief.agent_id)}`, {
+        method: "PUT",
+        json: {
+          direct_enabled: enabled,
+          tool_groups: groups,
+          max_tool_calls: maxCalls,
+          max_elapsed_seconds: maxSeconds,
+        },
+      });
+      setStatus(`Direct chat policy saved for ${chief.display_name}`);
+      await onSaved();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <article className="record-card">
+      <strong>{chief.display_name} direct owner execution</strong>
+      <label><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> Enabled</label>
+      <div className="settings-grid">
+        {CHIEF_DIRECT_TOOL_GROUPS.map((group) => (
+          <label key={group}>
+            <input
+              type="checkbox"
+              checked={groups.includes(group)}
+              onChange={(event) => setGroups((current) => event.target.checked ? [...current, group] : current.filter((item) => item !== group))}
+            /> {group.replace(/_/g, " ")}
+          </label>
+        ))}
+        <label>Tool ceiling <input type="number" min={1} max={1000} value={maxCalls} onChange={(event) => setMaxCalls(Number(event.target.value))} /></label>
+        <label>Active seconds <input type="number" min={60} max={7200} value={maxSeconds} onChange={(event) => setMaxSeconds(Number(event.target.value))} /></label>
+        <button disabled={busy} onClick={() => save().catch((error) => setStatus(errorMessage(error)))}>Save policy</button>
+      </div>
+    </article>
   );
 }
 
@@ -5205,6 +5515,7 @@ function ExecutiveChatView({
   const [messages, setMessages] = useState<Message[]>([]);
   const [message, setMessage] = useState("");
   const [pending, setPending] = useState(false);
+  const [activeTurn, setActiveTurn] = useState<ChiefDirectTurn | null>(null);
   const [loading, setLoading] = useState(true);
   const feedRef = useAutoScroll<HTMLDivElement>([thread?.thread_id, messages.length, pending]);
 
@@ -5239,8 +5550,15 @@ function ExecutiveChatView({
       );
       setThread(payload.thread);
       setMessages(payload.messages);
+      if (payload.thread.effective_model_provider && payload.thread.effective_model_name) {
+        onRouteChange({
+          provider: payload.thread.effective_model_provider,
+          model: payload.thread.effective_model_name,
+          base_url: payload.thread.effective_model_base_url || undefined,
+        });
+      }
     },
-    [api],
+    [api, onRouteChange],
   );
 
   const openThread = useCallback(
@@ -5309,7 +5627,7 @@ function ExecutiveChatView({
       return;
     }
     setPending(true);
-    setStatus("Sending executive chat");
+    setStatus(`Sending chat to ${selectedPersona?.display_name || "persona"}`);
     try {
       const result = await api<ThreadTurnResult>(
         `/api/chat/threads/${encodeURIComponent(thread.thread_id)}/messages`,
@@ -5318,17 +5636,45 @@ function ExecutiveChatView({
           json: {
             content: message,
             idempotency_key: randomId("web-executive"),
-            ...modelRoutePayload(route),
+            ...(!message.trim().startsWith("/") ? modelRoutePayload(route) : {}),
           },
         },
       );
       setMessage("");
-      setStatus(`Executive chat ${result.status || "complete"}`);
-      await loadMessages(thread);
+      if (result.thread_id && result.thread_id !== thread.thread_id) {
+        await loadThreads();
+        await openThread(selectedPersonaId);
+      }
+      if (result.turn_id) {
+        setActiveTurn({
+          ...result,
+          thread_id: thread.thread_id,
+          chief_agent_id: result.agent_id || assistantId,
+        });
+      } else {
+        setActiveTurn(null);
+      }
+      setStatus(result.summary || `Chat ${result.status || "complete"}`);
+      if (!result.thread_id || result.thread_id === thread.thread_id) {
+        await loadMessages(thread);
+      }
       await loadThreads();
     } finally {
       setPending(false);
     }
+  }
+
+  async function changeChatModel(nextRoute: ModelRoute) {
+    onRouteChange(nextRoute);
+    if (!thread) {
+      return;
+    }
+    const updated = await api<ChatThread>(
+      `/api/chat/threads/${encodeURIComponent(thread.thread_id)}/model`,
+      { method: "POST", json: modelRoutePayload(nextRoute) },
+    );
+    setThread(updated);
+    setStatus(`Chat model set to ${nextRoute.provider} / ${nextRoute.model}`);
   }
 
   const assistantId =
@@ -5336,6 +5682,47 @@ function ExecutiveChatView({
     selectedPersona?.chief_agent_id ||
     (thread?.persona === "front_desk" ? "front_desk" : thread?.persona || "");
   const assistantMessages = new Set(["front_desk", "orchestrator", assistantId].filter(Boolean));
+
+  const refreshDirectTurn = useCallback(
+    async (turnId: string) => {
+      const next = await api<ChiefDirectTurn>(
+        `/api/chat/turns/${encodeURIComponent(turnId)}`,
+      );
+      setActiveTurn(next);
+      if (["complete", "cancelled", "failed", "blocked"].includes(next.status) && thread) {
+        await loadMessages(thread);
+        await loadThreads();
+      }
+      return next;
+    },
+    [api, loadMessages, loadThreads, thread],
+  );
+
+  useEffect(() => {
+    if (
+      !activeTurn?.turn_id ||
+      !["queued", "running", "awaiting_permission"].includes(activeTurn.status)
+    ) {
+      return;
+    }
+    const turnId = activeTurn.turn_id;
+    const timer = window.setInterval(() => {
+      refreshDirectTurn(turnId).catch((error) => setStatus(errorMessage(error)));
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [activeTurn?.status, activeTurn?.turn_id, refreshDirectTurn, setStatus]);
+
+  async function controlDirectTurn(action: "cancel" | "confirm") {
+    if (!activeTurn?.turn_id) {
+      return;
+    }
+    const result = await api<ThreadTurnResult>(
+      `/api/chat/turns/${encodeURIComponent(activeTurn.turn_id)}/${action}`,
+      { method: "POST" },
+    );
+    setStatus(`Chief turn ${result.status}`);
+    await refreshDirectTurn(activeTurn.turn_id);
+  }
 
   return (
     <section className="executive-chat-view">
@@ -5392,14 +5779,16 @@ function ExecutiveChatView({
         <section className="ob-panel executive-chat-panel">
           <div className="executive-chat-head">
             <div>
-              <h2>{selectedPersona?.display_name || "Executive Chat"}</h2>
-              <p>{thread?.channel || "Open /chat to talk with your Executive."}</p>
+              <h2>{selectedPersona?.display_name || "Direct Chat"}</h2>
+              <p>{thread?.channel || "Open /chat to talk with an available persona."}</p>
             </div>
             <ModelSelect
               label="Chat model"
               inventory={models}
               route={route}
-              onChange={onRouteChange}
+              onChange={(nextRoute) => {
+                changeChatModel(nextRoute).catch((error) => setStatus(errorMessage(error)));
+              }}
             />
           </div>
           <div className="chat-feed executive-feed" ref={feedRef}>
@@ -5417,6 +5806,60 @@ function ExecutiveChatView({
               />
             ))}
           </div>
+          {activeTurn && activeTurn.thread_id === thread?.thread_id && (
+            <div className={`warning-banner direct-turn-status ${activeTurn.status}`}>
+              <strong>Direct Chief turn: {activeTurn.status.replace("_", " ")}</strong>
+              <span>
+                {activeTurn.progress_summary || activeTurn.summary || "Work is in progress."}
+              </span>
+              <small>
+                {activeTurn.tool_count || 0} tool calls ·{" "}
+                {Math.round(activeTurn.active_elapsed_seconds || 0)}s active
+              </small>
+              {activeTurn.pending_permission?.reason && (
+                <p>{activeTurn.pending_permission.reason}</p>
+              )}
+              {activeTurn.pending_permission?.tool_call && (
+                <code>
+                  {activeTurn.pending_permission.tool_call.tool}{" "}
+                  {JSON.stringify(activeTurn.pending_permission.tool_call.arguments || {})}
+                </code>
+              )}
+              <div className="chat-actions">
+                {["queued", "running", "awaiting_permission"].includes(activeTurn.status) && (
+                  <button
+                    onClick={() =>
+                      controlDirectTurn("cancel").catch((error) =>
+                        setStatus(errorMessage(error)),
+                      )
+                    }
+                  >
+                    Cancel
+                  </button>
+                )}
+                {activeTurn.status === "awaiting_permission" && (
+                  <button
+                    onClick={() =>
+                      controlDirectTurn("confirm").catch((error) =>
+                        setStatus(errorMessage(error)),
+                      )
+                    }
+                  >
+                    Confirm once
+                  </button>
+                )}
+                <button
+                  onClick={() =>
+                    refreshDirectTurn(activeTurn.turn_id as string).catch((error) =>
+                      setStatus(errorMessage(error)),
+                    )
+                  }
+                >
+                  Status
+                </button>
+              </div>
+            </div>
+          )}
           <div className="chat-compose executive-compose">
             <textarea
               value={message}
@@ -5427,7 +5870,7 @@ function ExecutiveChatView({
                   send().catch((error) => setStatus(errorMessage(error))),
                 )
               }
-              placeholder="Message your Executive - Ctrl+Enter to send, Enter for newline"
+              placeholder={`Message ${selectedPersona?.display_name || "this persona"} - Ctrl+Enter to send`}
             />
             <div className="chat-actions">
               <button
@@ -5448,7 +5891,7 @@ function ExecutiveChatView({
           <PermissionNotice
             allowed={canChat}
             permission="chat:write"
-            action="executive chat is disabled"
+            action="direct chat is disabled"
           />
         </section>
       </div>

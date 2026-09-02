@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import uuid4
@@ -27,6 +29,7 @@ SENSITIVE_METADATA_KEYS = {
     "token",
 }
 LOGGER = logging.getLogger(__name__)
+TELEGRAM_TYPING_REFRESH_SECONDS = 4.0
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,7 @@ class RedisConnectorRateLimiter:
 
 OutboundSender = Callable[[IncomingConnectorMessage, str], ConnectorResult]
 HttpPost = Callable[[str, bytes, dict[str, str]], dict[str, Any]]
+WorkingIndicator = Callable[[], AbstractContextManager[None]]
 
 
 @dataclass(frozen=True)
@@ -192,6 +196,7 @@ def process_live_connector_message(
     max_inbound_chars: int = 4000,
     max_outbound_chars: int = 3500,
     chat_turn: ConnectorChatTurn | None = None,
+    working_indicator: WorkingIndicator | None = None,
 ) -> ConnectorResult:
     validation = _validate_live_inbound(
         store,
@@ -226,14 +231,16 @@ def process_live_connector_message(
     # the multi-turn thread is tied to a stable operator. Everything else falls
     # through to the legacy single-shot default_agent path.
     if chat_turn is not None and identity.get("username"):
-        return _run_connector_chat_turn(
-            store,
-            incoming,
-            username=username,
-            chat_turn=chat_turn,
-            outbound_sender=outbound_sender,
-            max_outbound_chars=max_outbound_chars,
-        )
+        indicator = working_indicator() if working_indicator is not None else nullcontext()
+        with indicator:
+            return _run_connector_chat_turn(
+                store,
+                incoming,
+                username=username,
+                chat_turn=chat_turn,
+                outbound_sender=outbound_sender,
+                max_outbound_chars=max_outbound_chars,
+            )
 
     agent = next((item for item in store.agents() if item.agent_id == default_agent), None)
     if agent is None:
@@ -249,8 +256,8 @@ def process_live_connector_message(
         )
         return ConnectorResult(incoming.provider, "rejected", incoming.channel, reason=reason)
 
-    try:
-        response = model_provider.complete(
+    def complete():
+        return model_provider.complete(
             _external_chat_prompt(
                 display_name=agent.display_name,
                 agent_id=agent.agent_id,
@@ -260,6 +267,13 @@ def process_live_connector_message(
                 store=store,
             )
         )
+
+    try:
+        if working_indicator is None:
+            response = complete()
+        else:
+            with working_indicator():
+                response = complete()
     except RuntimeError as exc:
         reason = str(exc)
         store.add_alert(f"{incoming.provider} connector model call failed: {reason}")
@@ -472,7 +486,11 @@ def _run_connector_chat_turn(
     )
 
 
-def parse_telegram_update(payload: dict[str, Any]) -> IncomingConnectorMessage | None:
+def parse_telegram_update(
+    payload: dict[str, Any],
+    *,
+    account_id: str | None = None,
+) -> IncomingConnectorMessage | None:
     message = payload.get("message") or payload.get("edited_message") or {}
     if not isinstance(message, dict) or not message:
         return None
@@ -483,18 +501,21 @@ def parse_telegram_update(payload: dict[str, Any]) -> IncomingConnectorMessage |
     chat_id = str(chat.get("id") or external_user_id).strip()
     if not chat_id:
         return None
+    provider = f"telegram:{account_id}" if account_id else "telegram"
+    channel = f"telegram:{account_id}:{chat_id}" if account_id else f"telegram:{chat_id}"
     return IncomingConnectorMessage(
-        provider="telegram",
+        provider=provider,
         external_user_id=external_user_id,
         conversation_id=chat_id,
         external_message_id=str(message.get("message_id") or payload.get("update_id") or ""),
         text=text,
-        channel=f"telegram:{chat_id}",
+        channel=channel,
         reply_target=chat_id,
         metadata={
             "chat_type": chat.get("type"),
             "update_id": payload.get("update_id"),
             "username": sender.get("username"),
+            "account_id": account_id,
         },
     )
 
@@ -540,6 +561,53 @@ def telegram_reply_sender(
         )
 
     return send
+
+
+@contextmanager
+def telegram_typing_indicator(
+    bot_token: str,
+    *,
+    chat_id: str,
+    http_post: HttpPost | None = None,
+    refresh_seconds: float = TELEGRAM_TYPING_REFRESH_SECONDS,
+) -> Iterator[None]:
+    """Keep Telegram's short-lived typing status active during a bot turn."""
+    post = http_post or _urllib_post_json
+    stop_event = threading.Event()
+
+    def send_action() -> None:
+        payload = json.dumps({"chat_id": chat_id, "action": "typing"}).encode("utf-8")
+        url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
+        try:
+            response = post(url, payload, {"Content-Type": "application/json"})
+            if response.get("ok") is False:
+                LOGGER.warning(
+                    "telegram_typing_action_failed",
+                    extra={"reason": str(response.get("description") or "unknown error")[:240]},
+                )
+        except Exception as exc:  # typing is best-effort and must never fail a reply
+            LOGGER.warning(
+                "telegram_typing_action_failed",
+                extra={"reason": str(exc)[:240] or exc.__class__.__name__},
+            )
+
+    send_action()
+
+    def refresh() -> None:
+        while not stop_event.wait(refresh_seconds):
+            send_action()
+
+    thread = threading.Thread(
+        target=refresh,
+        name="brigade-telegram-typing",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=1)
 
 
 def send_telegram_message(

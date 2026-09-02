@@ -250,6 +250,74 @@ def test_thread_routes_round_trip(tmp_path):
     assert switched.json()["thread_id"] != thread["thread_id"]
 
 
+def test_thread_model_route_and_model_command_are_durable(tmp_path):
+    from brigade.auth import issue_token
+    from brigade.config import Settings
+    from brigade.web import create_app
+    from tests.test_v0_9 import _asgi_request
+
+    store = _store(tmp_path)
+    _team_fleet(store, teams=1)
+    owner = User(username="owner", role=Role.OWNER)
+    store.add_user(owner)
+    settings = Settings(
+        config_path=tmp_path / "brigade.config.json",
+        data_dir=tmp_path,
+        require_auth=True,
+        jwt_secret="x" * 40,
+        allow_json_store=True,
+        default_provider="openai",
+        default_model="gpt-x",
+        openai_api_key="test-key",
+    )
+    app = create_app(settings, store)
+    headers = {"Authorization": f"Bearer {issue_token(settings, owner)}"}
+    thread = asyncio.run(
+        _asgi_request(
+            app,
+            "POST",
+            "/api/chat/threads",
+            headers=headers,
+            json_payload={"persona": "chief:chief0"},
+        )
+    ).json()
+
+    changed = asyncio.run(
+        _asgi_request(
+            app,
+            "POST",
+            f"/api/chat/threads/{thread['thread_id']}/model",
+            headers=headers,
+            json_payload={
+                "provider": "openai-codex",
+                "model": "gpt-5.3-codex-spark",
+            },
+        )
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["model_provider"] == "openai-codex"
+    assert store.find_conversation(thread["thread_id"]).model_name == (
+        "gpt-5.3-codex-spark"
+    )
+
+    reported = asyncio.run(
+        _asgi_request(
+            app,
+            "POST",
+            f"/api/chat/threads/{thread['thread_id']}/messages",
+            headers=headers,
+            json_payload={"content": "/model"},
+        )
+    )
+    assert reported.status_code == 200, reported.text
+    assert "Current model: openai-codex / gpt-5.3-codex-spark" in (
+        reported.json()["summary"]
+    )
+    messages = store.messages(f"thread:{thread['thread_id']}")
+    assert [item.content for item in messages[-2:]][0] == "/model"
+    assert "Available models:" in messages[-1].content
+
+
 def test_thread_routes_reject_unknown_and_unauthorized(tmp_path):
     from tests.test_v0_9 import _asgi_request
 

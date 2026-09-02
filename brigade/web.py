@@ -11,14 +11,24 @@ from uuid import uuid4
 
 from brigade import __version__
 from brigade.auth import AuthResult, issue_token, verify_token
+from brigade.chat_commands import (
+    command_help,
+    effective_model_route,
+    model_command_reply,
+    parse_chat_command,
+    persist_model_route,
+    record_command_exchange,
+)
 from brigade.chief_chat import (
     CHIEF_CHAT_KIND_PREFIX,
+    FRONT_DESK_PERSONA,
     UnknownPersonaError,
     available_personas,
     resolve_persona,
     run_chief_chat_turn,
     run_connector_chief_chat,
 )
+from brigade.chief_direct_runtime import direct_turn_control, queue_direct_chief_turn
 from brigade.config import Settings, load_settings
 from brigade.connectors import (
     ConnectorRateLimiter,
@@ -34,6 +44,13 @@ from brigade.connectors import (
     parse_telegram_update,
     process_live_connector_message,
     telegram_reply_sender,
+    telegram_typing_indicator,
+)
+from brigade.direct_chief import (
+    public_telegram_account,
+    remove_telegram_account,
+    save_chief_chat_policy,
+    save_telegram_account,
 )
 from brigade.executive import (
     EXECUTIVE_CHAT_KIND_PREFIX,
@@ -70,6 +87,7 @@ from brigade.schemas import (
     Agent,
     Assignment,
     ChatMessage,
+    Conversation,
     Goal,
     Mission,
     Priority,
@@ -78,6 +96,7 @@ from brigade.schemas import (
     User,
     WorkMode,
 )
+from brigade.secrets import read_telegram_bot_token
 from brigade.services import (
     OPS_ROOM_ROOMS,
     AssignmentActionError,
@@ -127,7 +146,7 @@ def create_app(
 ):
     try:
         from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
-        from fastapi.responses import HTMLResponse, StreamingResponse
+        from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
         from fastapi.staticfiles import StaticFiles
         from starlette.datastructures import MutableHeaders
     except ImportError as exc:  # pragma: no cover - exercised by CLI smoke without web extra
@@ -218,6 +237,8 @@ def create_app(
                 max_iterations=max_iterations,
                 history_window=settings.chief_chat_history_window,
                 enable_web_fetch=settings.chief_chat_web_fetch_enabled,
+                settings=settings,
+                provider_factory=provider_from_settings,
             )
 
         return _turn
@@ -234,6 +255,8 @@ def create_app(
                 provider=provider_from_settings(settings),
                 max_iterations=max_iterations,
                 enable_web_fetch=settings.executive_web_fetch_enabled,
+                settings=settings,
+                provider_factory=provider_from_settings,
             )
 
         return _turn
@@ -294,10 +317,16 @@ def create_app(
             rate_limiter=connector_rate_limiter or _connector_rate_limiter(settings),
             max_inbound_chars=settings.connector_max_inbound_chars,
             max_outbound_chars=settings.connector_max_outbound_chars,
+            working_indicator=lambda: telegram_typing_indicator(
+                settings.telegram_bot_token,
+                chat_id=incoming.reply_target,
+                http_post=telegram_http_post,
+            ),
         )
         chat_turn = _connector_executive_turn(
             settings.executive_max_iterations
         ) or _connector_chat_turn(settings.chief_chat_max_iterations)
+
         if chat_turn is not None:
             # The chief-chat loop can run several model calls; do it out of band
             # so the webhook returns 200 fast and telegram_reply_sender posts the
@@ -516,6 +545,158 @@ def create_app(
         except ExternalIdentityAlreadyDecidedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/connectors/telegram/accounts")
+    async def telegram_accounts(
+        current: AuthResult = auth_dependency,
+    ) -> list[dict[str, object]]:
+        require("admin", current)
+        return [public_telegram_account(item) for item in store.telegram_accounts()]
+
+    @app.post("/api/connectors/telegram/accounts")
+    async def create_telegram_account(
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("admin", current)
+        try:
+            return save_telegram_account(
+                store,
+                settings,
+                account_id=str(payload.get("account_id") or ""),
+                chief_agent_id=str(payload.get("chief_agent_id") or ""),
+                label=payload.get("label"),
+                token=str(payload["token"]) if payload.get("token") else None,
+                enabled=bool(payload.get("enabled", False)),
+                actor=user.username if user else "web",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.patch("/api/connectors/telegram/accounts/{account_id}")
+    async def update_telegram_account(
+        account_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("admin", current)
+        existing = store.find_telegram_account(account_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="unknown Telegram account")
+        try:
+            return save_telegram_account(
+                store,
+                settings,
+                account_id=account_id,
+                chief_agent_id=str(
+                    payload.get("chief_agent_id") or existing.get("chief_agent_id") or ""
+                ),
+                label=payload.get("label") or existing.get("label"),
+                token=str(payload["token"]) if payload.get("token") else None,
+                enabled=bool(payload.get("enabled", existing.get("enabled", False))),
+                bot_username=str(existing.get("bot_username") or "") or None,
+                actor=user.username if user else "web",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/connectors/telegram/accounts/{account_id}/test")
+    async def test_telegram_account(
+        account_id: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("admin", current)
+        account = store.find_telegram_account(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="unknown Telegram account")
+        token = read_telegram_bot_token(settings, account_id)
+        if not token:
+            raise HTTPException(status_code=409, detail="Telegram bot token is not configured")
+        from brigade.telegram_polling import _telegram_api_post
+
+        post = telegram_http_post or _telegram_api_post
+        try:
+            response = post(
+                f"https://api.telegram.org/bot{token}/getMe",
+                b"{}",
+                {"Content-Type": "application/json"},
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if response.get("ok") is not True:
+            raise HTTPException(
+                status_code=502,
+                detail=str(response.get("description") or "Telegram getMe failed"),
+            )
+        bot = response.get("result") if isinstance(response.get("result"), dict) else {}
+        updated = save_telegram_account(
+            store,
+            settings,
+            account_id=account_id,
+            chief_agent_id=str(account["chief_agent_id"]),
+            label=str(account.get("label") or account_id),
+            enabled=bool(account.get("enabled")),
+            bot_username=str(bot.get("username") or "") or None,
+            actor=user.username if user else "web",
+        )
+        return {"ok": True, "account": updated, "bot_username": bot.get("username")}
+
+    @app.delete("/api/connectors/telegram/accounts/{account_id}")
+    async def delete_telegram_account_route(
+        account_id: str,
+        delete_secret: bool = False,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("admin", current)
+        try:
+            removed = remove_telegram_account(
+                store,
+                settings,
+                account_id,
+                delete_secret=delete_secret,
+                actor=user.username if user else "web",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not removed:
+            raise HTTPException(status_code=404, detail="unknown Telegram account")
+        return {"removed": True, "account_id": account_id, "secret_removed": delete_secret}
+
+    @app.get("/api/chief-chat/policies")
+    async def chief_chat_policies(
+        current: AuthResult = auth_dependency,
+    ) -> list[dict[str, object]]:
+        require("admin", current)
+        return store.chief_chat_policies()
+
+    @app.put("/api/chief-chat/policies/{chief_agent_id}")
+    async def update_chief_chat_policy(
+        chief_agent_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("admin", current)
+        try:
+            return save_chief_chat_policy(
+                store,
+                settings,
+                chief_agent_id=chief_agent_id,
+                direct_enabled=bool(payload.get("direct_enabled", False)),
+                tool_groups=[str(item) for item in payload.get("tool_groups") or []],
+                max_tool_calls=(
+                    int(payload["max_tool_calls"])
+                    if payload.get("max_tool_calls") is not None
+                    else None
+                ),
+                max_elapsed_seconds=(
+                    int(payload["max_elapsed_seconds"])
+                    if payload.get("max_elapsed_seconds") is not None
+                    else None
+                ),
+                actor=user.username if user else "web",
+            )
+        except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/models")
@@ -1367,12 +1548,45 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"unknown thread: {thread_id}")
         return conversation
 
+    def _thread_payload(conversation: Conversation) -> dict[str, object]:
+        fallback_provider = settings.default_provider
+        fallback_model = settings.default_model
+        try:
+            if conversation.persona.startswith("executive:"):
+                persona = resolve_executive_persona(
+                    store, conversation.operator_username, conversation.persona
+                )
+                agent_id = persona.agent_id
+            else:
+                persona = resolve_persona(store, conversation.persona)
+                agent_id = persona.chief_agent_id
+            agent = next(
+                (item for item in store.agents() if item.agent_id == agent_id), None
+            )
+            if agent is not None:
+                fallback_provider = agent.model_provider
+                fallback_model = agent.model_name
+        except (UnknownPersonaError, UnknownExecutiveError):
+            pass
+        provider_name, model_name, base_url = effective_model_route(
+            conversation,
+            fallback_provider=fallback_provider,
+            fallback_model=fallback_model,
+        )
+        return {
+            **conversation.to_dict(),
+            "channel": conversation.channel,
+            "effective_model_provider": provider_name,
+            "effective_model_name": model_name,
+            "effective_model_base_url": base_url,
+        }
+
     @app.get("/api/chat/threads")
     async def chat_threads(current: AuthResult = auth_dependency) -> dict[str, object]:
         user = require("chat:read", current)
         username = _operator_username(user)
         return {
-            "threads": [item.to_dict() for item in store.conversations(username)],
+            "threads": [_thread_payload(item) for item in store.conversations(username)],
             "personas": [
                 *[item.to_dict() for item in available_executive_personas(store, username)],
                 *[item.to_dict() for item in available_personas(store)],
@@ -1395,7 +1609,7 @@ def create_app(
                     persona.persona_id,
                     title=payload.get("title") or persona.display_name,
                 )
-                return {**conversation.to_dict(), "channel": conversation.channel}
+                return _thread_payload(conversation)
             persona = resolve_persona(
                 store,
                 payload.get("persona"),
@@ -1410,7 +1624,7 @@ def create_app(
             team_id=persona.team_id,
             title=payload.get("title") or persona.display_name,
         )
-        return {**conversation.to_dict(), "channel": conversation.channel}
+        return _thread_payload(conversation)
 
     @app.get("/api/chat/threads/{thread_id}/messages")
     async def chat_thread_messages(
@@ -1423,12 +1637,49 @@ def create_app(
         if conversation.operator_username != _operator_username(user):
             raise HTTPException(status_code=403, detail="not your thread")
         return {
-            "thread": conversation.to_dict(),
+            "thread": _thread_payload(conversation),
             "messages": [
                 message.to_dict()
                 for message in store.recent_messages(conversation.channel, limit=limit)
             ],
         }
+
+    @app.post("/api/chat/threads/{thread_id}/model")
+    async def chat_thread_model(
+        thread_id: str,
+        payload: dict[str, Any],
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("chat:write", current)
+        conversation = _thread_or_404(thread_id)
+        if conversation.operator_username != _operator_username(user):
+            raise HTTPException(status_code=403, detail="not your thread")
+        provider_name = str(payload.get("provider") or "").strip()
+        model_name = str(payload.get("model") or "").strip()
+        if not provider_name or not model_name:
+            raise HTTPException(status_code=422, detail="provider and model are required")
+        options = available_model_options(settings, store.model_inventory()).get("options", [])
+        selected = next(
+            (
+                item
+                for item in options
+                if item.get("provider") == provider_name
+                and item.get("model") == model_name
+                and item.get("available")
+                and item.get("configured", True)
+            ),
+            None,
+        )
+        if selected is None:
+            raise HTTPException(status_code=400, detail="model route is not available")
+        persist_model_route(
+            store,
+            conversation,
+            provider=provider_name,
+            model=model_name,
+            base_url=str(selected["base_url"]) if selected.get("base_url") else None,
+        )
+        return _thread_payload(conversation)
 
     @app.post("/api/chat/threads/{thread_id}/messages")
     async def chat_thread_send(
@@ -1453,6 +1704,76 @@ def create_app(
                 )
             except UnknownExecutiveError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            executive_agent = next(
+                item for item in store.agents() if item.agent_id == executive_persona.agent_id
+            )
+            command = parse_chat_command(content)
+            if command and command.verb in {"help", "who", "status", "model", "new"}:
+                if command.verb == "help":
+                    summary = command_help(fixed_persona=True)
+                elif command.verb == "who":
+                    summary = f"You're talking to {executive_persona.display_name}."
+                elif command.verb == "status":
+                    provider_name, model_name, _ = effective_model_route(
+                        conversation,
+                        fallback_provider=executive_agent.model_provider,
+                        fallback_model=executive_agent.model_name,
+                    )
+                    summary = (
+                        f"Chat status: active\nPersona: {executive_persona.display_name}\n"
+                        f"Model: {provider_name} / {model_name}"
+                    )
+                elif command.verb == "model":
+                    summary = model_command_reply(
+                        store,
+                        settings,
+                        conversation,
+                        command.argument,
+                        fallback_provider=executive_agent.model_provider,
+                        fallback_model=executive_agent.model_name,
+                    )
+                else:
+                    conversation.status = "archived"
+                    store.upsert_conversation(conversation)
+                    fresh = store.resolve_active_conversation(
+                        username,
+                        executive_persona.persona_id,
+                        title=executive_persona.display_name,
+                    )
+                    summary = f"Started a fresh conversation with {executive_persona.display_name}."
+                    request_id, response_id = record_command_exchange(
+                        store,
+                        fresh,
+                        operator=username,
+                        assistant=executive_persona.agent_id,
+                        command=content,
+                        reply=summary,
+                    )
+                    return {
+                        "status": "complete",
+                        "summary": summary,
+                        "thread_id": fresh.thread_id,
+                        "conversation_id": fresh.channel,
+                        "agent_id": executive_persona.agent_id,
+                        "request_message_id": request_id,
+                        "response_message_id": response_id,
+                    }
+                request_id, response_id = record_command_exchange(
+                    store,
+                    conversation,
+                    operator=username,
+                    assistant=executive_persona.agent_id,
+                    command=content,
+                    reply=summary,
+                )
+                return {
+                    "status": "complete",
+                    "summary": summary,
+                    "conversation_id": conversation.channel,
+                    "agent_id": executive_persona.agent_id,
+                    "request_message_id": request_id,
+                    "response_message_id": response_id,
+                }
             pending = _pending_chat_proposal(
                 store,
                 conversation.channel,
@@ -1460,7 +1781,14 @@ def create_app(
             )
             if pending is not None and _classify_chat_confirmation(content) == "confirm":
                 require("task:write", current)
-            provider = _provider_from_payload(payload, settings)
+            provider = _thread_provider(
+                payload,
+                settings,
+                store,
+                conversation,
+                fallback_provider=executive_agent.model_provider,
+                fallback_model=executive_agent.model_name,
+            )
             return run_executive_chat_turn(
                 store,
                 thread=conversation,
@@ -1481,9 +1809,155 @@ def create_app(
         pending = _pending_chat_proposal(
             store, conversation.channel, kind_prefix=CHIEF_CHAT_KIND_PREFIX
         )
+        chief_agent = next(
+            (
+                item
+                for item in store.agents()
+                if item.agent_id == persona.chief_agent_id
+            ),
+            None,
+        )
+        fallback_provider = (
+            chief_agent.model_provider if chief_agent else settings.default_provider
+        )
+        fallback_model = chief_agent.model_name if chief_agent else settings.default_model
+        command = parse_chat_command(content)
+        direct_enabled = bool(
+            persona.chief_agent_id
+            and user is not None
+            and user.role == Role.OWNER
+            and (store.chief_chat_policy(persona.chief_agent_id) or {}).get("direct_enabled")
+        )
+        basic_command = bool(
+            command
+            and (
+                command.verb in {"help", "who", "model", "new"}
+                or (
+                    not direct_enabled
+                    and pending is None
+                    and command.verb in {"status", "cancel", "confirm"}
+                )
+            )
+        )
+        if command and basic_command:
+            if command.verb == "help":
+                summary = command_help(
+                    fixed_persona=True, direct_enabled=direct_enabled
+                )
+            elif command.verb == "who":
+                summary = f"You're talking to {persona.display_name}."
+            elif command.verb == "model":
+                summary = model_command_reply(
+                    store,
+                    settings,
+                    conversation,
+                    command.argument,
+                    fallback_provider=fallback_provider,
+                    fallback_model=fallback_model,
+                )
+            elif command.verb == "status":
+                provider_name, model_name, _ = effective_model_route(
+                    conversation,
+                    fallback_provider=fallback_provider,
+                    fallback_model=fallback_model,
+                )
+                summary = (
+                    f"Chat status: active\nPersona: {persona.display_name}\n"
+                    f"Model: {provider_name} / {model_name}"
+                )
+            elif command.verb in {"cancel", "confirm"}:
+                summary = "There is no active direct Chief turn."
+            else:
+                conversation.status = "archived"
+                store.upsert_conversation(conversation)
+                fresh = store.resolve_active_conversation(
+                    username,
+                    persona.persona_id,
+                    chief_agent_id=persona.chief_agent_id,
+                    team_id=persona.team_id,
+                    title=persona.display_name,
+                )
+                summary = f"Started a fresh conversation with {persona.display_name}."
+                request_id, response_id = record_command_exchange(
+                    store,
+                    fresh,
+                    operator=username,
+                    assistant=persona.chief_agent_id or FRONT_DESK_PERSONA,
+                    command=content,
+                    reply=summary,
+                )
+                return {
+                    "status": "complete",
+                    "summary": summary,
+                    "thread_id": fresh.thread_id,
+                    "conversation_id": fresh.channel,
+                    "agent_id": persona.chief_agent_id or FRONT_DESK_PERSONA,
+                    "request_message_id": request_id,
+                    "response_message_id": response_id,
+                }
+            request_id, response_id = record_command_exchange(
+                store,
+                conversation,
+                operator=username,
+                assistant=persona.chief_agent_id or FRONT_DESK_PERSONA,
+                command=content,
+                reply=summary,
+            )
+            return {
+                "status": "complete",
+                "summary": summary,
+                "conversation_id": conversation.channel,
+                "agent_id": persona.chief_agent_id or FRONT_DESK_PERSONA,
+                "request_message_id": request_id,
+                "response_message_id": response_id,
+            }
         if pending is not None and _classify_chat_confirmation(content) == "confirm":
             require("task:write", current)
-        provider = _provider_from_payload(payload, settings)
+        if (
+            pending is None
+            and persona.chief_agent_id
+            and user is not None
+            and user.role == Role.OWNER
+            and direct_enabled
+        ):
+            control = direct_turn_control(
+                store,
+                thread=conversation,
+                operator_username=username,
+                command=content,
+            )
+            if control is not None:
+                return control
+            try:
+                turn = queue_direct_chief_turn(
+                    store,
+                    thread=conversation,
+                    chief_agent_id=persona.chief_agent_id,
+                    operator_username=username,
+                    content=content,
+                    idempotency_key=(
+                        payload.get("idempotency_key") or f"web-chief-direct:{uuid4()}"
+                    ),
+                )
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "queued",
+                    "turn_id": turn["turn_id"],
+                    "conversation_id": conversation.channel,
+                    "agent_id": persona.chief_agent_id,
+                },
+            )
+        provider = _thread_provider(
+            payload,
+            settings,
+            store,
+            conversation,
+            fallback_provider=fallback_provider,
+            fallback_model=fallback_model,
+        )
         return run_chief_chat_turn(
             store,
             thread=conversation,
@@ -1518,7 +1992,7 @@ def create_app(
                     executive_persona.persona_id,
                     title=executive_persona.display_name,
                 )
-                return {**conversation.to_dict(), "channel": conversation.channel}
+                return _thread_payload(conversation)
             persona = resolve_persona(store, requested_persona)
         except (UnknownPersonaError, UnknownExecutiveError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1529,7 +2003,62 @@ def create_app(
             team_id=persona.team_id,
             title=persona.display_name,
         )
-        return {**conversation.to_dict(), "channel": conversation.channel}
+        return _thread_payload(conversation)
+
+    @app.get("/api/chat/turns/{turn_id}")
+    async def chief_direct_turn_status(
+        turn_id: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("chat:read", current)
+        turn = store.find_chief_interactive_turn(turn_id)
+        if turn is None:
+            raise HTTPException(status_code=404, detail="unknown direct Chief turn")
+        if turn.get("operator_username") != _operator_username(user):
+            raise HTTPException(status_code=403, detail="not your turn")
+        return turn
+
+    @app.post("/api/chat/turns/{turn_id}/cancel")
+    async def cancel_chief_direct_turn(
+        turn_id: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("chat:write", current)
+        turn = store.find_chief_interactive_turn(turn_id)
+        if turn is None:
+            raise HTTPException(status_code=404, detail="unknown direct Chief turn")
+        if turn.get("operator_username") != _operator_username(user):
+            raise HTTPException(status_code=403, detail="not your turn")
+        thread = _thread_or_404(str(turn["thread_id"]))
+        result = direct_turn_control(
+            store,
+            thread=thread,
+            operator_username=_operator_username(user),
+            command="/cancel",
+        )
+        return result or {"status": str(turn.get("status") or "unknown")}
+
+    @app.post("/api/chat/turns/{turn_id}/confirm")
+    async def confirm_chief_direct_turn_permission(
+        turn_id: str,
+        current: AuthResult = auth_dependency,
+    ) -> dict[str, object]:
+        user = require("admin", current)
+        turn = store.find_chief_interactive_turn(turn_id)
+        if turn is None:
+            raise HTTPException(status_code=404, detail="unknown direct Chief turn")
+        if turn.get("operator_username") != _operator_username(user):
+            raise HTTPException(status_code=403, detail="not your turn")
+        thread = _thread_or_404(str(turn["thread_id"]))
+        result = direct_turn_control(
+            store,
+            thread=thread,
+            operator_username=_operator_username(user),
+            command="confirm",
+        )
+        if result is None or result.get("status") != "resumed":
+            raise HTTPException(status_code=409, detail="turn is not awaiting permission")
+        return result
 
     @app.get("/api/settings/effective")
     async def settings_effective(current: AuthResult = auth_dependency) -> dict[str, object]:
@@ -1812,6 +2341,42 @@ def _provider_from_payload(payload: dict[str, Any], settings: Settings):
         api_key=payload.get("api_key"),
         api_base=str(base_url) if base_url else None,
     )
+
+
+def _thread_provider(
+    payload: dict[str, Any],
+    settings: Settings,
+    store: StateStore,
+    conversation,
+    *,
+    fallback_provider: str,
+    fallback_model: str,
+):
+    requested_provider = str(payload.get("provider") or "").strip()
+    requested_model = str(payload.get("model") or "").strip()
+    if requested_provider and requested_model:
+        persist_model_route(
+            store,
+            conversation,
+            provider=requested_provider,
+            model=requested_model,
+            base_url=str(payload["base_url"]) if payload.get("base_url") else None,
+        )
+    provider_name, model_name, base_url = effective_model_route(
+        conversation,
+        fallback_provider=fallback_provider,
+        fallback_model=fallback_model,
+    )
+    routed_payload = {
+        **payload,
+        "provider": provider_name,
+        "model": model_name,
+    }
+    if base_url:
+        routed_payload["base_url"] = base_url
+    else:
+        routed_payload.pop("base_url", None)
+    return _provider_from_payload(routed_payload, settings)
 
 
 def _require_live_connector_store(settings: Settings) -> None:

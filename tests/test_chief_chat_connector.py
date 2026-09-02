@@ -5,13 +5,14 @@ from __future__ import annotations
 from functools import partial
 
 from brigade.chief_chat import parse_control_command, run_connector_chief_chat
+from brigade.config import Settings
 from brigade.connectors import (
     ConnectorResult,
     IncomingConnectorMessage,
     approve_external_identity,
     process_live_connector_message,
 )
-from brigade.schemas import Agent, Assignment, AssignmentStatus, Team
+from brigade.schemas import Agent, Assignment, AssignmentStatus, Role, Team, User
 from brigade.state import JsonStateStore
 from tests.helpers import SequencedTestProvider, TestProvider
 
@@ -78,12 +79,85 @@ def test_parse_control_command():
     assert parse_control_command("/frontdesk").verb == "frontdesk"
     assert parse_control_command("/who").verb == "who"
     assert parse_control_command("/new").verb == "new"
+    assert parse_control_command("/help").verb == "help"
+    assert parse_control_command("/model 2").argument == "2"
     chief = parse_control_command("/chief sales team")
     assert chief.verb == "chief"
     assert chief.argument == "sales team"
     assert parse_control_command("/chief").argument == ""
     assert parse_control_command("hello there") is None
     assert parse_control_command("/unknown") is None
+
+
+def test_model_command_changes_connector_thread_without_model_call(tmp_path):
+    store = _fleet(tmp_path, teams=1)
+    settings = Settings(
+        config_path=tmp_path / "brigade.config.json",
+        data_dir=tmp_path,
+        default_provider="openai",
+        default_model="gpt-x",
+        openai_api_key="test-key",
+    )
+    provider = SequencedTestProvider([])
+
+    _, sent = _run(store, provider, "/model 2", settings=settings)
+
+    assert sent == [
+        "Model changed to openai-codex / gpt-5.3-codex-spark for this chat."
+    ]
+    thread = store.conversations("alice", status="active")[0]
+    assert thread.model_provider == "openai-codex"
+    assert thread.model_name == "gpt-5.3-codex-spark"
+    assert provider.calls == []
+
+    routed: list[dict] = []
+
+    def provider_factory(_settings, **kwargs):
+        routed.append(kwargs)
+        return TestProvider(text="Routed reply.")
+
+    _, reply = _run(
+        store,
+        TestProvider(text="wrong provider"),
+        "continue",
+        message_id="model-followup",
+        settings=settings,
+        provider_factory=provider_factory,
+    )
+    assert reply == ["Routed reply."]
+    assert routed == [
+        {
+            "provider": "openai-codex",
+            "model": "gpt-5.3-codex-spark",
+            "api_base": None,
+        }
+    ]
+
+
+def test_named_bot_model_command_updates_its_bound_thread_not_recent_persona(tmp_path):
+    store = _fleet(tmp_path, teams=2)
+    settings = Settings(
+        config_path=tmp_path / "brigade.config.json",
+        data_dir=tmp_path,
+        default_provider="openai",
+        default_model="gpt-x",
+        openai_api_key="test-key",
+    )
+    _run(store, TestProvider(text="x"), "/chief team1", message_id="switch")
+
+    _, sent = _run(
+        store,
+        SequencedTestProvider([]),
+        "/model 2",
+        message_id="fixed-model",
+        settings=settings,
+        fixed_persona="chief0",
+    )
+
+    assert "openai-codex / gpt-5.3-codex-spark" in sent[0]
+    threads = {item.persona: item for item in store.conversations("alice", status="active")}
+    assert threads["chief:chief0"].model_provider == "openai-codex"
+    assert threads["chief:chief1"].model_provider is None
 
 
 def test_approved_identity_creates_thread_and_replies(tmp_path):
@@ -111,6 +185,30 @@ def test_approved_identity_creates_thread_and_replies(tmp_path):
     kinds = [item.metadata.get("kind") for item in store.messages(threads[0].channel)]
     assert "chief_chat_request" in kinds
     assert "chief_chat_response" in kinds
+
+
+def test_telegram_chief_chat_bare_task_json_creates_task_and_replies_in_prose(tmp_path):
+    store = _fleet(tmp_path, teams=1)
+    store.add_user(User("alice", Role.OWNER))
+    provider = SequencedTestProvider(
+        [
+            '{"type":"create_task","assigned_to":"worker0",'
+            '"description":"Check the backup job","priority":"high"}'
+        ]
+    )
+
+    result, sent = _run(store, provider, "Create a task to check the backup job.")
+
+    assert result.status == "complete"
+    assert len(store.assignments()) == 1
+    assignment = store.assignments()[0]
+    assert assignment.assignment == "Check the backup job"
+    assert assignment.assigned_to == "worker0"
+    assert sent == [
+        f'Applied.\n\nApplied:\n- Created task "Check the backup job" for worker0 '
+        f"(high, id {assignment.assignment_id[:8]})."
+    ]
+    assert "{" not in sent[0]
 
 
 def test_control_commands_switch_persona(tmp_path):

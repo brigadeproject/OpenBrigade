@@ -1,0 +1,17 @@
+{
+  "actions": [
+    {
+      "id": "openbrigade-status",
+      "description": "Read the live OpenBrigade service and datastore status.",
+      "argv": [
+        "/opt/openbrigade/ops/brigade-live.sh",
+        "status",
+        "--json"
+      ],
+      "allowed_chief_ids": [
+        "infrastructure-chief"
+      ],
+      "timeout_seconds": 60
+    }
+  ]
+}

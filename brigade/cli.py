@@ -23,6 +23,7 @@ from brigade.auth import (
     issue_token,
     verify_token,
 )
+from brigade.chief_direct_runtime import ChiefDirectTurnWorker
 from brigade.config import Settings, load_settings
 from brigade.connectors import (
     approve_external_identity,
@@ -38,6 +39,12 @@ from brigade.db import (
     combined_schema_sql,
     load_migrations,
     migration_status,
+)
+from brigade.direct_chief import (
+    public_telegram_account,
+    remove_telegram_account,
+    save_chief_chat_policy,
+    save_telegram_account,
 )
 from brigade.executive import (
     resolve_executive_persona,
@@ -119,6 +126,7 @@ from brigade.secrets import (
     MODEL_AUTH_PROVIDERS,
     delete_oauth_credential,
     oauth_credential_status,
+    read_telegram_bot_token,
     write_oauth_credential,
 )
 from brigade.services import (
@@ -136,7 +144,11 @@ from brigade.services import (
     set_runtime_overrides,
 )
 from brigade.store import RedisRuntimeClient, StateStore, open_state_store
-from brigade.telegram_polling import TelegramPollingWorker
+from brigade.telegram_polling import (
+    TelegramPollingSupervisor,
+    TelegramPollingWorker,
+    _telegram_api_post,
+)
 from brigade.time import utc_now_iso
 from brigade.tui import (
     VIEWS,
@@ -960,6 +972,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Allowed Telegram user id. May be repeated. Defaults to BRIGADE_TELEGRAM_ALLOWLIST.",
     )
+    telegram_accounts = connector_sub.add_parser(
+        "telegram-account",
+        help="Manage opt-in named Telegram bots for Crew Chiefs.",
+    )
+    telegram_accounts_sub = telegram_accounts.add_subparsers(
+        dest="telegram_account_command", required=True
+    )
+    telegram_accounts_sub.add_parser("list")
+    telegram_account_add = telegram_accounts_sub.add_parser("add")
+    telegram_account_add.add_argument("--id", required=True)
+    telegram_account_add.add_argument("--chief", required=True)
+    telegram_account_add.add_argument("--label", default=None)
+    telegram_account_add.add_argument("--token-stdin", action="store_true", required=True)
+    telegram_account_add.add_argument("--enable", action="store_true")
+    telegram_account_rotate = telegram_accounts_sub.add_parser("rotate-token")
+    telegram_account_rotate.add_argument("--id", required=True)
+    telegram_account_rotate.add_argument("--token-stdin", action="store_true", required=True)
+    for command in ("enable", "disable", "test"):
+        item = telegram_accounts_sub.add_parser(command)
+        item.add_argument("--id", required=True)
+    telegram_account_remove = telegram_accounts_sub.add_parser("remove")
+    telegram_account_remove.add_argument("--id", required=True)
+    telegram_account_remove.add_argument("--delete-secret", action="store_true")
+
+    chief_policy = connector_sub.add_parser(
+        "chief-policy",
+        help="Manage owner-only direct Crew Chief chat policy.",
+    )
+    chief_policy_sub = chief_policy.add_subparsers(
+        dest="chief_policy_command", required=True
+    )
+    chief_policy_sub.add_parser("list")
+    chief_policy_set = chief_policy_sub.add_parser("set")
+    chief_policy_set.add_argument("--chief", required=True)
+    chief_policy_set.add_argument("--direct", choices=["on", "off"], required=True)
+    chief_policy_set.add_argument("--tool-group", action="append", default=[])
+    chief_policy_set.add_argument("--max-tool-calls", type=int, default=None)
+    chief_policy_set.add_argument("--max-elapsed-seconds", type=int, default=None)
     google_chat = connector_sub.add_parser(
         "google-chat",
         help="Handle one Google Chat event payload.",
@@ -1522,6 +1572,133 @@ def _main(argv: Sequence[str] | None = None) -> int:
             )
             print(json.dumps(record, indent=2, sort_keys=True))
             return 0
+
+    if args.command == "connector" and args.connector_command == "telegram-account":
+        user = _require_permission(store, settings, actor, "admin")
+        decided_by = user.username if user else "bootstrap"
+        if args.telegram_account_command == "list":
+            records = [public_telegram_account(item) for item in store.telegram_accounts()]
+            print(json.dumps(records, indent=2, sort_keys=True))
+            return 0
+        if args.telegram_account_command == "add":
+            token = sys.stdin.read().strip()
+            if not token:
+                raise ValueError("Telegram bot token is required on stdin")
+            record = save_telegram_account(
+                store,
+                settings,
+                account_id=args.id,
+                chief_agent_id=args.chief,
+                label=args.label,
+                token=token,
+                enabled=args.enable,
+                actor=decided_by,
+            )
+            print(json.dumps(record, indent=2, sort_keys=True))
+            return 0
+        account = store.find_telegram_account(args.id)
+        if account is None:
+            raise ValueError(f"unknown Telegram account: {args.id}")
+        if args.telegram_account_command == "rotate-token":
+            token = sys.stdin.read().strip()
+            if not token:
+                raise ValueError("Telegram bot token is required on stdin")
+            record = save_telegram_account(
+                store,
+                settings,
+                account_id=args.id,
+                chief_agent_id=str(account["chief_agent_id"]),
+                label=str(account.get("label") or args.id),
+                token=token,
+                enabled=bool(account.get("enabled")),
+                bot_username=account.get("bot_username"),
+                actor=decided_by,
+            )
+            print(json.dumps(record, indent=2, sort_keys=True))
+            return 0
+        if args.telegram_account_command in {"enable", "disable"}:
+            record = save_telegram_account(
+                store,
+                settings,
+                account_id=args.id,
+                chief_agent_id=str(account["chief_agent_id"]),
+                label=str(account.get("label") or args.id),
+                enabled=args.telegram_account_command == "enable",
+                bot_username=account.get("bot_username"),
+                actor=decided_by,
+            )
+            print(json.dumps(record, indent=2, sort_keys=True))
+            return 0
+        if args.telegram_account_command == "test":
+            token = read_telegram_bot_token(settings, args.id)
+            if not token:
+                raise ValueError("Telegram bot token is not configured")
+            response = _telegram_api_post(
+                f"https://api.telegram.org/bot{token}/getMe",
+                b"{}",
+                {"Content-Type": "application/json"},
+            )
+            if not response.get("ok") or not isinstance(response.get("result"), dict):
+                raise RuntimeError("Telegram getMe rejected the configured bot token")
+            bot = response["result"]
+            record = save_telegram_account(
+                store,
+                settings,
+                account_id=args.id,
+                chief_agent_id=str(account["chief_agent_id"]),
+                label=str(account.get("label") or args.id),
+                enabled=bool(account.get("enabled")),
+                bot_username=str(bot.get("username") or "") or None,
+                actor=decided_by,
+            )
+            print(
+                json.dumps(
+                    {"ok": True, "bot": bot, "account": record},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        removed = remove_telegram_account(
+            store,
+            settings,
+            args.id,
+            delete_secret=args.delete_secret,
+            actor=decided_by,
+        )
+        print(json.dumps({"account_id": args.id, "removed": removed}, indent=2))
+        return 0
+
+    if args.command == "connector" and args.connector_command == "chief-policy":
+        user = _require_permission(store, settings, actor, "admin")
+        decided_by = user.username if user else "bootstrap"
+        if args.chief_policy_command == "list":
+            print(json.dumps(store.chief_chat_policies(), indent=2, sort_keys=True))
+            return 0
+        existing = store.chief_chat_policy(args.chief)
+        groups = args.tool_group
+        if not groups and existing is not None:
+            groups = list(existing.get("tool_groups") or [])
+        policy = save_chief_chat_policy(
+            store,
+            settings,
+            chief_agent_id=args.chief,
+            direct_enabled=args.direct == "on",
+            tool_groups=groups,
+            max_tool_calls=(
+                args.max_tool_calls
+                if args.max_tool_calls is not None
+                else (existing or {}).get("max_tool_calls")
+            ),
+            max_elapsed_seconds=(
+                args.max_elapsed_seconds
+                if args.max_elapsed_seconds is not None
+                else (existing or {}).get("max_elapsed_seconds")
+            ),
+            actor=decided_by,
+        )
+        print(json.dumps(policy, indent=2, sort_keys=True))
+        return 0
 
     if args.command == "connector" and args.connector_command == "telegram":
         _require_permission(store, settings, actor, "chat:write")
@@ -2724,6 +2901,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
         )
         if telegram_poller:
             telegram_poller.start()
+        telegram_account_supervisor = TelegramPollingSupervisor(settings, store)
+        telegram_account_supervisor.start()
+        chief_direct_worker = ChiefDirectTurnWorker(settings, store)
+        chief_direct_worker.start()
         try:
             while (max_cycles is None or completed < max_cycles) and not shutdown.is_set():
                 cycle_config = OrchestrationConfig.from_settings(settings).with_overrides(
@@ -2767,6 +2948,8 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 if shutdown.wait(sleep_seconds):
                     break
         finally:
+            chief_direct_worker.stop()
+            telegram_account_supervisor.stop()
             if telegram_poller:
                 telegram_poller.stop()
         print(

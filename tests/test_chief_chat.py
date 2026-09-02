@@ -72,6 +72,16 @@ def test_parse_chief_chat_reply_variants():
     assert actions.actions[0]["type"] == "cancel_assignment"
 
     assert parse_chief_chat_reply("All quiet on the team.").kind == "text"
+    bare_task = parse_chief_chat_reply(
+        '{"type":"create_task","agent_id":"worker0","assignment":"Do it"}'
+    )
+    assert bare_task.kind == "actions"
+    assert bare_task.actions[0]["type"] == "create_task"
+    untyped_task = parse_chief_chat_reply(
+        '{"title":"Do it","assigned_to":"worker0","priority":"normal"}'
+    )
+    assert untyped_task.kind == "actions"
+    assert untyped_task.actions[0]["type"] == "create_task"
     assert parse_chief_chat_reply('{"status":"tool_call"}').kind == "invalid"
     # Reasoning-only completions arrive as empty text; retry, don't store them.
     assert parse_chief_chat_reply("").kind == "invalid"

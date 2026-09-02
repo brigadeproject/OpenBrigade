@@ -665,18 +665,104 @@ def _format_action_proposal(summary: str, actions: list[dict[str, Any]]) -> str:
 
 
 def _format_action_result(result: dict[str, list[dict[str, Any]]]) -> str:
-    lines = ["Applied."]
+    lines = ["Applied." if result["applied"] else "I couldn't apply that."]
     if result["applied"]:
         lines.append("")
         lines.append("Applied:")
         for item in result["applied"]:
-            lines.append(f"- {json.dumps(item, sort_keys=True, default=str)}")
+            action_type = str(item.get("type") or "action")
+            if action_type in {"create_assignment", "create_task"}:
+                task_id = str(item.get("assignment_id") or "")
+                assignment = str(item.get("assignment") or "task")
+                agent_id = str(item.get("agent_id") or "assigned agent")
+                priority = str(item.get("priority") or "normal")
+                lines.append(
+                    f'- Created task "{assignment}" for {agent_id} '
+                    f"({priority}, id {task_id[:8]})."
+                )
+            else:
+                details = ", ".join(
+                    f"{key.replace('_', ' ')}: {value}"
+                    for key, value in item.items()
+                    if key != "type" and value is not None
+                )
+                label = action_type.replace("_", " ").capitalize()
+                lines.append(f"- {label}{f': {details}' if details else '.'}")
     if result["rejected"]:
         lines.append("")
         lines.append("Rejected:")
         for item in result["rejected"]:
             lines.append(f"- {item.get('reason')}")
     return "\n".join(lines)
+
+
+def _apply_chat_actions_now(
+    store: StateStore,
+    actions: list[dict[str, Any]],
+    *,
+    channel: str,
+    sender: str,
+    request: ChatMessage,
+    response: Any,
+    apply: Callable[[list[dict[str, Any]]], dict[str, list[dict[str, Any]]]],
+    agent_id: str,
+    kind_prefix: str,
+) -> dict[str, Any]:
+    """Apply an already-authorized low-risk chat action and render prose.
+
+    Task creation uses this path because the operator's imperative is the
+    authorization. Other action types continue through the proposal/confirm
+    path.
+    """
+    result = apply(actions)
+    response_text = _format_action_result(result)
+    response_message = ChatMessage(
+        channel=channel,
+        sender=agent_id,
+        recipient=sender,
+        content=response_text,
+        metadata={
+            "kind": f"{kind_prefix}_action_applied",
+            "conversation_id": channel,
+            "agent_id": agent_id,
+            "actions": actions,
+            "result": result,
+            "provider": response.provider,
+            "model": response.model,
+            "route_type": response.route_type,
+        },
+    )
+    store.add_message(response_message)
+    store.add_usage_record(
+        {
+            "usage_id": str(uuid4()),
+            "assignment_id": None,
+            "agent_id": agent_id,
+            "provider": response.provider,
+            "model": response.model,
+            "route_type": response.route_type,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "total_tokens": response.input_tokens + response.output_tokens,
+            "estimated_cost_usd": response.estimated_cost_usd,
+            "recorded_at": utc_now_iso(),
+            "conversation_id": channel,
+            "source": kind_prefix,
+        }
+    )
+    return {
+        "status": "applied" if result["applied"] else "rejected",
+        "conversation_id": channel,
+        "summary": _summarize(response_text),
+        "request_message_id": request.message_id,
+        "response_message_id": response_message.message_id,
+        "agent_id": agent_id,
+        "actions_applied": result["applied"],
+        "actions_rejected": result["rejected"],
+        "provider": response.provider,
+        "model": response.model,
+        "route_type": response.route_type,
+    }
 
 
 def send_orchestrator_chat(
@@ -1600,8 +1686,23 @@ def apply_orchestrator_chat_actions(
     applied: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    for action in actions:
+    for original_action in actions:
+        action = dict(original_action)
         action_type = str(action.get("type") or "").strip()
+        if action_type == "create_task":
+            action_type = "create_assignment"
+            action["type"] = action_type
+        if action_type == "create_assignment":
+            action["agent_id"] = (
+                action.get("agent_id")
+                or action.get("assigned_to")
+                or action.get("assignee")
+            )
+            action["assignment"] = (
+                action.get("assignment")
+                or action.get("description")
+                or action.get("title")
+            )
         if action_type not in CHAT_EXTENDED_ACTION_TYPES:
             sub = apply_orchestrator_actions(store, [action])
             applied.extend(sub["applied"])
@@ -1777,9 +1878,11 @@ def apply_chief_chat_actions(
     by: str = "operator",
     conversation_channel: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Operator-confirmed actions proposed by a crew chief in chat.
+    """Governed actions requested through Crew Chief chat.
 
-    Every action is validated against the chief's managed agents
+    Task creation may arrive as an owner-authorized immediate action; the other
+    action types use proposal confirmation. Every action is validated against
+    the chief's managed agents
     (``managed_agent_ids=None`` is the unrestricted front desk) before it
     touches state; anything outside the vocabulary or the team is rejected
     with a reason instead of applied."""
@@ -1917,7 +2020,7 @@ def _apply_chief_create_assignment(
             else None
         ),
         assignment_rationale=str(
-            action.get("rationale") or "Operator-confirmed chief chat action."
+            action.get("rationale") or "Operator-directed chief chat action."
         ),
         created_by_role="crew_chief" if chief_id else "orchestrator",
     )
@@ -1925,6 +2028,7 @@ def _apply_chief_create_assignment(
     return {
         "type": "create_assignment",
         "assignment_id": persisted.assignment_id,
+        "assignment": persisted.assignment,
         "agent_id": resolved,
         "priority": priority.value,
         "status": persisted.status.value,

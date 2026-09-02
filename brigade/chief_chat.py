@@ -10,11 +10,19 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
+from brigade.chat_commands import (
+    command_help,
+    model_command_reply,
+    parse_chat_command,
+    record_command_exchange,
+)
 from brigade.citations import (
     available_citations,
     citation_context,
@@ -24,6 +32,7 @@ from brigade.citations import (
     classify_rendered_claims,
     enforce_citation_answer,
 )
+from brigade.config import Settings
 from brigade.connectors import ConnectorChatReply, IncomingConnectorMessage
 from brigade.memory import (
     build_memory_entry,
@@ -42,18 +51,20 @@ from brigade.prompt_floors import (
     read_agent_chat_notes,
     write_agent_chat_notes,
 )
-from brigade.providers import ModelProvider, ModelResponse
+from brigade.providers import ModelProvider, ModelResponse, provider_from_settings
 from brigade.research_control import record_citation_validation
 from brigade.runner import MAX_OBSERVATION_CHARS, _truncate
 from brigade.schemas import (
     Assignment,
     ChatMessage,
     Conversation,
+    Role,
     Team,
     extract_json_object,
 )
 from brigade.services import (
     _acquire_chat_local_inference_lock,
+    _apply_chat_actions_now,
     _chat_activity_snapshot,
     _classify_chat_confirmation,
     _find_chat_by_idempotency,
@@ -847,6 +858,22 @@ class ChiefChatReply:
     reason: str = ""
 
 
+CHAT_ACTION_TYPES = frozenset(
+    {
+        "create_assignment",
+        "create_task",
+        "create_goal",
+        "cancel_assignment",
+        "set_priority",
+        "attach_guidance",
+        "retry_blocked_assignment",
+        "create_recurrence",
+        "set_recurrence_enabled",
+        "ingest_text",
+    }
+)
+
+
 def parse_chief_chat_reply(text: str) -> ChiefChatReply:
     """One parser for both paths: native tool calls arrive pre-translated to
     the same ``{"status":"tool_call",...}`` JSON by the providers, and
@@ -883,6 +910,42 @@ def parse_chief_chat_reply(text: str) -> ChiefChatReply:
         if actions:
             return ChiefChatReply(kind="actions", actions=actions, summary=summary)
         return ChiefChatReply(kind="text", text=summary)
+    # Smaller models sometimes omit the protocol envelope and emit the action
+    # object itself. Recognize only the governed action vocabulary so arbitrary
+    # JSON answers remain prose.
+    action_type = str(
+        payload.get("type") or payload.get("action") or payload.get("status") or ""
+    ).strip()
+    if action_type in CHAT_ACTION_TYPES:
+        action = dict(payload)
+        action["type"] = action_type
+        action.pop("action", None)
+        summary = str(payload.get("summary") or "").strip() or "Requested action."
+        return ChiefChatReply(kind="actions", actions=[action], summary=summary)
+    if isinstance(payload.get("task"), dict):
+        action = {**payload["task"], "type": "create_task"}
+        summary = str(payload.get("summary") or "").strip() or "Requested task."
+        return ChiefChatReply(kind="actions", actions=[action], summary=summary)
+    task_text = payload.get("assignment") or payload.get("description") or payload.get("title")
+    task_target = (
+        payload.get("agent_id")
+        or payload.get("assigned_to")
+        or payload.get("assignee")
+        or payload.get("assigned_agent")
+    )
+    if task_text and task_target:
+        action = {**payload, "type": "create_task"}
+        return ChiefChatReply(
+            kind="actions", actions=[action], summary="Requested task."
+        )
+    bare_actions = [
+        item
+        for item in payload.get("actions") or []
+        if isinstance(item, dict) and str(item.get("type") or "") in CHAT_ACTION_TYPES
+    ]
+    if bare_actions:
+        summary = str(payload.get("summary") or "").strip() or "Requested action(s)."
+        return ChiefChatReply(kind="actions", actions=bare_actions, summary=summary)
     prose = str(payload.get("summary") or payload.get("response") or "").strip()
     return ChiefChatReply(kind="text", text=prose or stripped)
 
@@ -906,6 +969,73 @@ CHIEF_CHAT_ACTION_DOCS = [
     " — a five-field UTC cron schedule. Use cron or interval_seconds, never both.",
     '{"type":"set_recurrence_enabled","recurrence_id":"...","enabled":false}',
 ]
+
+
+def _normalize_task_action(
+    action: dict[str, Any], *, target_type: str
+) -> dict[str, Any]:
+    item = dict(action)
+    nested = item.get("task")
+    if isinstance(nested, dict):
+        item = {**item, **nested}
+    if item.get("type") in {"create_task", "create_assignment"}:
+        item["type"] = target_type
+        item["agent_id"] = (
+            item.get("agent_id")
+            or item.get("assigned_to")
+            or item.get("assignee")
+            or item.get("target_agent")
+            or item.get("assigned_agent")
+        )
+        item["assignment"] = (
+            item.get("assignment")
+            or (nested if isinstance(nested, str) else None)
+            or item.get("description")
+            or item.get("title")
+            or item.get("task_name")
+        )
+    return item
+
+
+def _normalize_chief_actions(
+    actions: list[dict[str, Any]], *, default_agent_id: str | None = None
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for action in actions:
+        item = _normalize_task_action(action, target_type="create_assignment")
+        if item.get("type") == "create_assignment" and not item.get("agent_id"):
+            item["agent_id"] = default_agent_id
+        normalized.append(item)
+    return normalized
+
+
+def _immediate_task_creation_allowed(
+    store: StateStore,
+    operator: str,
+    actions: list[dict[str, Any]],
+    *,
+    action_types: set[str],
+    request_text: str,
+) -> bool:
+    if not actions or any(str(item.get("type") or "") not in action_types for item in actions):
+        return False
+    normalized = " ".join(request_text.lower().split())
+    hypothetical = re.search(
+        r"\b(what would|what could|how would|example of|suggest|brainstorm|draft)\b",
+        normalized,
+    )
+    explicit = re.search(
+        r"\b(create|add|make|open|queue|schedule|set up)\b.{0,80}"
+        r"\b(task|assignment|job|work item)\b",
+        normalized,
+    ) or re.search(r"^(please\s+)?(ask|have|tell|assign|delegate)\b", normalized)
+    if hypothetical or not explicit:
+        return False
+    users = store.users()
+    if not users:  # Offline/library callers are already trusted by their caller.
+        return True
+    user = next((item for item in users if item.username == operator), None)
+    return user is not None and user.role == Role.OWNER
 
 
 def _tool_manifest(registry: ToolRegistry) -> list[str]:
@@ -1010,6 +1140,11 @@ def build_chief_chat_prompt(
         "",
         "Allowed actions inside propose_actions:",
         *CHIEF_CHAT_ACTION_DOCS,
+        (
+            "Task creation is immediate when the operator asks for it: return a "
+            "create_assignment action and the system will create it without a second "
+            "confirmation. Never print action-protocol JSON as the user-facing answer."
+        ),
         "",
         "Context JSON:",
         compact_json(context),
@@ -1213,10 +1348,44 @@ def run_chief_chat_turn(
             }
         reply = parse_chief_chat_reply(response.text)
         if reply.kind == "actions":
+            actions = _normalize_chief_actions(
+                reply.actions, default_agent_id=persona.chief_agent_id
+            )
+            if _immediate_task_creation_allowed(
+                store,
+                operator,
+                actions,
+                action_types={"create_assignment"},
+                request_text=content,
+            ):
+                result = _apply_chat_actions_now(
+                    store,
+                    actions,
+                    channel=channel,
+                    sender=operator,
+                    request=request,
+                    response=response,
+                    agent_id=agent_label,
+                    kind_prefix=CHIEF_CHAT_KIND_PREFIX,
+                    apply=lambda requested: apply_chief_chat_actions(
+                        store,
+                        requested,
+                        chief_id=persona.chief_agent_id,
+                        managed_agent_ids=(
+                            None
+                            if persona.is_front_desk
+                            else set(persona.managed_agent_ids)
+                        ),
+                        by=operator,
+                        conversation_channel=channel,
+                    ),
+                )
+                store.touch_conversation(thread.thread_id)
+                return {**result, "iterations": iterations, "tools_used": tools_used}
             # _stage_chat_proposal records this completion's usage itself.
             result = _stage_chat_proposal(
                 store,
-                reply.actions,
+                actions,
                 reply.summary,
                 channel=channel,
                 sender=operator,
@@ -1407,32 +1576,25 @@ def _maybe_refresh_summary(
 
 @dataclass(frozen=True)
 class ControlCommand:
-    verb: str  # "frontdesk" | "chief" | "who" | "new"
+    verb: str
     argument: str = ""
 
 
 def parse_control_command(text: str) -> ControlCommand | None:
-    """Recognize the four connector control commands. Anything else — including
-    an unknown /slash — returns None and is treated as ordinary chat.
-
-    NL persona detection is deliberately out of scope for 1.1: switching
-    personas over a connector is commands only."""
-    stripped = text.strip()
-    if not stripped.startswith("/"):
-        return None
-    parts = stripped[1:].split(maxsplit=1)
-    if not parts:
-        return None
-    verb = parts[0].lower()
-    argument = parts[1].strip() if len(parts) > 1 else ""
-    if verb in {"frontdesk", "front_desk", "front-desk"}:
-        return ControlCommand("frontdesk")
-    if verb == "chief":
-        return ControlCommand("chief", argument)
-    if verb == "who":
-        return ControlCommand("who")
-    if verb == "new":
-        return ControlCommand("new")
+    """Recognize the shared connector/chat control command suite."""
+    command = parse_chat_command(text)
+    if command and command.verb in {
+        "frontdesk",
+        "chief",
+        "who",
+        "new",
+        "help",
+        "model",
+        "status",
+        "cancel",
+        "confirm",
+    }:
+        return ControlCommand(command.verb, command.argument)
     return None
 
 
@@ -1480,11 +1642,87 @@ def _handle_control_command(
     command: ControlCommand,
     *,
     default_persona: str,
+    settings: Settings | None = None,
+    fixed_persona: str | None = None,
+    direct_enabled: bool = False,
 ) -> ConnectorChatReply:
-    if command.verb == "who":
-        conversation = _current_connector_conversation(
-            store, username, default_persona=default_persona
+    def current_conversation() -> Conversation:
+        if not fixed_persona:
+            return _current_connector_conversation(
+                store, username, default_persona=default_persona
+            )
+        bound = resolve_persona(store, fixed_persona)
+        return store.resolve_active_conversation(
+            username,
+            bound.persona_id,
+            chief_agent_id=bound.chief_agent_id,
+            team_id=bound.team_id,
+            title=bound.display_name,
         )
+
+    if command.verb == "help":
+        conversation = current_conversation()
+        persona = resolve_persona(store, conversation.persona)
+        return ConnectorChatReply(
+            command_help(
+                fixed_persona=bool(fixed_persona), direct_enabled=direct_enabled
+            ),
+            _persona_agent_label(persona),
+        )
+
+    if command.verb in {"model", "status"}:
+        conversation = current_conversation()
+        try:
+            persona = resolve_persona(store, conversation.persona)
+        except UnknownPersonaError:
+            persona = resolve_persona(store, None, default=default_persona)
+        agent = next(
+            (
+                item
+                for item in store.agents()
+                if item.agent_id == persona.chief_agent_id
+            ),
+            None,
+        )
+        fallback_provider = agent.model_provider if agent else (
+            settings.default_provider if settings else "configured default"
+        )
+        fallback_model = agent.model_name if agent else (
+            settings.default_model if settings else "configured default"
+        )
+        if command.verb == "model":
+            if settings is None:
+                text = f"Current model: {fallback_provider} / {fallback_model}"
+            else:
+                text = model_command_reply(
+                    store,
+                    settings,
+                    conversation,
+                    command.argument,
+                    fallback_provider=fallback_provider,
+                    fallback_model=fallback_model,
+                )
+        else:
+            provider = conversation.model_provider or fallback_provider
+            model = conversation.model_name or fallback_model
+            text = (
+                f"Chat status: active\nPersona: {persona.display_name}\n"
+                f"Model: {provider} / {model}"
+            )
+        return ConnectorChatReply(text, _persona_agent_label(persona))
+
+    if command.verb in {"cancel", "confirm"}:
+        conversation = current_conversation()
+        try:
+            persona = resolve_persona(store, conversation.persona)
+        except UnknownPersonaError:
+            persona = resolve_persona(store, None, default=default_persona)
+        return ConnectorChatReply(
+            "There is no active direct Chief turn.", _persona_agent_label(persona)
+        )
+
+    if command.verb == "who":
+        conversation = current_conversation()
         try:
             persona = resolve_persona(store, conversation.persona)
         except UnknownPersonaError:
@@ -1494,9 +1732,7 @@ def _handle_control_command(
         )
 
     if command.verb == "new":
-        conversation = _current_connector_conversation(
-            store, username, default_persona=default_persona
-        )
+        conversation = current_conversation()
         try:
             persona = resolve_persona(store, conversation.persona)
         except UnknownPersonaError:
@@ -1549,25 +1785,82 @@ def run_connector_chief_chat(
     max_iterations: int = 6,
     history_window: int = 12,
     enable_web_fetch: bool = True,
+    fixed_persona: str | None = None,
+    settings: Settings | None = None,
+    direct_enabled: bool = False,
+    provider_factory: Callable[..., ModelProvider] | None = None,
 ) -> ConnectorChatReply:
     """One connector message -> one chief-chat reply. Handles control commands
     (persona switching, /who, /new) before any model call; otherwise continues
     the operator's current thread."""
     command = parse_control_command(incoming.text)
     if command is not None:
-        return _handle_control_command(
-            store, username, command, default_persona=default_persona
+        if fixed_persona and command.verb in {"chief", "frontdesk"}:
+            persona = resolve_persona(store, fixed_persona)
+            return ConnectorChatReply(
+                f"This bot is permanently assigned to {persona.display_name}.",
+                _persona_agent_label(persona),
+            )
+        reply = _handle_control_command(
+            store,
+            username,
+            command,
+            default_persona=default_persona,
+            settings=settings,
+            fixed_persona=fixed_persona,
+            direct_enabled=direct_enabled,
         )
+        if command.verb in {"help", "who", "model", "status", "cancel", "confirm"}:
+            if fixed_persona:
+                bound = resolve_persona(store, fixed_persona)
+                conversation = store.resolve_active_conversation(
+                    username,
+                    bound.persona_id,
+                    chief_agent_id=bound.chief_agent_id,
+                    team_id=bound.team_id,
+                    title=bound.display_name,
+                )
+            else:
+                conversation = _current_connector_conversation(
+                    store, username, default_persona=default_persona
+                )
+            record_command_exchange(
+                store,
+                conversation,
+                operator=username,
+                assistant=reply.agent_id,
+                command=incoming.text,
+                reply=reply.text,
+            )
+        return reply
 
-    conversation = _current_connector_conversation(
-        store, username, default_persona=default_persona
-    )
+    if fixed_persona:
+        bound_persona = resolve_persona(store, fixed_persona)
+        conversation = store.resolve_active_conversation(
+            username,
+            bound_persona.persona_id,
+            chief_agent_id=bound_persona.chief_agent_id,
+            team_id=bound_persona.team_id,
+            title=bound_persona.display_name,
+        )
+    else:
+        conversation = _current_connector_conversation(
+            store, username, default_persona=default_persona
+        )
     try:
-        persona = resolve_persona(store, conversation.persona)
+        persona = resolve_persona(store, fixed_persona or conversation.persona)
     except UnknownPersonaError:
         persona = resolve_persona(store, None, default=default_persona)
         conversation = _switch_persona_conversation(store, username, persona)
     store.touch_conversation(conversation.thread_id)
+    if settings and conversation.model_provider and conversation.model_name:
+        factory = provider_factory or provider_from_settings
+        provider = factory(
+            settings,
+            provider=conversation.model_provider,
+            model=conversation.model_name,
+            api_base=conversation.model_base_url,
+        )
     result = run_chief_chat_turn(
         store,
         thread=conversation,

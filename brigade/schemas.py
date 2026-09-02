@@ -430,6 +430,9 @@ class Conversation:
     status: str = "active"
     title: str | None = None
     rolling_summary: str = ""
+    model_provider: str | None = None
+    model_name: str | None = None
+    model_base_url: str | None = None
     thread_id: str = field(default_factory=lambda: str(uuid4()))
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
@@ -570,6 +573,9 @@ def conversation_from_dict(item: dict[str, Any]) -> Conversation:
         status=item.get("status", "active"),
         title=item.get("title"),
         rolling_summary=item.get("rolling_summary", ""),
+        model_provider=item.get("model_provider"),
+        model_name=item.get("model_name"),
+        model_base_url=item.get("model_base_url"),
         thread_id=item["thread_id"],
         created_at=item["created_at"],
         updated_at=item.get("updated_at", item["created_at"]),

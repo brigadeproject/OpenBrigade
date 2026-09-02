@@ -85,7 +85,7 @@ def test_run_managed_agents_skips_executive_when_running_all(tmp_path):
     assert run_managed_agents(store, TestProvider()) == []
 
 
-def test_executive_can_stage_and_apply_task_action(tmp_path):
+def test_executive_applies_owner_task_action_immediately(tmp_path):
     store = _store(tmp_path)
     persona = resolve_executive_persona(store, "owner")
     thread = store.resolve_active_conversation("owner", persona.persona_id)
@@ -104,7 +104,7 @@ def test_executive_can_stage_and_apply_task_action(tmp_path):
         ]
     )
 
-    proposed = run_executive_chat_turn(
+    applied = run_executive_chat_turn(
         store,
         thread=thread,
         persona=persona,
@@ -112,21 +112,12 @@ def test_executive_can_stage_and_apply_task_action(tmp_path):
         content="Ask ADA to summarize the release notes.",
         provider=provider,
     )
-    assert proposed["status"] == "proposed"
-
-    applied = run_executive_chat_turn(
-        store,
-        thread=thread,
-        persona=persona,
-        operator="owner",
-        content="confirm",
-        provider=SequencedTestProvider(["not used"]),
-    )
     assert applied["status"] == "applied"
     assignment = store.assignments()[0]
     assert assignment.source == "executive_chat"
     assert assignment.assigned_to == "ada"
     assert assignment.created_by_role == "executive"
+    assert "Created task" in store.messages(thread.channel)[-1].content
 
 
 def test_executive_explicit_memory_reconciles_policy_projection(tmp_path):

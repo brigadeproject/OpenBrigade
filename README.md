@@ -238,6 +238,16 @@ For local deployments, use Telegram long polling. The orchestrator calls
 Telegram webhook during startup, so it does not need public ingress. Do not
 run another poller, such as OpenClaw, with the same bot token.
 
+Optional named Telegram bots can be bound one-to-one to Crew Chiefs. They are
+disabled by default, use polling only, and share the Chief's canonical Chat-tab
+thread. Direct owner execution is a separate per-Chief opt-in policy with
+explicit tool groups, durable progress, `/status` and `/cancel`, one-shot exact
+permission grants, a 60-call/30-minute default budget, and a two-hour hard
+stop. Configure accounts and policies in the Connector Approvals UI or with
+`brigade connector telegram-account` and `brigade connector chief-policy`.
+See `docs/CONNECTORS_RUNBOOK.md` for setup, maintenance-action safety, and
+migration rollback instructions.
+
 ```bash
 BRIGADE_TELEGRAM_BOT_TOKEN=<botfather-token>
 BRIGADE_TELEGRAM_POLLING_ENABLED=true
@@ -291,10 +301,13 @@ Release 1.1 lets operators converse with the brigade in natural language through
 loop over query tools (`list_tasks`, `team_status`, `search_episodes`,
 `usage_summary`, `list_recurrences`, `web_search`, `web_fetch`, …) to answer from live and
 historical state, keeps long-term memory (conversation continuity, episodic
-recall, curated notes), and stages state-changing actions (`create_assignment`,
-`cancel_assignment`, `set_priority`, `attach_guidance`,
-`retry_blocked_assignment`, `create_recurrence`, `set_recurrence_enabled`) for
-the operator to confirm in chat. Each conversation talks to one persona: a
+recall, curated notes), and handles governed state-changing actions. An owner's
+explicit task request (`create_assignment`) is applied immediately and answered
+with a plain-language creation receipt. Other mutations (`cancel_assignment`,
+`set_priority`, `attach_guidance`, `retry_blocked_assignment`,
+`create_recurrence`, and `set_recurrence_enabled`) are staged for the operator
+to confirm in chat. Bare, valid task-action JSON from a model is
+normalized internally rather than echoed to the user. Each conversation talks to one persona: a
 team's Crew Chief (scoped to that chief's agents) or the fleet-wide **front
 desk** (the orchestrator's view).
 
@@ -322,11 +335,14 @@ thread routes:
 
 - `GET/POST /api/chat/threads` — list personas/threads, get-or-create by persona
 - `GET/POST /api/chat/threads/{id}/messages` — read history, send a turn
+- `POST /api/chat/threads/{id}/model` — persist that thread's model route
 
 Routing external connectors through chief chat is opt-in and off by default while
 it soaks (`BRIGADE_CONNECTOR_CHIEF_CHAT_ENABLED=true`). Once on, an approved
-connector user switches persona with control commands: `/frontdesk`,
-`/chief <team-or-agent>`, `/who`, and `/new`. Telegram runs the turn out of band
+connector user can use `/help`, `/who`, `/model`, `/new` (or `/clear`), and
+`/status`; the default routing bot also supports `/frontdesk` and
+`/chief <team-or-agent>`. `/model` lists configured choices and persists the
+selection on the shared Telegram/web thread. Telegram runs the turn out of band
 (the webhook returns immediately and the reply is posted when the turn
 finishes); Google Chat runs synchronously with a tighter iteration cap. See the
 `BRIGADE_CHIEF_CHAT_*` settings in `.env.example`, including the

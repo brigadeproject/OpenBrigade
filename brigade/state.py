@@ -26,7 +26,7 @@ from brigade.schemas import (
     team_from_dict,
     user_from_dict,
 )
-from brigade.time import utc_now_iso
+from brigade.time import add_seconds_iso, parse_utc_iso, utc_now, utc_now_iso
 
 EMPTY_STATE: dict[str, Any] = {
     "mission": None,
@@ -58,6 +58,9 @@ EMPTY_STATE: dict[str, Any] = {
     "provenance_records": [],
     "connector_audit_events": [],
     "external_identities": [],
+    "telegram_accounts": [],
+    "chief_chat_policies": [],
+    "chief_interactive_turns": [],
     "local_inference": {
         "status": "idle",
         "holder": None,
@@ -902,6 +905,138 @@ class JsonStateStore:
         if status is not None:
             records = [record for record in records if record.get("status") == status]
         return records
+
+    def upsert_telegram_account(self, account: dict[str, Any]) -> None:
+        state = self.load()
+        records = [
+            item
+            for item in state.get("telegram_accounts", [])
+            if item.get("account_id") != account.get("account_id")
+        ]
+        records.append(dict(account))
+        state["telegram_accounts"] = records
+        self.save(state)
+
+    def telegram_accounts(self, enabled: bool | None = None) -> list[dict[str, Any]]:
+        records = [dict(item) for item in self.load().get("telegram_accounts", [])]
+        if enabled is not None:
+            records = [item for item in records if bool(item.get("enabled")) is enabled]
+        return sorted(records, key=lambda item: str(item.get("account_id") or ""))
+
+    def find_telegram_account(self, account_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                item
+                for item in self.telegram_accounts()
+                if item.get("account_id") == account_id
+            ),
+            None,
+        )
+
+    def delete_telegram_account(self, account_id: str) -> bool:
+        state = self.load()
+        records = list(state.get("telegram_accounts", []))
+        kept = [item for item in records if item.get("account_id") != account_id]
+        if len(kept) == len(records):
+            return False
+        state["telegram_accounts"] = kept
+        self.save(state)
+        return True
+
+    def upsert_chief_chat_policy(self, policy: dict[str, Any]) -> None:
+        state = self.load()
+        records = [
+            item
+            for item in state.get("chief_chat_policies", [])
+            if item.get("chief_agent_id") != policy.get("chief_agent_id")
+        ]
+        records.append(dict(policy))
+        state["chief_chat_policies"] = records
+        self.save(state)
+
+    def chief_chat_policy(self, chief_agent_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                item
+                for item in self.chief_chat_policies()
+                if item.get("chief_agent_id") == chief_agent_id
+            ),
+            None,
+        )
+
+    def chief_chat_policies(self) -> list[dict[str, Any]]:
+        return sorted(
+            [dict(item) for item in self.load().get("chief_chat_policies", [])],
+            key=lambda item: str(item.get("chief_agent_id") or ""),
+        )
+
+    def upsert_chief_interactive_turn(self, turn: dict[str, Any]) -> None:
+        state = self.load()
+        records = [
+            item
+            for item in state.get("chief_interactive_turns", [])
+            if item.get("turn_id") != turn.get("turn_id")
+        ]
+        records.append(dict(turn))
+        state["chief_interactive_turns"] = records
+        self.save(state)
+
+    def find_chief_interactive_turn(self, turn_id: str) -> dict[str, Any] | None:
+        return next(
+            (item for item in self.chief_interactive_turns() if item.get("turn_id") == turn_id),
+            None,
+        )
+
+    def chief_interactive_turns(
+        self,
+        *,
+        status: str | None = None,
+        thread_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        records = [dict(item) for item in self.load().get("chief_interactive_turns", [])]
+        if status is not None:
+            records = [item for item in records if item.get("status") == status]
+        if thread_id is not None:
+            records = [item for item in records if item.get("thread_id") == thread_id]
+        return sorted(records, key=lambda item: str(item.get("updated_at") or ""))
+
+    def try_claim_chief_interactive_turn(
+        self,
+        turn_id: str,
+        owner: str,
+        *,
+        lease_seconds: int,
+    ) -> bool:
+        state = self.load()
+        records = list(state.get("chief_interactive_turns", []))
+        for index, record in enumerate(records):
+            if record.get("turn_id") != turn_id or record.get("status") != "queued":
+                continue
+            expires_at = record.get("claim_expires_at")
+            if expires_at and parse_utc_iso(str(expires_at)) >= utc_now():
+                return False
+            claimed_at = utc_now_iso()
+            claimed = {
+                **record,
+                "claim_owner": owner,
+                "claim_expires_at": add_seconds_iso(claimed_at, lease_seconds),
+                "updated_at": claimed_at,
+            }
+            records[index] = claimed
+            state["chief_interactive_turns"] = records
+            self.save(state)
+            return True
+        return False
+
+    def delete_chief_interactive_turn(self, turn_id: str) -> bool:
+        state = self.load()
+        records = list(state.get("chief_interactive_turns", []))
+        kept = [item for item in records if item.get("turn_id") != turn_id]
+        if len(kept) == len(records):
+            return False
+        state["chief_interactive_turns"] = kept
+        self.save(state)
+        return True
 
 
 RUNNABLE_ASSIGNMENT_STATUSES = {

@@ -351,10 +351,13 @@ def test_live_connector_unknown_user_creates_pending_approval(tmp_path):
         telegram_bot_token="bot-token",
         telegram_default_agent="sage",
     )
+    telegram_calls = []
     app = create_app(
         settings,
         store,
         connector_rate_limiter=InMemoryConnectorRateLimiter(limit=10, window_seconds=60),
+        telegram_http_post=lambda url, payload, headers: telegram_calls.append(url)
+        or {"ok": True},
     )
 
     response = asyncio.run(
@@ -375,6 +378,7 @@ def test_live_connector_unknown_user_creates_pending_approval(tmp_path):
     assert identity is not None
     assert identity["status"] == "pending"
     assert store.messages() == []
+    assert telegram_calls == []
     assert any("pending approval" in alert for alert in store.alerts())
 
 
@@ -434,8 +438,11 @@ def test_approved_telegram_user_auto_replies_and_audits_outbound(tmp_path, monke
 
     assert response.status_code == 200
     assert response.json()["status"] == "complete"
-    assert len(sent) == 1
-    assert sent[0]["payload"]["chat_id"] == "7"  # type: ignore[index]
+    assert len(sent) == 2
+    assert sent[0]["url"].endswith("/sendChatAction")  # type: ignore[union-attr]
+    assert sent[0]["payload"] == {"chat_id": "7", "action": "typing"}
+    assert sent[1]["url"].endswith("/sendMessage")  # type: ignore[union-attr]
+    assert sent[1]["payload"]["chat_id"] == "7"  # type: ignore[index]
     messages = store.messages("telegram:7")
     assert [message.metadata["kind"] for message in messages] == [
         "external_inbound",

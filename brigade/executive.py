@@ -8,13 +8,22 @@ own memory without entering the normal heartbeat assignment runner.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
+from brigade.chat_commands import (
+    command_help,
+    model_command_reply,
+    parse_chat_command,
+    record_command_exchange,
+)
 from brigade.chief_chat import (
     ChiefChatReply,
     _complete_model_call,
+    _immediate_task_creation_allowed,
+    _normalize_task_action,
     _tool_manifest,
     parse_chief_chat_reply,
     search_episode_summaries,
@@ -28,6 +37,7 @@ from brigade.citations import (
     classify_rendered_claims,
     enforce_citation_answer,
 )
+from brigade.config import Settings
 from brigade.connectors import ConnectorChatReply, IncomingConnectorMessage
 from brigade.governance import reconcile_policy_projection_after_trusted_write
 from brigade.knowledge import ingest_text, store_ingest_result
@@ -36,7 +46,7 @@ from brigade.memory import (
     explicit_memory_request,
     record_memory_mutation,
 )
-from brigade.providers import ModelProvider, ModelResponse
+from brigade.providers import ModelProvider, ModelResponse, provider_from_settings
 from brigade.research_control import record_citation_validation
 from brigade.runner import MAX_OBSERVATION_CHARS, _truncate
 from brigade.schemas import (
@@ -49,6 +59,7 @@ from brigade.schemas import (
     Priority,
 )
 from brigade.services import (
+    _apply_chat_actions_now,
     _classify_chat_confirmation,
     _find_chat_by_idempotency,
     _pending_chat_proposal,
@@ -521,8 +532,8 @@ def build_executive_prompt(
         "You are the user's Executive: a personal assistant and concierge to OpenBrigade.",
         "You are user-driven, chatty, direct, and helpful. You do not perform mission work.",
         (
-            "Use tools to inspect Brigade state and answer accurately. For state "
-            "changes, propose actions."
+            "Use tools to inspect Brigade state and answer accurately. Task creation "
+            "requested by the owner is immediate; propose other state changes."
         ),
         (
             "Citation requirements for retrieved sources are supplied only for "
@@ -534,6 +545,11 @@ def build_executive_prompt(
         "",
         "Allowed actions inside propose_actions:",
         *EXECUTIVE_ACTION_DOCS,
+        (
+            "When the owner asks you to create or assign a task, return a create_task "
+            "action. The system creates it immediately. Never print action-protocol JSON "
+            "as the user-facing answer."
+        ),
         "",
         "Context JSON:",
         _compact_json(context),
@@ -557,8 +573,12 @@ def apply_executive_actions(
     by: str,
 ) -> dict[str, list[dict[str, Any]]]:
     result = ExecutiveActionResult()
-    for action in actions:
+    for original_action in actions:
+        action = dict(original_action)
         action_type = str(action.get("type") or "").strip()
+        if action_type == "create_assignment":
+            action_type = "create_task"
+            action["type"] = action_type
         try:
             if action_type == "create_task":
                 applied = _apply_create_task(store, action, persona=persona, by=by)
@@ -621,7 +641,7 @@ def _apply_create_task(
             if action.get("goal_statement") is not None
             else None
         ),
-        assignment_rationale="User-confirmed Executive action.",
+        assignment_rationale="User-directed Executive action.",
         created_by_user_id=by,
         created_by_role="executive",
     )
@@ -629,7 +649,9 @@ def _apply_create_task(
     return {
         "type": "create_task",
         "assignment_id": persisted.assignment_id,
+        "assignment": persisted.assignment,
         "agent_id": target.agent_id,
+        "priority": persisted.priority.value,
         "status": persisted.status.value,
     }
 
@@ -795,9 +817,35 @@ def run_executive_chat_turn(
         response = _complete_model_call(store, provider, prompt, tools=tools, holder=agent_label)
         reply: ChiefChatReply = parse_chief_chat_reply(response.text)
         if reply.kind == "actions":
+            actions = [
+                _normalize_task_action(action, target_type="create_task")
+                for action in reply.actions
+            ]
+            if _immediate_task_creation_allowed(
+                store,
+                operator,
+                actions,
+                action_types={"create_task"},
+                request_text=content,
+            ):
+                result = _apply_chat_actions_now(
+                    store,
+                    actions,
+                    channel=channel,
+                    sender=operator,
+                    request=request,
+                    response=response,
+                    agent_id=agent_label,
+                    kind_prefix=EXECUTIVE_CHAT_KIND_PREFIX,
+                    apply=lambda requested: apply_executive_actions(
+                        store, requested, persona=persona, by=operator
+                    ),
+                )
+                store.touch_conversation(thread.thread_id)
+                return {**result, "iterations": iterations, "tools_used": tools_used}
             result = _stage_chat_proposal(
                 store,
-                reply.actions,
+                actions,
                 reply.summary,
                 channel=channel,
                 sender=operator,
@@ -925,6 +973,8 @@ def run_connector_executive_chat(
     provider: ModelProvider,
     max_iterations: int = 3,
     enable_web_fetch: bool = True,
+    settings: Settings | None = None,
+    provider_factory: Callable[..., ModelProvider] | None = None,
 ) -> ConnectorChatReply:
     try:
         persona = resolve_executive_persona(store, username)
@@ -935,6 +985,54 @@ def run_connector_executive_chat(
         persona.persona_id,
         title=persona.display_name,
     )
+    command = parse_chat_command(incoming.text)
+    if command and command.verb in {"help", "who", "status", "model", "new"}:
+        agent = next(item for item in store.agents() if item.agent_id == persona.agent_id)
+        if command.verb == "help":
+            text = command_help(fixed_persona=True)
+        elif command.verb == "who":
+            text = f"You're talking to {persona.display_name}."
+        elif command.verb == "status":
+            text = (
+                f"Chat status: active\nPersona: {persona.display_name}\n"
+                f"Model: {conversation.model_provider or agent.model_provider} / "
+                f"{conversation.model_name or agent.model_name}"
+            )
+        elif command.verb == "new":
+            conversation.status = "archived"
+            store.upsert_conversation(conversation)
+            conversation = store.resolve_active_conversation(
+                username, persona.persona_id, title=persona.display_name
+            )
+            text = f"Started a fresh conversation with {persona.display_name}."
+        elif settings is None:
+            text = f"Current model: {agent.model_provider} / {agent.model_name}"
+        else:
+            text = model_command_reply(
+                store,
+                settings,
+                conversation,
+                command.argument,
+                fallback_provider=agent.model_provider,
+                fallback_model=agent.model_name,
+            )
+        record_command_exchange(
+            store,
+            conversation,
+            operator=username,
+            assistant=persona.agent_id,
+            command=incoming.text,
+            reply=text,
+        )
+        return ConnectorChatReply(text=text, agent_id=persona.agent_id)
+    if settings and conversation.model_provider and conversation.model_name:
+        factory = provider_factory or provider_from_settings
+        provider = factory(
+            settings,
+            provider=conversation.model_provider,
+            model=conversation.model_name,
+            api_base=conversation.model_base_url,
+        )
     result = run_executive_chat_turn(
         store,
         thread=conversation,

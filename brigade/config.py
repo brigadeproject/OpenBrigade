@@ -80,6 +80,7 @@ class Settings:
     telegram_polling_timeout_seconds: int = 30
     telegram_default_agent: str = "sage"
     telegram_allowlist: str | None = None
+    telegram_account_refresh_seconds: int = 10
     operator_telegram_chat_id: str | None = None
     google_chat_webhook_enabled: bool = False
     google_chat_secret: str | None = None
@@ -97,6 +98,11 @@ class Settings:
     chief_chat_web_fetch_enabled: bool = True
     connector_chief_chat_enabled: bool = False
     chief_chat_connector_max_iterations: int = 3
+    chief_direct_max_tool_calls: int = 60
+    chief_direct_max_elapsed_seconds: int = 1800
+    chief_direct_hard_elapsed_seconds: int = 7200
+    chief_direct_context_max_chars: int = 32_000
+    maintenance_actions_path: Path | None = None
     executive_enabled: bool = True
     executive_max_iterations: int = 6
     executive_web_fetch_enabled: bool = True
@@ -539,6 +545,11 @@ def load_settings(
             dotenv,
             config.get("telegram_allowlist"),
         ),
+        telegram_account_refresh_seconds=_env_int(
+            "BRIGADE_TELEGRAM_ACCOUNT_REFRESH_SECONDS",
+            dotenv,
+            config.get("telegram_account_refresh_seconds", 10),
+        ),
         operator_telegram_chat_id=_env(
             "BRIGADE_OPERATOR_TELEGRAM_CHAT_ID",
             dotenv,
@@ -625,6 +636,31 @@ def load_settings(
             "BRIGADE_CHIEF_CHAT_CONNECTOR_MAX_ITERATIONS",
             dotenv,
             config.get("chief_chat_connector_max_iterations", 3),
+        ),
+        chief_direct_max_tool_calls=_env_int(
+            "BRIGADE_CHIEF_DIRECT_MAX_TOOL_CALLS",
+            dotenv,
+            config.get("chief_direct_max_tool_calls", 60),
+        ),
+        chief_direct_max_elapsed_seconds=_env_int(
+            "BRIGADE_CHIEF_DIRECT_MAX_ELAPSED_SECONDS",
+            dotenv,
+            config.get("chief_direct_max_elapsed_seconds", 1800),
+        ),
+        chief_direct_hard_elapsed_seconds=_env_int(
+            "BRIGADE_CHIEF_DIRECT_HARD_ELAPSED_SECONDS",
+            dotenv,
+            config.get("chief_direct_hard_elapsed_seconds", 7200),
+        ),
+        chief_direct_context_max_chars=_env_int(
+            "BRIGADE_CHIEF_DIRECT_CONTEXT_MAX_CHARS",
+            dotenv,
+            config.get("chief_direct_context_max_chars", 32_000),
+        ),
+        maintenance_actions_path=_env_path(
+            "BRIGADE_MAINTENANCE_ACTIONS_PATH",
+            dotenv,
+            config.get("maintenance_actions_path"),
         ),
         executive_enabled=_env_bool(
             "BRIGADE_EXECUTIVE_ENABLED",
