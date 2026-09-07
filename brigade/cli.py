@@ -2630,6 +2630,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 max_iterations=settings.executive_max_iterations,
                 enable_web_fetch=settings.executive_web_fetch_enabled,
                 idempotency_key=f"tui-executive:{persona.agent_id}:{uuid4()}",
+                operator_timezone=settings.operator_timezone,
             )
 
         try:

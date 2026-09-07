@@ -680,6 +680,14 @@ def _format_action_result(result: dict[str, list[dict[str, Any]]]) -> str:
                     f'- Created task "{assignment}" for {agent_id} '
                     f"({priority}, id {task_id[:8]})."
                 )
+            elif action_type == "create_reminder":
+                reminder_id = str(item.get("recurrence_id") or "")
+                message = str(item.get("message") or "reminder")
+                remind_at = str(item.get("remind_at") or "")
+                lines.append(
+                    f'- Scheduled one-time reminder "{message}" for {remind_at} '
+                    f"(UTC, id {reminder_id[:8]})."
+                )
             else:
                 details = ", ".join(
                     f"{key.replace('_', ' ')}: {value}"
@@ -2049,6 +2057,9 @@ def create_scheduled_task(
     next_due_at: str | None = None,
     priority: str = Priority.NORMAL.value,
     label: str | None = None,
+    run_once: bool = False,
+    notification_only: bool = False,
+    deliver_to: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Create a durable UTC schedule for a worker or its owning Executive.
 
@@ -2070,7 +2081,12 @@ def create_scheduled_task(
         resolved_priority = Priority(str(priority).lower()).value
     except ValueError as exc:
         raise ValueError(f"invalid scheduled task priority: {priority}") from exc
-    if interval_seconds is not None:
+    if run_once:
+        if not next_due_at:
+            raise ValueError("one-shot schedule requires next_due_at")
+        if interval_seconds is not None or cron:
+            raise ValueError("one-shot schedule accepts next_due_at only")
+    elif interval_seconds is not None:
         try:
             interval_seconds = int(interval_seconds)
         except (TypeError, ValueError) as exc:
@@ -2103,11 +2119,20 @@ def create_scheduled_task(
             )
         template["target_kind"] = "executive"
         template["owner_username"] = owner_username
+        if notification_only:
+            template["notification_only"] = True
+        if deliver_to:
+            template["deliver_to"] = {
+                key: str(value)
+                for key, value in deliver_to.items()
+                if key in {"provider", "chat_id"} and str(value).strip()
+            }
     recurrence = build_recurrence(
         template=template,
         interval_seconds=interval_seconds,
         cron=cron,
         next_due_at=due_at,
+        run_once=run_once,
     )
     persisted = store.add_recurrence(recurrence)
     return dict(persisted)

@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from brigade.chat_commands import (
     command_help,
@@ -46,6 +47,7 @@ from brigade.memory import (
     explicit_memory_request,
     record_memory_mutation,
 )
+from brigade.prompt_floors import MAX_CHAT_MEMORY_CHARS
 from brigade.providers import ModelProvider, ModelResponse, provider_from_settings
 from brigade.research_control import record_citation_validation
 from brigade.runner import MAX_OBSERVATION_CHARS, _truncate
@@ -68,11 +70,12 @@ from brigade.services import (
     _stage_chat_proposal,
     _summarize,
     attach_operator_guidance,
+    create_scheduled_task,
     lookup_assignment,
 )
 from brigade.staff_meeting import approve_freeze_and_dispatch, create_staff_meeting
 from brigade.store import StateStore
-from brigade.time import utc_now_iso
+from brigade.time import parse_utc_iso, utc_now, utc_now_iso
 from brigade.tools import (
     ToolRegistry,
     ToolResult,
@@ -499,9 +502,55 @@ EXECUTIVE_ACTION_DOCS = [
     '"priority":"normal","goal_statement":"optional"}',
     '{"type":"create_goal","agent_id":"...","statement":"...",'
     '"success_criteria":["..."],"explicitly_not":["..."]}',
+    '{"type":"create_reminder","message":"...",'
+    '"remind_at":"UTC ISO timestamp"}'
+    " — a durable one-time personal reminder; never represent it as a task.",
     '{"type":"attach_guidance","assignment_id":"...","message":"..."}',
     '{"type":"ingest_text","title":"...","source":"...","document_type":"note","content":"..."}',
 ]
+
+
+def build_executive_memory(
+    store: StateStore,
+    *,
+    thread: Conversation,
+    persona: ExecutivePersona,
+    content: str,
+    history_window: int = 12,
+    exclude_message_id: str | None = None,
+) -> dict[str, Any]:
+    """Load bounded personal memory and real thread history for continuity."""
+    memory: dict[str, Any] = {}
+    agent = next(
+        (item for item in store.agents() if item.agent_id == persona.agent_id),
+        None,
+    )
+    if agent is not None:
+        memory_path = store.data_dir / agent.workspace_path / "MEMORY.md"
+        if memory_path.exists():
+            notes = memory_path.read_text(encoding="utf-8").strip()
+            if notes:
+                memory["curated_notes"] = notes[-MAX_CHAT_MEMORY_CHARS:]
+    if thread.rolling_summary.strip():
+        memory["conversation_summary"] = thread.rolling_summary[-2048:]
+    history = [
+        message
+        for message in store.recent_messages(thread.channel, limit=history_window + 1)
+        if message.message_id != exclude_message_id
+    ][-history_window:]
+    if history:
+        memory["recent_thread_history"] = [
+            {
+                "sender": message.sender,
+                "kind": message.metadata.get("kind"),
+                "content": _truncate(message.content, 400),
+            }
+            for message in history
+        ]
+    episodes = search_episode_summaries(store, content, limit=3)
+    if episodes:
+        memory["possibly_relevant_past_episodes"] = episodes
+    return memory
 
 
 def build_executive_prompt(
@@ -513,14 +562,27 @@ def build_executive_prompt(
     registry: ToolRegistry,
     observations: list[dict[str, Any]],
     pending: dict[str, Any] | None = None,
+    memory: dict[str, Any] | None = None,
+    operator_timezone: str = "UTC",
     demand_final: bool = False,
     citation_instruction: str = "",
 ) -> str:
+    now = utc_now()
+    try:
+        local_zone = ZoneInfo(operator_timezone)
+    except ZoneInfoNotFoundError:
+        operator_timezone = "UTC"
+        local_zone = ZoneInfo("UTC")
     context: dict[str, Any] = {
         "operator": operator,
         "executive_agent": persona.to_dict(),
         "mission": store.mission().statement if store.mission() else "not set",
+        "current_time_utc": now.isoformat(),
+        "operator_timezone": operator_timezone,
+        "current_time_local": now.astimezone(local_zone).isoformat(),
     }
+    if memory:
+        context.update(memory)
     if pending:
         context["pending_proposal_awaiting_confirmation"] = {
             "summary": pending.get("summary"),
@@ -550,6 +612,13 @@ def build_executive_prompt(
             "action. The system creates it immediately. Never print action-protocol JSON "
             "as the user-facing answer."
         ),
+        (
+            "When the owner asks for a personal reminder, return create_reminder, never "
+            "create_task or ingest_text. Interpret an unqualified clock time in "
+            "operator_timezone, then convert it to an exact UTC ISO timestamp in remind_at. "
+            "Use current_time_local to resolve relative dates such as tomorrow. The system "
+            "creates clear owner requests immediately and sends the receipt."
+        ),
         "",
         "Context JSON:",
         _compact_json(context),
@@ -571,6 +640,7 @@ def apply_executive_actions(
     *,
     persona: ExecutivePersona,
     by: str,
+    delivery_target: dict[str, str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     result = ExecutiveActionResult()
     for original_action in actions:
@@ -582,6 +652,14 @@ def apply_executive_actions(
         try:
             if action_type == "create_task":
                 applied = _apply_create_task(store, action, persona=persona, by=by)
+            elif action_type == "create_reminder":
+                applied = _apply_create_reminder(
+                    store,
+                    action,
+                    persona=persona,
+                    by=by,
+                    delivery_target=delivery_target,
+                )
             elif action_type == "create_goal":
                 applied = _apply_create_goal(store, action, persona=persona, by=by)
             elif action_type == "attach_guidance":
@@ -653,6 +731,48 @@ def _apply_create_task(
         "agent_id": target.agent_id,
         "priority": persisted.priority.value,
         "status": persisted.status.value,
+    }
+
+
+def _apply_create_reminder(
+    store: StateStore,
+    action: dict[str, Any],
+    *,
+    persona: ExecutivePersona,
+    by: str,
+    delivery_target: dict[str, str] | None,
+) -> dict[str, Any]:
+    if by != persona.owner_username:
+        raise ValueError("Executive reminders may only be created by that Executive's owner")
+    message = str(action.get("message") or action.get("assignment") or "").strip()
+    remind_at = str(action.get("remind_at") or action.get("next_due_at") or "").strip()
+    if not message:
+        raise ValueError("create_reminder is missing message")
+    if not remind_at:
+        raise ValueError("create_reminder is missing remind_at")
+    try:
+        due = parse_utc_iso(remind_at)
+    except ValueError as exc:
+        raise ValueError("create_reminder remind_at is not a UTC ISO timestamp") from exc
+    if due <= utc_now():
+        raise ValueError("create_reminder remind_at must be in the future")
+    schedule = create_scheduled_task(
+        store,
+        agent_id=persona.agent_id,
+        assignment=message,
+        owner_username=by,
+        next_due_at=due.isoformat(),
+        label="Personal reminder",
+        run_once=True,
+        notification_only=True,
+        deliver_to=delivery_target,
+    )
+    return {
+        "type": "create_reminder",
+        "recurrence_id": schedule["recurrence_id"],
+        "message": message,
+        "remind_at": due.isoformat(),
+        "delivery": "telegram" if delivery_target else "executive conversation",
     }
 
 
@@ -736,6 +856,9 @@ def run_executive_chat_turn(
     max_iterations: int = 6,
     idempotency_key: str | None = None,
     enable_web_fetch: bool = True,
+    delivery_target: dict[str, str] | None = None,
+    history_window: int = 12,
+    operator_timezone: str = "UTC",
 ) -> dict[str, Any]:
     channel = thread.channel
     agent_label = persona.agent_id
@@ -776,7 +899,11 @@ def run_executive_chat_turn(
             agent_id=agent_label,
             kind_prefix=EXECUTIVE_CHAT_KIND_PREFIX,
             apply=lambda actions: apply_executive_actions(
-                store, actions, persona=persona, by=operator
+                store,
+                actions,
+                persona=persona,
+                by=operator,
+                delivery_target=delivery_target,
             ),
         )
         store.touch_conversation(thread.thread_id)
@@ -792,6 +919,14 @@ def run_executive_chat_turn(
         conversation_id=channel,
     )
     tools = native_tool_specs(registry)
+    memory = build_executive_memory(
+        store,
+        thread=thread,
+        persona=persona,
+        content=content,
+        history_window=history_window,
+        exclude_message_id=request.message_id,
+    )
     observations: list[dict[str, Any]] = []
     tools_used: list[str] = []
     final_text: str | None = None
@@ -809,6 +944,8 @@ def run_executive_chat_turn(
             registry=registry,
             observations=observations,
             pending=pending,
+            memory=memory,
+            operator_timezone=operator_timezone,
             demand_final=demand_final,
             citation_instruction=citation_instructions(
                 citation_context(store, content, observations)
@@ -825,7 +962,7 @@ def run_executive_chat_turn(
                 store,
                 operator,
                 actions,
-                action_types={"create_task"},
+                action_types={"create_task", "create_reminder"},
                 request_text=content,
             ):
                 result = _apply_chat_actions_now(
@@ -838,7 +975,11 @@ def run_executive_chat_turn(
                     agent_id=agent_label,
                     kind_prefix=EXECUTIVE_CHAT_KIND_PREFIX,
                     apply=lambda requested: apply_executive_actions(
-                        store, requested, persona=persona, by=operator
+                        store,
+                        requested,
+                        persona=persona,
+                        by=operator,
+                        delivery_target=delivery_target,
                     ),
                 )
                 store.touch_conversation(thread.thread_id)
@@ -1046,6 +1187,12 @@ def run_connector_executive_chat(
             f"{incoming.provider}:executive:{incoming.external_user_id}:"
             f"{incoming.external_message_id}"
         ),
+        delivery_target=(
+            {"provider": "telegram", "chat_id": incoming.reply_target}
+            if incoming.provider == "telegram"
+            else None
+        ),
+        operator_timezone=settings.operator_timezone if settings else "UTC",
     )
     response_id = result.get("response_message_id")
     response = (

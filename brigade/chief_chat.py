@@ -862,6 +862,7 @@ CHAT_ACTION_TYPES = frozenset(
     {
         "create_assignment",
         "create_task",
+        "create_reminder",
         "create_goal",
         "cancel_assignment",
         "set_priority",
@@ -1021,7 +1022,8 @@ def _immediate_task_creation_allowed(
         return False
     normalized = " ".join(request_text.lower().split())
     hypothetical = re.search(
-        r"\b(what would|what could|how would|example of|suggest|brainstorm|draft)\b",
+        r"\b(what would|what could|how would|example of|suggest|brainstorm)\b"
+        r"|\bdraft (?:a |an |the )?(?:task|assignment|job|work item|reminder)\b",
         normalized,
     )
     explicit = re.search(
@@ -1029,6 +1031,14 @@ def _immediate_task_creation_allowed(
         r"\b(task|assignment|job|work item)\b",
         normalized,
     ) or re.search(r"^(please\s+)?(ask|have|tell|assign|delegate)\b", normalized)
+    if action_types == {"create_reminder"} or (
+        action_types == {"create_task", "create_reminder"}
+        and all(str(item.get("type") or "") == "create_reminder" for item in actions)
+    ):
+        explicit = explicit or re.search(
+            r"\b(remind me|set(?: up)? (?:a )?reminder|schedule (?:a )?reminder)\b",
+            normalized,
+        )
     if hypothetical or not explicit:
         return False
     users = store.users()

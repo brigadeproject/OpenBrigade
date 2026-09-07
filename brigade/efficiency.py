@@ -162,6 +162,7 @@ def materialize_due_recurrences(
     *,
     now: datetime | None = None,
     executive_executor: Callable[[dict[str, Any], str, str], dict[str, Any]] | None = None,
+    reminder_sender: Callable[[dict[str, str], str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Turn due recurrences into queued assignments exactly once per due slot,
     then advance ``next_due_at`` past now."""
@@ -182,6 +183,46 @@ def materialize_due_recurrences(
         recurrence_id = str(recurrence.get("recurrence_id"))
         key = recurrence_idempotency_key(recurrence_id, next_due_at)
         template = recurrence.get("template") or {}
+        if (
+            template.get("target_kind") == "executive"
+            and template.get("notification_only") is True
+        ):
+            entry = {
+                "recurrence_id": recurrence_id,
+                "due_at": next_due_at,
+                "idempotency_key": key,
+                "agent_id": template.get("assigned_to"),
+            }
+            try:
+                result = _materialize_executive_reminder(
+                    store,
+                    recurrence,
+                    next_due_at,
+                    key,
+                    reminder_sender=reminder_sender,
+                )
+            except Exception as exc:  # retain the due slot for delivery retry
+                LOGGER.warning("scheduled_executive_reminder_failed", exc_info=True)
+                deferred.append({**entry, "reason": str(exc)})
+                continue
+            entry["result"] = result
+            materialized.append(entry)
+            recurrence["last_reminder_result"] = result
+            _advance_recurrence(recurrence, now=now, due_at=next_due_at)
+            store.update_recurrence(recurrence)
+            events.append(
+                orchestration_event(
+                    EVENT_RECURRENCE_MATERIALIZED,
+                    f"Executive reminder {recurrence_id} delivered for slot {next_due_at}.",
+                    source="orchestrator_recurrence",
+                    decision="delivered",
+                    trigger="reminder_due",
+                    agent_id=str(template.get("assigned_to") or ""),
+                    idempotency_key=key,
+                    payload=entry,
+                )
+            )
+            continue
         if template.get("target_kind") == "executive":
             entry = {
                 "recurrence_id": recurrence_id,
@@ -267,6 +308,8 @@ def materialize_due_recurrences(
 
 
 def _has_valid_schedule(recurrence: dict[str, Any]) -> bool:
+    if recurrence.get("run_once") is True:
+        return True
     if recurrence.get("cron"):
         return True
     return int(recurrence.get("interval_seconds") or 0) > 0
@@ -276,6 +319,11 @@ def _advance_recurrence(
     recurrence: dict[str, Any], *, now: datetime, due_at: str
 ) -> None:
     """Advance a durable schedule beyond now, intentionally skipping missed slots."""
+    if recurrence.get("run_once") is True:
+        recurrence["enabled"] = False
+        recurrence["last_materialized_at"] = due_at
+        recurrence["updated_at"] = now.isoformat()
+        return
     cron = recurrence.get("cron")
     if cron:
         from brigade.scheduling import next_cron_due
@@ -293,6 +341,70 @@ def _advance_recurrence(
         recurrence["next_due_at"] = advanced
     recurrence["last_materialized_at"] = due_at
     recurrence["updated_at"] = now.isoformat()
+
+
+def _materialize_executive_reminder(
+    store: StateStore,
+    recurrence: dict[str, Any],
+    due_at: str,
+    idempotency_key: str,
+    *,
+    reminder_sender: Callable[[dict[str, str], str], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Persist and optionally push a personal reminder without a model call."""
+    from brigade.executive import resolve_executive_persona
+
+    template = recurrence.get("template") or {}
+    owner = str(template.get("owner_username") or "").strip()
+    requested = str(template.get("assigned_to") or "").strip()
+    task = str(template.get("assignment") or "").strip()
+    if not owner or not requested or not task:
+        raise ValueError("scheduled Executive reminder is missing owner, agent, or message")
+    persona = resolve_executive_persona(store, owner, requested)
+    thread = store.resolve_active_conversation(
+        owner, persona.persona_id, title=persona.display_name
+    )
+    body = f"Reminder: {task}"
+    existing = next(
+        (
+            message
+            for message in store.messages(thread.channel)
+            if message.metadata.get("idempotency_key") == idempotency_key
+        ),
+        None,
+    )
+    if existing is None:
+        existing = ChatMessage(
+            channel=thread.channel,
+            sender=persona.agent_id,
+            recipient=owner,
+            content=body,
+            metadata={
+                "kind": "executive_reminder",
+                "conversation_id": thread.channel,
+                "agent_id": persona.agent_id,
+                "recurrence_id": recurrence.get("recurrence_id"),
+                "due_at": due_at,
+                "idempotency_key": idempotency_key,
+            },
+        )
+        store.add_message(existing)
+        store.touch_conversation(thread.thread_id)
+
+    delivery = "conversation"
+    deliver_to = template.get("deliver_to")
+    if isinstance(deliver_to, dict) and deliver_to.get("provider"):
+        if reminder_sender is None:
+            raise RuntimeError("scheduled reminder delivery is not configured")
+        sent = reminder_sender(
+            {str(key): str(value) for key, value in deliver_to.items()}, body
+        )
+        delivery = str(sent.get("status") or "sent")
+    return {
+        "message_id": existing.message_id,
+        "conversation_id": thread.channel,
+        "delivery": delivery,
+    }
 
 
 EVENT_RECURRENCE_BRIEFING_DELIVERED = "recurrence_briefing_delivered"
@@ -437,6 +549,10 @@ def run_recurrence_step(
             if provider is not None
             else None
         ),
+        reminder_sender=_reminder_sender(
+            telegram_bot_token=telegram_bot_token,
+            operator_telegram_chat_id=operator_telegram_chat_id,
+        ),
     )
     delivery = deliver_recurrence_briefings(
         store,
@@ -460,6 +576,31 @@ def run_recurrence_step(
             *detection["events"],
         ],
     }
+
+
+def _reminder_sender(
+    *,
+    telegram_bot_token: str | None,
+    operator_telegram_chat_id: str | None,
+) -> Callable[[dict[str, str], str], dict[str, Any]]:
+    def send(deliver_to: dict[str, str], text: str) -> dict[str, Any]:
+        provider = str(deliver_to.get("provider") or "").strip()
+        if provider != "telegram":
+            raise RuntimeError(f"scheduled reminder delivery does not support {provider}")
+        chat_id = str(deliver_to.get("chat_id") or operator_telegram_chat_id or "").strip()
+        if not telegram_bot_token or not chat_id:
+            raise RuntimeError("scheduled Telegram reminder delivery is not configured")
+        from brigade.connectors import send_telegram_message
+
+        result = send_telegram_message(telegram_bot_token, chat_id=chat_id, text=text)
+        status = str(getattr(result, "status", "failed"))
+        if status != "sent":
+            raise RuntimeError(
+                str(getattr(result, "reason", None) or "scheduled Telegram reminder failed")
+            )
+        return {"status": status, "chat_id": chat_id}
+
+    return send
 
 
 def _scheduled_executive_executor(

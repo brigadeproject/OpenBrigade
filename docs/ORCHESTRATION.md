@@ -285,6 +285,17 @@ An Executive schedule is owner-scoped. Its due task runs as a private turn in
 that owner's Executive conversation, not as a mission assignment. Any mutation
 the Executive proposes still follows the normal explicit-confirmation boundary.
 
+Personal reminders are owner-scoped one-shot Executive schedules. A clear
+"remind me" request is created immediately, records an exact UTC due time, and
+does not enter the mission task queue. When due, the orchestrator writes the
+reminder directly to the durable Executive conversation without requiring a
+model provider. If the request originated in the default Telegram Executive
+chat, the reminder is also pushed to that same Telegram chat; failed outbound
+delivery leaves the schedule enabled for retry, while the conversation copy is
+idempotent. The schedule disables itself after successful delivery.
+Unqualified clock times are interpreted in `BRIGADE_OPERATOR_TIMEZONE`
+(default `UTC`) and converted to an exact UTC due time before persistence.
+
 Rest-cycle `[efficiency]` proposals enter the same proposal queue, so agents' own observations
 about repetitive work flow through the identical approval path.
 

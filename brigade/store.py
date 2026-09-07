@@ -1823,7 +1823,7 @@ class PostgresStateStore:
             (
                 recurrence["recurrence_id"],
                 bool(recurrence.get("enabled", True)),
-                int(recurrence["interval_seconds"]),
+                int(recurrence.get("interval_seconds") or 0),
                 recurrence["next_due_at"],
                 recurrence["created_at"],
                 recurrence.get("updated_at") or recurrence["created_at"],

@@ -634,10 +634,14 @@ def build_recurrence(
     next_due_at: str,
     proposal_id: str | None = None,
     enabled: bool = True,
+    run_once: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(template, dict) or not str(template.get("assignment") or "").strip():
         raise ValueError("recurrence template requires assignment text")
-    if (interval_seconds is None) == (cron is None):
+    if run_once:
+        if interval_seconds is not None or cron is not None:
+            raise ValueError("one-shot schedule accepts next_due_at only")
+    elif (interval_seconds is None) == (cron is None):
         raise ValueError("recurrence requires exactly one of interval_seconds or cron")
     normalized_cron = None
     if interval_seconds is not None and interval_seconds <= 0:
@@ -651,8 +655,12 @@ def build_recurrence(
     return {
         "recurrence_id": str(uuid4()),
         "enabled": enabled,
-        "interval_seconds": int(interval_seconds) if interval_seconds is not None else None,
+        # Postgres keeps this indexed column non-null. Zero is the explicit
+        # sentinel for cron and one-shot records; the JSON record retains the
+        # actual schedule kind.
+        "interval_seconds": int(interval_seconds) if interval_seconds is not None else 0,
         "cron": normalized_cron,
+        "run_once": bool(run_once),
         "next_due_at": next_due_at,
         "template": dict(template),
         "proposal_id": proposal_id,

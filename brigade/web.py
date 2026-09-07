@@ -1799,6 +1799,7 @@ def create_app(
                 max_iterations=settings.executive_max_iterations,
                 enable_web_fetch=settings.executive_web_fetch_enabled,
                 idempotency_key=payload.get("idempotency_key") or f"web-executive:{uuid4()}",
+                operator_timezone=settings.operator_timezone,
             )
         if not settings.chief_chat_enabled:
             raise HTTPException(status_code=503, detail="chief chat is disabled")

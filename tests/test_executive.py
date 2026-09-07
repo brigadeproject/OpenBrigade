@@ -18,7 +18,7 @@ from brigade.executive import (
 )
 from brigade.governance import ensure_policy_projections_current, policy_projection_diff
 from brigade.runner import run_managed_agents
-from brigade.schemas import Agent, Assignment, Role, User
+from brigade.schemas import Agent, Assignment, ChatMessage, Role, User
 from brigade.state import JsonStateStore
 from brigade.tools import ToolResult
 from brigade.workspace import (
@@ -118,6 +118,84 @@ def test_executive_applies_owner_task_action_immediately(tmp_path):
     assert assignment.assigned_to == "ada"
     assert assignment.created_by_role == "executive"
     assert "Created task" in store.messages(thread.channel)[-1].content
+
+
+def test_executive_applies_owner_personal_reminder_without_mission_task(tmp_path):
+    store = _store(tmp_path)
+    persona = resolve_executive_persona(store, "owner")
+    thread = store.resolve_active_conversation("owner", persona.persona_id)
+    provider = SequencedTestProvider(
+        [
+            _propose(
+                [
+                    {
+                        "type": "create_reminder",
+                        "message": "Draft the AI cash-flow Substack article.",
+                        "remind_at": "2099-09-04T08:00:00+00:00",
+                    }
+                ]
+            )
+        ]
+    )
+
+    result = run_executive_chat_turn(
+        store,
+        thread=thread,
+        persona=persona,
+        operator="owner",
+        content="Tomorrow at 8am, remind me to draft the article.",
+        provider=provider,
+        delivery_target={"provider": "telegram", "chat_id": "42"},
+    )
+
+    assert result["status"] == "applied"
+    assert store.assignments() == []
+    reminder = store.recurrences()[0]
+    assert reminder["run_once"] is True
+    assert reminder["template"]["target_kind"] == "executive"
+    assert reminder["template"]["notification_only"] is True
+    assert reminder["template"]["deliver_to"] == {
+        "provider": "telegram",
+        "chat_id": "42",
+    }
+    assert "Scheduled one-time reminder" in store.messages(thread.channel)[-1].content
+    prompt = provider.calls[0]["prompt"]
+    assert '"type":"create_reminder"' in prompt
+    assert '"current_time_utc"' in prompt
+
+
+def test_executive_prompt_includes_personal_memory_and_prior_thread_turns(tmp_path):
+    store = _store(tmp_path)
+    persona = resolve_executive_persona(store, "owner")
+    agent = next(item for item in store.agents() if item.agent_id == persona.agent_id)
+    workspace = store.data_dir / agent.workspace_path
+    workspace.mkdir(parents=True)
+    (workspace / "MEMORY.md").write_text(
+        "The owner prefers concise reminders.\n", encoding="utf-8"
+    )
+    thread = store.resolve_active_conversation("owner", persona.persona_id)
+    store.add_message(
+        ChatMessage(
+            channel=thread.channel,
+            sender="owner",
+            recipient="exec",
+            content="The article should discuss economic collapse and used hardware.",
+        )
+    )
+    provider = SequencedTestProvider(["I remember the article details."])
+
+    run_executive_chat_turn(
+        store,
+        thread=thread,
+        persona=persona,
+        operator="owner",
+        content="What did I say it should cover?",
+        provider=provider,
+    )
+
+    prompt = provider.calls[0]["prompt"]
+    assert "The owner prefers concise reminders." in prompt
+    assert "economic collapse and used hardware" in prompt
 
 
 def test_executive_explicit_memory_reconciles_policy_projection(tmp_path):

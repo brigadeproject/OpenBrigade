@@ -382,6 +382,16 @@ stays on the existing default-agent / chief-chat path. Full personal-assistant
 automation — email/calendar write actions, shell/curl workflows, and
 Playwright/Chrome button-clicking — remains 1.4 scope.
 
+Executives also support durable one-time personal reminders. A clear owner
+request such as "tomorrow at 08:00 UTC, remind me to draft the article" creates
+the reminder immediately rather than creating a mission task or merely saving a
+note. The orchestrator posts it to the shared Executive conversation when due
+and, when requested through the default Executive Telegram bot, sends it back
+to the originating Telegram chat. Reminder scheduling and receipts use exact
+UTC timestamps; `BRIGADE_OPERATOR_TIMEZONE` (an IANA name such as
+`America/New_York`) controls how phrases such as "tomorrow at 8am" are
+interpreted and defaults to `UTC`.
+
 OpenAI, OpenAI/Codex, Anthropic/Claude, and Gemini routes continue to use LiteLLM. API keys remain
 supported through `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`. Claude is API-key
 only for RC. OpenAI/Codex and Gemini OAuth credentials can be imported or manually exchanged and

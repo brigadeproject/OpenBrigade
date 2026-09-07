@@ -107,6 +107,7 @@ class Settings:
     executive_max_iterations: int = 6
     executive_web_fetch_enabled: bool = True
     connector_executive_chat_enabled: bool = False
+    operator_timezone: str = "UTC"
     search_backend: str = "searxng"
     searxng_url: str = "http://brigade_searxng:8080"
     browser_worker_url: str = "http://brigade_browser:8765"
@@ -681,6 +682,14 @@ def load_settings(
             "BRIGADE_CONNECTOR_EXECUTIVE_CHAT_ENABLED",
             dotenv,
             config.get("connector_executive_chat_enabled", False),
+        ),
+        operator_timezone=(
+            _env(
+                "BRIGADE_OPERATOR_TIMEZONE",
+                dotenv,
+                config.get("operator_timezone", "UTC"),
+            )
+            or "UTC"
         ),
         search_backend=(
             _env("BRIGADE_SEARCH_BACKEND", dotenv, config.get("search_backend", "searxng"))

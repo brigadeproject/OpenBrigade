@@ -70,6 +70,7 @@ def test_load_settings_reads_executive_controls(tmp_path):
                 "BRIGADE_EXECUTIVE_MAX_ITERATIONS=4",
                 "BRIGADE_EXECUTIVE_WEB_FETCH_ENABLED=false",
                 "BRIGADE_CONNECTOR_EXECUTIVE_CHAT_ENABLED=true",
+                "BRIGADE_OPERATOR_TIMEZONE=America/New_York",
             ]
         )
         + "\n",
@@ -82,6 +83,7 @@ def test_load_settings_reads_executive_controls(tmp_path):
     assert settings.executive_max_iterations == 4
     assert settings.executive_web_fetch_enabled is False
     assert settings.connector_executive_chat_enabled is True
+    assert settings.operator_timezone == "America/New_York"
 
 
 def test_load_settings_reads_research_tool_controls(tmp_path):
